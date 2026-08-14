@@ -1,0 +1,71 @@
+[package]
+name = "ai-editor"
+version = "0.1.0"
+description = "Ultra-fast, low-memory, standalone local AI code editor"
+authors = ["ai-editor"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+crossbeam-channel = "0.5"
+encoding_rs = "0.8"
+# Remote (OpenAI-compatible API) backend for the model router.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+# Hugging Face tokenizers - exact BPE/Unigram token counting for the context
+# eviction engine. `default-features = false` keeps the build light; `fancy-regex`
+# is the pure-Rust pre-tokenizer backend (no C++ esaxx / C onig bindings).
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# Agent / tool-execution stack (all open source, high-performance).
+walkdir = "2.5"
+ignore = "0.4"
+globset = "0.4"
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+similar = { version = "2.5", features = ["inline"] }
+regex = "1.11"
+# Pinned exactly: llama-cpp-2 explicitly does not follow semver, so a lockstep
+# pin protects against API drift in the volatile llama.cpp bindings.
+# CPU-only baseline: `common` + `sampler`. GPU backends are opt-in Cargo
+# features (`gpu-cuda` / `gpu-metal`) that build.rs detects and validates
+# against the host toolchain; they must be enabled explicitly because they
+# change the compiled artifact and require a CUDA toolkit / Metal SDK.
+llama-cpp-2 = { version = "=0.1.154", default-features = false, features = ["common", "sampler"] }
+# macOS ships a Metal runtime on every supported machine, so wire the llama.cpp
+# Metal backend in automatically for Apple targets (feature list is repeated so
+# the platform override is self-contained either way).
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "=0.1.154", default-features = false, features = ["common", "sampler", "metal"] }
+
+[features]
+default = []
+# Enable llama.cpp's CUDA compute backend (requires an NVIDIA toolkit + NVCC).
+gpu-cuda = ["llama-cpp-2/cuda"]
+# Enable llama.cpp's Apple Metal backend (macOS only).
+gpu-metal = ["llama-cpp-2/metal"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.dev]
+opt-level = 1
+incremental = true
+
+# Compile dependencies (llama.cpp, tokio, tauri) at a higher opt level even in
+# dev builds so streaming benchmarks are representative.
+[profile.dev.package."*"]
+opt-level = 2

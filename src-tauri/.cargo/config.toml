@@ -1,0 +1,14 @@
+# Project-local Cargo configuration.
+#
+# llama-cpp-sys-2 generates its C bindings with `bindgen`, which needs libclang
+# at build time. This machine ships LLVM as a portable install that is not on
+# the default search paths, so we point clang-sys at it explicitly. Unlike the
+# Cargo.toml `[env]` table, config-level `[env]` is applied to *dependency*
+# build scripts too.
+[env]
+LIBCLANG_PATH = "C:\\Users\\durga\\AppData\\Local\\LLVM-portable\\bin"
+
+# The cmake crate auto-detects VS via `devenv`, which only ships with the full
+# VS IDE - this machine has VS Build Tools only. Point it at the bundled cmake
+# explicitly.
+CMAKE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
