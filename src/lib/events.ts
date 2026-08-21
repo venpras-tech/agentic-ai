@@ -6,6 +6,7 @@ import type {
   KnowledgeReport,
   ModelInfo,
   PermissionRequest,
+  PlanStepEvent,
   StepEvent,
   SubtaskEvent,
   ToolOutputEvent,
@@ -38,6 +39,7 @@ export interface FileChangedHandlerEvent extends FileChangedEvent {}
 export interface ToolOutputHandlerEvent extends ToolOutputEvent {}
 export interface StepHandlerEvent extends StepEvent {}
 export interface SubtaskHandlerEvent extends SubtaskEvent {}
+export interface PlanStepHandlerEvent extends PlanStepEvent {}
 
 export interface EngineHandlers {
   onToken: (e: TokenEvent) => void;
@@ -54,6 +56,7 @@ export interface EngineHandlers {
   onToolOutput?: (e: ToolOutputHandlerEvent) => void;
   onStep?: (e: StepHandlerEvent) => void;
   onSubtask?: (e: SubtaskHandlerEvent) => void;
+  onPlanStep?: (e: PlanStepHandlerEvent) => void;
   onSkillsChanged?: (e: { name: string; path: string }) => void;
 }
 

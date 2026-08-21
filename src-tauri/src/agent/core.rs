@@ -193,6 +193,42 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
             prop("name", "string", "Name of an available skill (from the ## Skill instructions context section) to load in full. Use this when a skill was truncated to save context or you need its complete text before applying it."),
         ]),
     );
+    m.insert(
+        "semantic_search_codebase",
+        json_schema(vec![
+            prop("query", "string", "Natural-language query describing what you're looking for, e.g. `where is the auth logic` or `how are timestamps formatted`. Results are ranked by code-aware relevance, not literal match."),
+            prop_opt("include", "string", "Optional glob to restrict which files are indexed (e.g. `src/**/*.rs`). Defaults to all files in the workspace."),
+            prop_opt("root", "string", "Absolute directory to search (defaults to the workspace root)."),
+            prop_opt("respect_gitignore", "boolean", "Whether to skip paths ignored by git (default true)."),
+            prop_opt("top_k", "integer", "How many ranked regions to return (default 10, max 25)."),
+        ]),
+    );
+    m.insert(
+        "create_plan",
+        json_schema(vec![
+            prop("title", "string", "Short title for the plan, e.g. `Refactor auth`."),
+            prop_opt("goal", "string", "One sentence describing the overall goal the plan accomplishes."),
+            prop("items", "array", "The ordered list of concrete steps to take. Each item should be a single self-contained directive the agent can execute."),
+        ]),
+    );
+    m.insert(
+        "read_plan",
+        json_schema(vec![]),
+    );
+    m.insert(
+        "update_plan",
+        json_schema(vec![
+            prop("item", "integer", "1-based index of the plan item to update."),
+            prop("status", "string", "New status: `not_started`, `in_progress`, `completed` or `terminal`."),
+            prop_opt("details", "string", "Optional extra detail/result to record for the item (appended)."),
+        ]),
+    );
+    m.insert(
+        "execute_plan",
+        json_schema(vec![
+            prop_opt("execute_plan", "boolean", "Whether to begin executing the active plan (default true)."),
+        ]),
+    );
     m
 }
 

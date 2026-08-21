@@ -70,13 +70,13 @@ export default function FileExplorer(props: FileExplorerProps) {
             tabIndex={0}
             onClick={() => onToggle(node)}
             onKeyDown={(e) => e.key === "Enter" && onToggle(node)}
-            className="group flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 hover:bg-white/5"
+            className="group flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 hover:bg-zinc-100"
             style={{ paddingLeft: depth * 12 + 6 }}
           >
-            <span className="w-3 text-center text-[9px] text-zinc-600">
+            <span className="w-3 text-center text-[9px] text-zinc-400">
               {isDir ? (open ? "▾" : "▸") : ""}
             </span>
-            <span className={`truncate text-[12px] ${isDir ? "font-medium text-zinc-300" : "text-zinc-400"}`}>
+            <span className={`truncate text-[12px] ${isDir ? "font-medium text-zinc-700" : "text-zinc-500"}`}>
               {node.name}
             </span>
           </div>
@@ -95,21 +95,21 @@ export default function FileExplorer(props: FileExplorerProps) {
           <button
             onClick={onNewFile}
             title="New file"
-            className="rounded px-1.5 py-0.5 text-sm text-zinc-400 hover:bg-white/10 hover:text-white"
+            className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             +
           </button>
           <button
             onClick={onOpenSkills}
             title="Skills & rules"
-            className="rounded px-1.5 py-0.5 text-sm text-zinc-400 hover:bg-white/10 hover:text-white"
+            className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             ✦
           </button>
           <button
             onClick={onSelectWorkspace}
             title="Open workspace"
-            className="rounded px-1.5 py-0.5 text-sm text-zinc-400 hover:bg-white/10 hover:text-white"
+            className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             📁
           </button>
@@ -117,20 +117,20 @@ export default function FileExplorer(props: FileExplorerProps) {
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-1.5 py-1.5">
         {!workspaceRoot ? (
-          <div className="px-1 pt-3 text-center text-[11px] leading-relaxed text-zinc-600">
+          <div className="px-1 pt-3 text-center text-[11px] leading-relaxed text-zinc-400">
             No workspace open.
             <br />
             <button
               onClick={onSelectWorkspace}
-              className="mt-2 rounded border border-border px-2 py-1 text-[11px] text-zinc-300 hover:border-zinc-500"
+              className="mt-2 rounded border border-border px-2 py-1 text-[11px] text-zinc-700 hover:border-zinc-400"
             >
               Open folder
             </button>
           </div>
         ) : loading ? (
-          <p className="px-1 text-[11px] text-zinc-600">Listing…</p>
+          <p className="px-1 text-[11px] text-zinc-400">Listing…</p>
         ) : roots.length === 0 ? (
-          <p className="px-1 text-[11px] text-zinc-600">Empty folder</p>
+          <p className="px-1 text-[11px] text-zinc-400">Empty folder</p>
         ) : (
           renderNodes(roots, 0)
         )}

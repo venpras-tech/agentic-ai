@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type {
+  AuditEntry,
   ContextUsage,
   GenParams,
   FileNode,
@@ -10,6 +11,8 @@ import type {
   ModelInfo,
   PolicySnapshot,
   RemoteModelConfig,
+  CheckpointInfo,
+  ToolResultInfo,
 } from "../types";
 import { parseEvent, type EngineHandlers } from "./events";
 
@@ -80,6 +83,7 @@ const onToolOutputEvent = "agent://tool-output";
 const onStepEvent = "agent-step";
 const onSubtaskEvent = "agent-subtask";
 const onSkillsChangedEvent = "agent://skills-changed";
+const onPlanStepEvent = "agent://plan-step";
 
 export const api = {
   // ---- window chrome ----
@@ -126,6 +130,7 @@ export const api = {
 
   // ---- workspace / files ----
   pickWorkspaceFolder: () => tauriInvoke<string | null>("pick_workspace_folder"),
+  pickTextFile: () => tauriInvoke<string | null>("pick_text_file"),
   agentSetWorkspace: (root: string) => tauriInvoke<void>("agent_set_workspace", { root }),
   listDirectory: (root: string, relative: string | null = null) =>
     tauriInvoke<FileNode[]>("list_directory", { root, relative }),
@@ -137,9 +142,21 @@ export const api = {
     tauriInvoke<string | null>("save_file_as", { content }),
 
   // ---- permissions ----
-  agentRespondPermission: (requestId: string, allowed: boolean) =>
-    tauriInvoke<void>("agent_respond_permission", { requestId, allowed }),
+  agentRespondPermission: (requestId: string, decision: string) =>
+    tauriInvoke<void>("agent_respond_permission", { requestId, decision }),
   agentPolicySnapshot: () => tauriInvoke<PolicySnapshot>("agent_policy_snapshot"),
+
+  // ---- audit trail ----
+  agentAuditLog: (limit?: number) =>
+    tauriInvoke<AuditEntry[]>("agent_audit_log", { limit }),
+
+  // ---- git checkpoints (direct, from UI) ----
+  gitCheckpoint: (message?: string) =>
+    tauriInvoke<ToolResultInfo>("agent_git_checkpoint_cmd", { message }),
+  gitCheckpoints: () =>
+    tauriInvoke<CheckpointInfo[]>("agent_git_checkpoints_cmd"),
+  gitRevert: (commit?: string) =>
+    tauriInvoke<ToolResultInfo>("agent_git_revert_cmd", { commit }),
 
   // ---- skills & rules ----
   knowledgeScan: () => tauriInvoke<KnowledgeReport>("knowledge_scan"),
@@ -197,6 +214,9 @@ export const api = {
         : []),
       ...(handlers.onSkillsChanged
         ? [listen(onSkillsChangedEvent, (e) => handlers.onSkillsChanged!(parseEvent(e.payload)))]
+        : []),
+      ...(handlers.onPlanStep
+        ? [listen(onPlanStepEvent, (e) => handlers.onPlanStep!(parseEvent(e.payload)))]
         : []),
     ]);
     return () => {

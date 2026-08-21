@@ -5,7 +5,7 @@ import type { PermissionRequest, PolicySnapshot } from "../types";
 interface PermissionModalProps {
   request: PermissionRequest | null;
   policy: PolicySnapshot | null;
-  onRespond: (requestId: string, allowed: boolean) => void;
+  onRespond: (requestId: string, decision: string) => void;
 }
 
 function toolLabel(tool: string): string {
@@ -41,10 +41,10 @@ export default function PermissionModal({ request, policy, onRespond }: Permissi
       if (!request) return;
       if (e.key === "Escape") {
         e.preventDefault();
-        onRespond(request.requestId, false);
+        onRespond(request.requestId, "deny");
       } else if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        onRespond(request.requestId, true);
+        onRespond(request.requestId, "allow_once");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -55,14 +55,14 @@ export default function PermissionModal({ request, policy, onRespond }: Permissi
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/60"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
       role="dialog"
       aria-modal="true"
       aria-label="Permission request"
     >
       <div className="flex w-[30rem] max-w-[92vw] flex-col gap-3 rounded-lg border border-border bg-panel-2 p-4 shadow-2xl">
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/20 text-[12px] text-amber-300">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/20 text-[12px] text-amber-600">
             ⚠
           </span>
           <span className="text-[13px] font-semibold text-ink">
@@ -70,7 +70,7 @@ export default function PermissionModal({ request, policy, onRespond }: Permissi
           </span>
         </div>
 
-        <p className="rounded border border-border bg-panel px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-300">
+        <p className="rounded border border-border bg-panel px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-700">
           {request.summary}
         </p>
 
@@ -83,26 +83,40 @@ export default function PermissionModal({ request, policy, onRespond }: Permissi
           </p>
         )}
 
-        <div className="mt-1 flex items-center justify-between gap-3">
-          <span className="text-[10px] text-zinc-600">
-            Enter to allow · Esc to deny
-          </span>
-          <div className="flex items-center gap-2">
-            <button
-              ref={denyBtnRef}
-              onClick={() => onRespond(request.requestId, false)}
-              className="rounded border border-border px-4 py-1.5 text-[12px] font-medium text-zinc-300 hover:border-red-400/50 hover:text-red-300"
-            >
-              Deny
-            </button>
-            <button
-              onClick={() => onRespond(request.requestId, true)}
-              className="rounded bg-accent px-4 py-1.5 text-[12px] font-semibold text-black hover:bg-cyan-300"
-            >
-              Allow
-            </button>
-          </div>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            ref={denyBtnRef}
+            onClick={() => onRespond(request.requestId, "deny")}
+            className="rounded border border-border px-3 py-1.5 text-[12px] font-medium text-zinc-700 hover:border-red-400/50 hover:text-red-600"
+          >
+            Deny
+          </button>
+          <button
+            onClick={() => onRespond(request.requestId, "allow_once")}
+            className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-cyan-500"
+          >
+            Allow once
+          </button>
+          <button
+            onClick={() => onRespond(request.requestId, "allow_session")}
+            title="Allow every call of this tool (this exact command for terminal) for the rest of the session"
+            className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-[12px] font-medium text-emerald-600 hover:bg-emerald-500/20"
+          >
+            Allow for session
+          </button>
+          <button
+            onClick={() => onRespond(request.requestId, "always_allow")}
+            title="Write an allow rule to .ai/policy.json so this tool never asks again"
+            className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-[12px] font-medium text-emerald-600 hover:bg-emerald-500/20"
+          >
+            Always allow
+          </button>
         </div>
+
+        <p className="text-[10px] text-zinc-400">
+          Enter = allow once · Esc = deny. "Always allow" writes a rule to{" "}
+          <span className="font-mono">.ai/policy.json</span>; session memory lasts for this run.
+        </p>
       </div>
     </div>
   );

@@ -66,7 +66,7 @@ export default function EditorPane({ file, onContentChange }: EditorPaneProps) {
         language={languageFromPath(file.path)}
         value={file.content}
         onChange={(value) => onContentChange(value ?? "")}
-        theme="vs-dark"
+        theme="vs"
         options={{
           fontSize: 13,
           fontFamily:

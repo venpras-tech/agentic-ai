@@ -22,11 +22,12 @@ pub mod core;
 pub mod interrupt;
 pub mod mcp;
 pub mod orchestrator;
+pub mod plan;
 pub mod policy;
 pub mod skills;
 pub mod tools;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -132,6 +133,37 @@ pub enum ToolCall {
     ReadSkill {
         name: String,
     },
+    #[serde(rename_all = "camelCase")]
+    SemanticSearchCodebase {
+        query: String,
+        #[serde(default)]
+        include: Option<String>,
+        root: Option<String>,
+        #[serde(default)]
+        respect_gitignore: Option<bool>,
+        #[serde(default)]
+        top_k: Option<usize>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CreatePlan {
+        title: String,
+        #[serde(default)]
+        goal: String,
+        items: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ReadPlan {},
+    #[serde(rename_all = "camelCase")]
+    UpdatePlan {
+        /// 1-based plan item index.
+        item: usize,
+        /// "not_started" | "in_progress" | "completed" | "terminal".
+        status: String,
+        #[serde(default)]
+        details: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ExecutePlan {},
 }
 
 impl ToolCall {
@@ -153,6 +185,11 @@ impl ToolCall {
             ToolCall::WriteFile { .. } => "write_file",
             ToolCall::CreateSkill { .. } => "create_skill",
             ToolCall::ReadSkill { .. } => "read_skill",
+            ToolCall::SemanticSearchCodebase { .. } => "semantic_search_codebase",
+            ToolCall::CreatePlan { .. } => "create_plan",
+            ToolCall::ReadPlan { .. } => "read_plan",
+            ToolCall::UpdatePlan { .. } => "update_plan",
+            ToolCall::ExecutePlan { .. } => "execute_plan",
         }
     }
 
@@ -195,6 +232,17 @@ impl ToolCall {
             }
             ToolCall::CreateSkill { name, .. } => format!("Learning skill `{name}`…"),
             ToolCall::ReadSkill { name, .. } => format!("Loading skill `{name}`…"),
+            ToolCall::SemanticSearchCodebase { query, .. } => {
+                format!("Semantic search: `{query}`…")
+            }
+            ToolCall::CreatePlan { title, items, .. } => {
+                format!("Creating plan `{title}` ({} items)…", items.len())
+            }
+            ToolCall::ReadPlan { .. } => "Reading the active plan…".into(),
+            ToolCall::UpdatePlan { item, status, .. } => {
+                format!("Updating plan item #{item} → {status}…")
+            }
+            ToolCall::ExecutePlan { .. } => "Executing the approved plan…".into(),
         }
     }
 }
@@ -283,6 +331,38 @@ pub struct FileChangedEvent {
     pub diff: Option<String>,
 }
 
+/// Per-plan-item progress event (blueprint §11 `step_started`/`step_completed`).
+/// Emitted on `agent://plan-step`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStepEvent {
+    pub session_id: u64,
+    pub plan_id: String,
+    /// 1-based index of the plan item.
+    pub item_index: usize,
+    pub title: String,
+    /// "in_progress" | "completed" | "terminal" | "failed".
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// How a human answered a policy-`ask` permission request. Carried over the
+/// permission response channel and serialized to the UI as the button choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// Allow exactly this one call; ask again next time.
+    AllowOnce,
+    /// Allow every call of this tool (exact command, for terminal) for the rest
+    /// of the session.
+    AllowSession,
+    /// Allow forever by writing an `allow` rule to `.ai/policy.json`.
+    AlwaysAllow,
+    /// Deny this call.
+    Deny,
+}
+
 /// Long-lived agent state managed by Tauri.
 pub struct ToolState {
     /// Current workspace root, shared with the workspace picker.
@@ -293,12 +373,29 @@ pub struct ToolState {
     pub id: AtomicU64,
     /// Pending permission requests keyed by request id (see `policy::check`).
     pub permission_requests:
-        Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+        Mutex<HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>>,
     /// Monotonic permission request id counter.
     pub request_id: AtomicU64,
+    /// Tools the user "allowed for this session" (see `PermissionDecision`).
+    /// Keyed by tool name, or `execute_terminal_command:<command>` for terminal
+    /// calls so one approved command never silently covers a different one.
+    pub session_allow: std::sync::Mutex<HashSet<String>>,
     /// Skills & rules snapshot, shared with the `KnowledgeState` managed state
     /// so the `read_skill` tool can load any skill's full text on demand.
     pub knowledge: std::sync::Arc<skills::KnowledgeState>,
+    /// Active persisted plan for the workspace (`.ai/plan.json`), if any.
+    pub plan: std::sync::Mutex<Option<plan::PlanState>>,
+    /// Guards against nested `execute_plan` re-entry (a plan executing itself).
+    pub plan_executing: std::sync::Mutex<bool>,
+    /// Clone of the engine pool so the `execute_plan` tool can drive its own
+    /// per-item agent loops. Kept in sync with `InferenceState.pool` on every
+    /// load/unload/configure.
+    pub engine: tokio::sync::Mutex<Option<std::sync::Arc<crate::engine::EnginePool>>>,
+    /// Clone of the emitter channel so nested plan-item loops can stream
+    /// tokens/steps to the UI. Kept in sync with `InferenceState.worker_tx`.
+    pub worker_tx: std::sync::Mutex<Option<crossbeam_channel::Sender<crate::engine::WorkerEvent>>>,
+    /// The session currently running the agent loop (for plan-step events).
+    pub session_id: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ToolState {
@@ -309,7 +406,13 @@ impl Default for ToolState {
             id: AtomicU64::new(1),
             permission_requests: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
+            session_allow: std::sync::Mutex::new(HashSet::new()),
             knowledge: std::sync::Arc::new(skills::KnowledgeState::default()),
+            plan: std::sync::Mutex::new(None),
+            plan_executing: std::sync::Mutex::new(false),
+            engine: tokio::sync::Mutex::new(None),
+            worker_tx: std::sync::Mutex::new(None),
+            session_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -321,6 +424,12 @@ impl ToolState {
 
     pub fn next_request_id(&self) -> String {
         format!("perm-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Remember which session is running the agent loop, so the `execute_plan`
+    /// tool can address its `plan-step` events to the correct chat message.
+    pub fn note_session(&self, session_id: u64) {
+        self.session_id.store(session_id, Ordering::SeqCst);
     }
 }
 

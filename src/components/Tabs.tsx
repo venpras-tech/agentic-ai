@@ -11,7 +11,7 @@ export default function Tabs({ files, activeKey, onSelect, onClose }: TabsProps)
   if (files.length === 0) {
     return (
       <div className="flex h-9 shrink-0 items-center border-b border-border bg-panel px-3">
-        <span className="text-[11px] text-zinc-600">Welcome — open a file to start editing</span>
+        <span className="text-[11px] text-zinc-400">Welcome — open a file to start editing</span>
       </div>
     );
   }
@@ -30,7 +30,7 @@ export default function Tabs({ files, activeKey, onSelect, onClose }: TabsProps)
             className={`group flex max-w-52 cursor-pointer items-center gap-1.5 border-r border-border px-3 text-[12px] ${
               active
                 ? "bg-editor font-medium text-ink"
-                : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300"
+                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700"
             }`}
           >
             {!f.saved && <span className="text-accent">●</span>}
@@ -41,7 +41,7 @@ export default function Tabs({ files, activeKey, onSelect, onClose }: TabsProps)
                 onClose(f.id);
               }}
               title="Close"
-              className="rounded px-1 text-zinc-500 opacity-0 hover:bg-white/10 hover:text-white group-hover:opacity-100"
+              className="rounded px-1 text-zinc-500 opacity-0 hover:bg-zinc-100 hover:text-zinc-800 group-hover:opacity-100"
             >
               ✕
             </button>

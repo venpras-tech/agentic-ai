@@ -31,6 +31,7 @@ export function useEngineEvents(handlers: EngineHandlers) {
       onToolOutput: (e) => ref.current.onToolOutput?.(e),
       onStep: (e) => ref.current.onStep?.(e),
       onSubtask: (e) => ref.current.onSubtask?.(e),
+      onPlanStep: (e) => ref.current.onPlanStep?.(e),
       onSkillsChanged: (e) => ref.current.onSkillsChanged?.(e),
     }).then((un) => {
       if (disposed) un();

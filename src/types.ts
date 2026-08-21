@@ -41,6 +41,12 @@ export interface ChatMessage {
   content: string;
   sessionId?: number;
   tools?: AgentToolEvent[];
+  /** Per-step telemetry for this turn (plan / subtask / execute phases). */
+  steps?: StepTimelineStep[];
+  /** File diffs attached to this turn (agent://file-changed), in order. */
+  diffs?: FileChangedEvent[];
+  /** Turn-lifecycle stats when this assistant turn finished. */
+  done?: InferenceDone;
 }
 
 export interface AgentToolEvent {
@@ -68,6 +74,18 @@ export interface ToolOutputEvent {
 
 export interface StepStat {
   step: number;
+  /** Phase label from the orchestrator: "Plan", "Execute" or
+   *  "Subtask N/M · title". Used to group steps into a collapsible timeline. */
+  group: string;
+  tokens: number;
+  elapsedMs: number;
+  toolCalls: number;
+}
+
+/** One step already folded into a chat message's timeline. */
+export interface StepTimelineStep {
+  step: number;
+  group: string;
   tokens: number;
   elapsedMs: number;
   toolCalls: number;
@@ -102,7 +120,41 @@ export interface InferenceDone {
   tokensPerSec: number;
   elapsedMs: number;
   stopReason: string;
+  /** Turn lifecycle outcome: "completed" | "failed" | "interrupted" | "error". */
+  outcome: string;
+  /** Prompt tokens sent to the model this turn. */
+  inputTokens: number;
+  /** Tokens generated this turn. */
+  outputTokens: number;
+  /** Tokens served from a prompt cache (0 for local llama.cpp). */
+  cacheReadTokens: number;
+  /** Tokens written into the prompt cache. */
+  cacheWriteTokens: number;
+  /** Reasoning/thinking tokens, when the provider reports them. */
+  reasoningTokens: number;
 }
+
+/** One tool-decision record from `.ai/audit.jsonl` (camelCase). */
+export interface AuditEntry {
+  ts: number;
+  id: string;
+  tool: string;
+  summary: string;
+  /** "allow" | "deny" | "granted" | "granted-session" | "granted-always" |
+   *  "declined" | "timed-out" | "aborted". */
+  decision: string;
+  startedAt?: number;
+  latencyMs: number;
+  success: boolean | null;
+  error: string | null;
+}
+
+/** How the user answered a permission prompt (see PermissionDecision in Rust). */
+export type PermissionDecision =
+  | "allow_once"
+  | "allow_session"
+  | "always_allow"
+  | "deny";
 
 export interface OpenFile {
   id: string;
@@ -158,4 +210,38 @@ export interface PolicyRule {
 export interface PolicySnapshot {
   default: string;
   rules: PolicyRule[];
+}
+
+export interface CheckpointInfo {
+  hash: string;
+  subject: string;
+  relative: string;
+}
+
+export interface ToolResultInfo {
+  success: boolean;
+  tool: string;
+  summary: string;
+  stdout?: string;
+  error?: string;
+  durationMs: number;
+}
+
+/** Aggregate ledger entry for one agentic session. */
+export interface LedgerEntry {
+  sessionId: number;
+  label: string;
+  tokens: number;
+  toolCalls: number;
+  elapsedMs: number;
+}
+
+/** Per-plan-item progress event (agent://plan-step). */
+export interface PlanStepEvent {
+  sessionId: number;
+  planId: string;
+  itemIndex: number;
+  title: string;
+  status: "in_progress" | "completed" | "terminal" | "failed";
+  error?: string;
 }

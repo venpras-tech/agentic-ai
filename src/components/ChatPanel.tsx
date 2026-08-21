@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { AgentToolEvent, ChatMessage, InferenceDone } from "../types";
+import type {
+  AgentToolEvent,
+  ChatMessage,
+  InferenceDone,
+  StepTimelineStep,
+} from "../types";
+import DiffView from "./DiffView";
 
 export interface SendOptions {
   planMode?: boolean;
@@ -41,6 +47,108 @@ const SLASH_HINTS: { cmd: string; hint: string }[] = [
   { cmd: "/clear", hint: "clear conversation" },
 ];
 
+/** Human-readable label + badge style for a turn outcome. */
+function outcomeLabel(outcome: string): string {
+  switch (outcome) {
+    case "completed":
+      return "done";
+    case "failed":
+      return "failed";
+    case "interrupted":
+      return "interrupted";
+    case "error":
+      return "error";
+    default:
+      return outcome;
+  }
+}
+
+/** Small color-coded lifecycle badge shown on a finished assistant turn. */
+function OutcomeBadge({ outcome }: { outcome: string }) {
+  const styles: Record<string, string> = {
+    completed: "bg-emerald-500/15 text-emerald-600",
+    failed: "bg-red-500/15 text-red-600",
+    interrupted: "bg-amber-500/15 text-amber-600",
+    error: "bg-red-500/15 text-red-600",
+  };
+  return (
+    <span
+      className={`rounded px-1.5 py-px text-[9px] font-semibold normal-case tracking-normal ${
+        styles[outcome] ?? "bg-zinc-500/15 text-zinc-500"
+      }`}
+    >
+      {outcomeLabel(outcome)}
+    </span>
+  );
+}
+
+/** Grouped, collapsible per-step telemetry for one assistant turn. Steps
+ *  arriving from the orchestrator carry a phase label ("Plan", "Execute" or
+ *  "Subtask N/M · title"); we group by that label, preserving first-seen order,
+ *  and collapse everything into a single header when the turn has one group. */
+function StepTimeline({ steps }: { steps: StepTimelineStep[] }) {
+  const groups: { label: string; steps: StepTimelineStep[] }[] = [];
+  const seen = new Map<string, number>();
+  for (const s of steps) {
+    const idx = seen.get(s.group);
+    if (idx == null) {
+      seen.set(s.group, groups.length);
+      groups.push({ label: s.group, steps: [s] });
+    } else {
+      groups[idx].steps.push(s);
+    }
+  }
+
+  const [collapsed, setCollapsed] = useState<Set<string>>(() =>
+    groups.length > 1 ? new Set(groups.slice(1).map((g) => g.label)) : new Set(),
+  );
+  const toggle = (label: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+
+  if (groups.length === 0) return null;
+  return (
+    <div className="mt-2 space-y-1 rounded-md border border-border bg-panel-2/40 p-1.5">
+      {groups.map((g) => {
+        const isCollapsed = collapsed.has(g.label);
+        const tokens = g.steps.reduce((a, s) => a + s.tokens, 0);
+        const tools = g.steps.reduce((a, s) => a + s.toolCalls, 0);
+        return (
+          <div key={g.label}>
+            <button
+              onClick={() => toggle(g.label)}
+              className="flex w-full items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[10.5px] hover:bg-panel-2/70"
+            >
+              <span className="text-zinc-400">{isCollapsed ? "▸" : "▾"}</span>
+              <span className="truncate font-medium text-zinc-700">{g.label}</span>
+              <span className="ml-auto shrink-0 text-zinc-400">
+                {g.steps.length} step{g.steps.length !== 1 ? "s" : ""} · {tokens} tok
+                {tools > 0 ? ` · ${tools} tool${tools !== 1 ? "s" : ""}` : ""}
+              </span>
+            </button>
+            {!isCollapsed && (
+              <div className="ml-3 space-y-0.5 border-l border-border pl-2">
+                {g.steps.map((s, i) => (
+                  <div key={i} className="flex items-center gap-2 text-[10px] text-zinc-500">
+                    <span className="text-zinc-500">#{s.step}</span>
+                    <span>{s.tokens} tok</span>
+                    <span>{s.elapsedMs}ms</span>
+                    {s.toolCalls > 0 && <span>{s.toolCalls} tool(s)</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ToolCard({ event }: { event: AgentToolEvent }) {
   const running = event.status === "running";
   const failed = event.status === "error";
@@ -52,10 +160,10 @@ function ToolCard({ event }: { event: AgentToolEvent }) {
             running ? "animate-pulse bg-amber-400" : failed ? "bg-red-400" : "bg-emerald-400"
           }`}
         />
-        <span className="truncate font-medium text-zinc-300">
+        <span className="truncate font-medium text-zinc-700">
           {event.tool.replaceAll("_", " ")}
         </span>
-        <span className="ml-auto shrink-0 text-zinc-600">
+        <span className="ml-auto shrink-0 text-zinc-400">
           {running
             ? "running…"
             : event.durationMs != null
@@ -67,12 +175,12 @@ function ToolCard({ event }: { event: AgentToolEvent }) {
         {event.summary}
       </p>
       {event.output && (event.output.trim()?.length ?? 0) > 0 && (
-        <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-black/40 px-1.5 py-1 font-mono text-[10px] leading-snug text-zinc-400">
+        <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 px-1.5 py-1 font-mono text-[10px] leading-snug text-zinc-500">
           {event.output}
         </pre>
       )}
       {event.detail && (
-        <p className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap text-[10px] leading-snug text-red-300/80">
+        <p className="mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap text-[10px] leading-snug text-red-600/80">
           {event.detail}
         </p>
       )}
@@ -185,8 +293,8 @@ export default function ChatPanel(props: ChatPanelProps) {
               title="After edits, run tests/typecheck before finishing"
               className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
                 verify
-                  ? "bg-emerald-500/20 text-emerald-300"
-                  : "border border-border text-zinc-500 hover:text-zinc-300"
+                  ? "bg-emerald-500/20 text-emerald-600"
+                  : "border border-border text-zinc-500 hover:text-zinc-700"
               }`}
             >
               Verify
@@ -197,26 +305,26 @@ export default function ChatPanel(props: ChatPanelProps) {
             title="Toggle agentic tool-use mode"
             className={`rounded px-2 py-0.5 text-[10px] font-semibold transition-colors ${
               agentMode
-                ? "bg-cyan-500/20 text-cyan-300"
-                : "border border-border text-zinc-500 hover:text-zinc-300"
+                ? "bg-cyan-500/20 text-cyan-600"
+                : "border border-border text-zinc-500 hover:text-zinc-700"
             }`}
           >
             Agent
           </button>
           {currentStep != null && isStreaming && (
-            <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+            <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
               step {currentStep}
             </span>
           )}
           {currentSubtask != null && isStreaming && (
             <span
-              className="shrink-0 truncate rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-300"
+              className="shrink-0 truncate rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-600"
               title={currentSubtask.title}
             >
               subtask {currentSubtask.index}/{currentSubtask.total}
             </span>
           )}
-          <span className="max-w-24 truncate text-[10px] text-zinc-600">
+          <span className="max-w-24 truncate text-[10px] text-zinc-400">
             {modelName ?? "no model loaded"}
           </span>
         </div>
@@ -224,7 +332,7 @@ export default function ChatPanel(props: ChatPanelProps) {
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-2 text-[12.5px]">
         {messages.length === 0 && !isStreaming && (
-          <p className="mt-6 text-center text-[11px] leading-relaxed text-zinc-600">
+          <p className="mt-6 text-center text-[11px] leading-relaxed text-zinc-400">
             Load a model and ask it anything.
             <br />
             Enter = send · Shift+Enter = newline
@@ -238,18 +346,19 @@ export default function ChatPanel(props: ChatPanelProps) {
         {messages.map((m, i) =>
           m.role === "user" ? (
             <div key={i} className="mb-2 flex justify-end">
-              <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-accent/15 px-2.5 py-1.5 text-left text-zinc-200">
+              <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-accent/15 px-2.5 py-1.5 text-left text-zinc-800">
                 {m.content}
               </div>
             </div>
           ) : (
             <div key={i} className="mb-3">
-              <div className="mb-0.5 text-[10px] uppercase tracking-wider text-zinc-600">
-                {m.role === "error" ? "error" : "assistant"}
+              <div className="mb-0.5 flex items-center gap-2 text-[10px] uppercase tracking-wider text-zinc-400">
+                <span>{m.role === "error" ? "error" : "assistant"}</span>
+                {m.done && m.role !== "error" && <OutcomeBadge outcome={m.done.outcome} />}
               </div>
               <div
                 className={`whitespace-pre-wrap leading-relaxed ${
-                  m.role === "error" ? "text-red-300" : "text-ink"
+                  m.role === "error" ? "text-red-600" : "text-ink"
                 }`}
               >
                 {m.content || "…"}
@@ -258,13 +367,13 @@ export default function ChatPanel(props: ChatPanelProps) {
                 <div className="mt-2 flex items-center gap-2">
                   <button
                     onClick={onApprovePlan}
-                    className="rounded bg-emerald-500/20 px-3 py-1 text-[11px] font-semibold text-emerald-300 hover:bg-emerald-500/30"
+                    className="rounded bg-emerald-500/20 px-3 py-1 text-[11px] font-semibold text-emerald-600 hover:bg-emerald-500/30"
                   >
                     ✓ Approve &amp; Execute
                   </button>
                   <button
                     onClick={onRejectPlan}
-                    className="rounded border border-border px-3 py-1 text-[11px] font-medium text-zinc-400 hover:text-zinc-200"
+                    className="rounded border border-border px-3 py-1 text-[11px] font-medium text-zinc-500 hover:text-zinc-800"
                   >
                     ✕ Reject
                   </button>
@@ -274,6 +383,14 @@ export default function ChatPanel(props: ChatPanelProps) {
                 <div className="mt-2 space-y-1">
                   {m.tools.map((t) => (
                     <ToolCard key={t.id} event={t} />
+                  ))}
+                </div>
+              )}
+              {m.steps && m.steps.length > 0 && <StepTimeline steps={m.steps} />}
+              {m.diffs && m.diffs.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {m.diffs.map((d, di) => (
+                    <DiffView key={`${d.path}-${di}`} path={d.path} diff={d.diff ?? ""} />
                   ))}
                 </div>
               )}
@@ -295,7 +412,7 @@ export default function ChatPanel(props: ChatPanelProps) {
               <button
                 key={s.cmd}
                 onClick={() => setInput(s.cmd + " ")}
-                className="rounded border border-border px-1.5 py-0.5 text-[10px] text-zinc-400 hover:border-accent/50 hover:text-accent"
+                className="rounded border border-border px-1.5 py-0.5 text-[10px] text-zinc-500 hover:border-accent/50 hover:text-accent"
                 title={s.hint}
               >
                 {s.cmd}
@@ -321,13 +438,13 @@ export default function ChatPanel(props: ChatPanelProps) {
           }
           rows={3}
           disabled={!modelName}
-          className="w-full resize-none rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[12.5px] text-ink outline-none placeholder:text-zinc-600 focus:border-accent/60 disabled:opacity-50"
+          className="w-full resize-none rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[12.5px] text-ink outline-none placeholder:text-zinc-500 focus:border-accent/60 disabled:opacity-50"
         />
         <div className="mt-2 flex items-center justify-between">
           {isStreaming ? (
             <button
               onClick={onCancel}
-              className="rounded bg-red-500/15 px-3 py-1 text-[11px] font-medium text-red-300 hover:bg-red-500/25"
+              className="rounded bg-red-500/15 px-3 py-1 text-[11px] font-medium text-red-600 hover:bg-red-500/25"
             >
               ■ Stop
             </button>
@@ -335,14 +452,30 @@ export default function ChatPanel(props: ChatPanelProps) {
             <button
               onClick={submit}
               disabled={!input.trim() || !modelName}
-              className="rounded bg-accent px-3.5 py-1 text-[11px] font-semibold text-black hover:bg-cyan-300 disabled:opacity-40"
+              className="rounded bg-accent px-3.5 py-1 text-[11px] font-semibold text-white hover:bg-cyan-500 disabled:opacity-40"
             >
               Send
             </button>
           )}
           {lastDone && !isStreaming && (
-            <span className="text-[10px] tabular-nums text-zinc-600">
-              {lastDone.totalTokens} tok · {lastDone.tokensPerSec.toFixed(1)} tok/s ·{" "}
+            <span
+              className="text-[10px] tabular-nums text-zinc-400"
+              title={
+                `in ${lastDone.inputTokens} tok · out ${lastDone.outputTokens} tok` +
+                (lastDone.cacheReadTokens > 0
+                  ? ` · cache read ${lastDone.cacheReadTokens}`
+                  : "") +
+                (lastDone.cacheWriteTokens > 0
+                  ? ` · cache write ${lastDone.cacheWriteTokens}`
+                  : "") +
+                (lastDone.reasoningTokens > 0
+                  ? ` · reasoning ${lastDone.reasoningTokens}`
+                  : "") +
+                ` · ${lastDone.generatedChars} chars`
+              }
+            >
+              {outcomeLabel(lastDone.outcome)} · {lastDone.outputTokens} tok out ·{" "}
+              {lastDone.inputTokens} tok in · {lastDone.tokensPerSec.toFixed(1)} tok/s ·{" "}
               {lastDone.stopReason}
             </span>
           )}

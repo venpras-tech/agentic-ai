@@ -26,9 +26,11 @@ use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::context::ContextMessage;
-use super::{core::parse_tool_calls, tools, ToolCall, ToolResult, ToolState};
+use super::plan::{self, PlanState, PlanStatus};
+use super::{core::parse_tool_calls, tools, PlanStepEvent, ToolCall, ToolResult, ToolState};
 use crate::engine::{
-    InferenceDone, InferenceRequest, StepStat, SubtaskStat, TextGenerator, WorkerEvent,
+    EnginePool, InferenceDone, InferenceRequest, StepStat, SubtaskStat, TextGenerator,
+    WorkerEvent,
 };
 
 /// Default ceiling on tool-call feedback rounds per task.
@@ -179,15 +181,39 @@ pub struct AgentOutcome {
     pub done: InferenceDone,
 }
 
-/// Run the generate → parse → dispatch → feedback loop to completion (or until
-/// the circuit breaker fires / step budget is exhausted).
-///
-/// `context_messages` is a snapshot taken under the context lock *before* the
-/// worker thread is spawned; the loop appends assistant/tool messages to its
-/// own working copy so the shared `ContextManager` is never mutated from the
-/// worker.
-pub fn run_agent_loop(
-    gen: &mut dyn TextGenerator,
+/// Aggregate stats for a completed (sub)task phase. `total_tokens` is the sum of
+/// generated (output) tokens across the phase's generations; the input/cache
+/// fields mirror `InferenceDone` so the whole task can report honest accounting.
+struct FocusOutcome {
+    total_tokens: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    generated_chars: u64,
+    reason: String,
+}
+
+/// Result of one parallel subtask's focused loop.
+struct SubResult {
+    group: String,
+    success: bool,
+    output_tokens: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    chars: u64,
+}
+
+/// Pool version of the agent loop: the caller holds an [`EnginePool`]
+/// (several worker threads, each owning its own generator) instead of one
+/// `&mut dyn TextGenerator`. Sequential phases use a handle to worker 0; a
+/// decomposed task with more than one subtask *and* more than one worker runs
+/// its subtasks concurrently — one per worker — which is the "parallel agent
+/// threads" feature. There is no `'static` transmute anywhere on this path.
+pub fn run_agent_loop_pool(
+    pool: &EnginePool,
     tool_state: &ToolState,
     app: &AppHandle,
     interrupt: &CancellationToken,
@@ -202,26 +228,64 @@ pub fn run_agent_loop(
         .unwrap_or(DEFAULT_MAX_STEPS)
         .clamp(1, ABSOLUTE_MAX_STEPS);
     let mut messages: Vec<ContextMessage> = context_messages.to_vec();
-    // Cap the *working* copy (assistant + tool feedback + heal injections added
-    // each step) at the same fraction the ContextManager uses for its snapshot,
-    // so a long multi-step task can never push the assembled prompt past the
-    // KV cache and fail mid-task with a context-overflow error.
     let working_budget = (context_budget as f32 * super::context::EVICTION_THRESHOLD) as usize;
 
-    // One current-thread runtime per task, used exclusively for tool dispatch
-    // (terminal sub-processes, MCP, fs). Generation never awaits — it runs
-    // synchronously on this thread against llama.cpp.
+    // One current-thread runtime for the sequential phases (tool dispatch).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to start agent runtime: {e}"))?;
 
+    // The primary handle drives plan mode, the summary and the flat loop.
+    let mut primary = pool.handle(0);
+
+    // Tell the tool layer which session is running (plan-step event routing).
+    tool_state.note_session(session_id);
+
     let started = Instant::now();
+
+    // ---- Greeting / small-talk interceptor.
+    // Tiny models (0.5 B) often hallucinate random content when the system
+    // prompt is long.  Detect trivial greetings and return a canned reply so
+    // the user gets a sensible response without burning tokens.
+    if let Some(last_user) = messages.last() {
+        if last_user.role == "user" && is_greeting(&last_user.content) {
+            let reply = greeting_reply(&last_user.content);
+            let elapsed = started.elapsed().as_millis() as u64;
+            let _ = tx.send(WorkerEvent::Token {
+                session_id,
+                delta: reply.clone(),
+            });
+            let _ = tx.send(WorkerEvent::Done {
+                session_id,
+                done: InferenceDone {
+                    total_tokens: 0,
+                    generated_chars: reply.len() as u64,
+                    tokens_per_sec: 0.0,
+                    elapsed_ms: elapsed,
+                    stop_reason: "done".into(),
+                    outcome: "completed".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+            });
+            return finish_outcome(
+                started, 0, 0, 0, 0, 0, reply.len() as u64, "done".into(),
+            );
+        }
+    }
+
     let mut total_tokens = 0u64;
+    let mut input_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
     let mut generated_chars = 0u64;
 
-    // ---- Plan → Act separation: plan mode runs a single focused step that may
-    // never call tools (the plan is reviewed and approved before execution).
+    // ---- Plan → Act separation (single focused step, tools forbidden).
     if request.plan_mode {
         let plan_instruction = "You are in PLAN MODE. Produce a concise, numbered \
              step-by-step plan to accomplish the user's request. Do NOT call any \
@@ -229,23 +293,167 @@ pub fn run_agent_loop(
              approved before execution."
             .to_string();
         let outcome = run_focused_steps(
-            gen, tool_state, app, interrupt, tx, session_id, &rt, &mut messages, request,
-            Some(&plan_instruction), working_budget, 1,
+            &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages,
+            request, Some(&plan_instruction), working_budget, 1, "Plan",
         )?;
         total_tokens += outcome.total_tokens;
+        input_tokens += outcome.input_tokens;
+        cache_read_tokens += outcome.cache_read_tokens;
+        cache_write_tokens += outcome.cache_write_tokens;
+        reasoning_tokens += outcome.reasoning_tokens;
         generated_chars += outcome.generated_chars;
-        return finish_outcome(started, total_tokens, generated_chars, outcome.reason);
+        return finish_outcome(
+            started,
+            total_tokens,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            generated_chars,
+            outcome.reason,
+        );
     }
 
-    // ---- Sub-task decomposition: plan → per-subtask focused loops → summary.
-    // Subtasks run sequentially (one model, one engine); tool calls *within* a
-    // subtask still fan out concurrently. A failing subtask is recorded and the
-    // remaining subtasks continue — only an all-failed run reports "stuck".
+    // ---- Sub-task decomposition. Parallel when there are spare workers;
+    // otherwise sequential (identical semantics to the single-gen loop).
     if request.decompose {
-        if let Some(subtasks) =
-            plan_subtasks(gen, interrupt, tx, session_id, &mut messages, request, working_budget)?
-        {
+        if let Some(subtasks) = plan_subtasks(
+            &mut primary, interrupt, tx, session_id, &mut messages, request, working_budget,
+        )? {
             if !subtasks.is_empty() {
+                let workers = pool.len();
+                let parallel = subtasks.len() > 1 && workers > 1;
+
+                if parallel {
+                    let results = std::thread::scope(|s| -> Result<Vec<SubResult>, String> {
+                        let messages_ref: &Vec<ContextMessage> = &messages;
+                        let mut handles = Vec::with_capacity(subtasks.len());
+                        for (i, sub) in subtasks.iter().enumerate() {
+                            let mut gen = pool.handle(i);
+                            let group = format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title);
+                            let instruction = sub.instruction.clone();
+                            let title = sub.title.clone();
+                            let total = subtasks.len();
+                            handles.push(s.spawn(move || -> Result<SubResult, String> {
+                                let sub_rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .map_err(|e| format!("Failed to start subtask runtime: {e}"))?;
+                                let _ = tx.send(WorkerEvent::Subtask {
+                                    session_id,
+                                    subtask: SubtaskStat {
+                                        index: i + 1,
+                                        total,
+                                        title: title.clone(),
+                                        status: "running".into(),
+                                    },
+                                });
+                                let mut sub_messages = messages_ref.to_vec();
+                                let r = run_focused_steps(
+                                    &mut gen, tool_state, app, interrupt, tx, session_id,
+                                    &sub_rt, &mut sub_messages, request, Some(&instruction),
+                                    working_budget, max_steps, &group,
+                                );
+                                let (success, out, inp, cache_r, cache_w, reas, chars) = match r {
+                                    Ok(o) if o.reason != "stuck" => (
+                                        true,
+                                        o.total_tokens,
+                                        o.input_tokens,
+                                        o.cache_read_tokens,
+                                        o.cache_write_tokens,
+                                        o.reasoning_tokens,
+                                        o.generated_chars,
+                                    ),
+                                    Ok(o) => (
+                                        false,
+                                        o.total_tokens,
+                                        o.input_tokens,
+                                        o.cache_read_tokens,
+                                        o.cache_write_tokens,
+                                        o.reasoning_tokens,
+                                        o.generated_chars,
+                                    ),
+                                    Err(_) => (false, 0, 0, 0, 0, 0, 0),
+                                };
+                                let status = if success { "done" } else { "failed" };
+                                let _ = tx.send(WorkerEvent::Subtask {
+                                    session_id,
+                                    subtask: SubtaskStat {
+                                        index: i + 1,
+                                        total,
+                                        title,
+                                        status: status.into(),
+                                    },
+                                });
+                                Ok(SubResult {
+                                    group,
+                                    success,
+                                    output_tokens: out,
+                                    input_tokens: inp,
+                                    cache_read_tokens: cache_r,
+                                    cache_write_tokens: cache_w,
+                                    reasoning_tokens: reas,
+                                    chars,
+                                })
+                            }));
+                        }
+                        let mut results = Vec::with_capacity(handles.len());
+                        for h in handles {
+                            let r: SubResult = h.join().map_err(|_| "Subtask thread panicked".to_string())??;
+                            results.push(r);
+                        }
+                        Ok(results)
+                    })?;
+
+                    let mut failed = 0usize;
+                    for r in results {
+                        total_tokens += r.output_tokens;
+                        input_tokens += r.input_tokens;
+                        cache_read_tokens += r.cache_read_tokens;
+                        cache_write_tokens += r.cache_write_tokens;
+                        reasoning_tokens += r.reasoning_tokens;
+                        generated_chars += r.chars;
+                        if !r.success {
+                            failed += 1;
+                        }
+                        messages.push(ContextMessage {
+                            role: "system".into(),
+                            content: format!(
+                                "Completed {} — {}",
+                                r.group,
+                                if r.success { "done" } else { "failed" }
+                            ),
+                            pinned: false,
+                        });
+                    }
+                    let summary = run_summary(
+                        &mut primary, interrupt, tx, session_id, &mut messages, request,
+                        working_budget,
+                    )?;
+                    total_tokens += summary.total_tokens;
+                    input_tokens += summary.input_tokens;
+                    cache_read_tokens += summary.cache_read_tokens;
+                    cache_write_tokens += summary.cache_write_tokens;
+                    reasoning_tokens += summary.reasoning_tokens;
+                    generated_chars += summary.generated_chars;
+                    let reason = if failed == subtasks.len() {
+                        "stuck".to_string()
+                    } else {
+                        summary.reason
+                    };
+                    return finish_outcome(
+                        started,
+                        total_tokens,
+                        input_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        reasoning_tokens,
+                        generated_chars,
+                        reason,
+                    );
+                }
+
+                // Sequential fallback (single worker or single subtask).
                 let mut failed = 0usize;
                 for (i, sub) in subtasks.iter().enumerate() {
                     let _ = tx.send(WorkerEvent::Subtask {
@@ -258,11 +466,16 @@ pub fn run_agent_loop(
                         },
                     });
                     match run_focused_steps(
-                        gen, tool_state, app, interrupt, tx, session_id, &rt, &mut messages,
+                        &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages,
                         request, Some(&sub.instruction), working_budget, max_steps,
+                        &format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title),
                     ) {
                         Ok(outcome) => {
                             total_tokens += outcome.total_tokens;
+                            input_tokens += outcome.input_tokens;
+                            cache_read_tokens += outcome.cache_read_tokens;
+                            cache_write_tokens += outcome.cache_write_tokens;
+                            reasoning_tokens += outcome.reasoning_tokens;
                             generated_chars += outcome.generated_chars;
                             if outcome.reason == "stuck" {
                                 failed += 1;
@@ -296,15 +509,31 @@ pub fn run_agent_loop(
                         }
                     }
                 }
-                let summary = run_summary(gen, interrupt, tx, session_id, &mut messages, request, working_budget)?;
+                let summary = run_summary(
+                    &mut primary, interrupt, tx, session_id, &mut messages, request,
+                    working_budget,
+                )?;
                 total_tokens += summary.total_tokens;
+                input_tokens += summary.input_tokens;
+                cache_read_tokens += summary.cache_read_tokens;
+                cache_write_tokens += summary.cache_write_tokens;
+                reasoning_tokens += summary.reasoning_tokens;
                 generated_chars += summary.generated_chars;
                 let reason = if failed == subtasks.len() {
                     "stuck".to_string()
                 } else {
                     summary.reason
                 };
-                return finish_outcome(started, total_tokens, generated_chars, reason);
+                return finish_outcome(
+                    started,
+                    total_tokens,
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    generated_chars,
+                    reason,
+                );
             }
         }
         // Planning yielded nothing usable → fall through to the flat loop.
@@ -312,24 +541,34 @@ pub fn run_agent_loop(
 
     // ---- Flat (default) mode: one continuous generate → act → feedback loop.
     let outcome = run_focused_steps(
-        gen, tool_state, app, interrupt, tx, session_id, &rt, &mut messages, request, None,
-        working_budget, max_steps,
+        &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages, request,
+        None, working_budget, max_steps, "Execute",
     )?;
     total_tokens += outcome.total_tokens;
+    input_tokens += outcome.input_tokens;
+    cache_read_tokens += outcome.cache_read_tokens;
+    cache_write_tokens += outcome.cache_write_tokens;
+    reasoning_tokens += outcome.reasoning_tokens;
     generated_chars += outcome.generated_chars;
-    finish_outcome(started, total_tokens, generated_chars, outcome.reason)
-}
-
-/// Aggregate stats for a completed (sub)task phase.
-struct FocusOutcome {
-    total_tokens: u64,
-    generated_chars: u64,
-    reason: String,
+    finish_outcome(
+        started,
+        total_tokens,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+        generated_chars,
+        outcome.reason,
+    )
 }
 
 fn finish_outcome(
     started: Instant,
     total_tokens: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
     generated_chars: u64,
     final_reason: String,
 ) -> Result<AgentOutcome, String> {
@@ -339,6 +578,11 @@ fn finish_outcome(
     } else {
         0.0
     };
+    let outcome = match final_reason.as_str() {
+        "cancelled" => "interrupted",
+        "stuck" => "failed",
+        _ => "completed",
+    };
     Ok(AgentOutcome {
         done: InferenceDone {
             total_tokens,
@@ -346,6 +590,12 @@ fn finish_outcome(
             tokens_per_sec,
             elapsed_ms,
             stop_reason: final_reason,
+            outcome: outcome.to_string(),
+            input_tokens,
+            output_tokens: total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
         },
     })
 }
@@ -356,7 +606,7 @@ fn finish_outcome(
 /// with a "step N" prefix (callers may recover from them, e.g. in decompose
 /// mode).
 #[allow(clippy::too_many_arguments)]
-fn run_focused_steps(
+pub(crate) fn run_focused_steps(
     gen: &mut dyn TextGenerator,
     tool_state: &ToolState,
     app: &AppHandle,
@@ -369,8 +619,13 @@ fn run_focused_steps(
     focus: Option<&str>,
     working_budget: usize,
     max_steps: usize,
+    group: &str,
 ) -> Result<FocusOutcome, String> {
     let mut total_tokens = 0u64;
+    let mut input_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
     let mut generated_chars = 0u64;
     let mut final_reason = "done".to_string();
     let mut consecutive_failed_steps = 0usize;
@@ -419,6 +674,10 @@ fn run_focused_steps(
             .generate(&gen_request, session_id, interrupt, tx)
             .map_err(|e| format!("Agent step {} failed: {e}", step + 1))?;
         total_tokens += outcome.done.total_tokens;
+        input_tokens += outcome.done.input_tokens;
+        cache_read_tokens += outcome.done.cache_read_tokens;
+        cache_write_tokens += outcome.done.cache_write_tokens;
+        reasoning_tokens += outcome.done.reasoning_tokens;
         generated_chars += outcome.done.generated_chars;
 
         if outcome.done.stop_reason == "cancelled" {
@@ -426,7 +685,7 @@ fn run_focused_steps(
             break;
         }
 
-        // Per-step telemetry so the UI can render a step timeline.
+        // Per-step telemetry so the UI can render a grouped step timeline.
         let step_tool_count = {
             let text = outcome.full_text.clone();
             parse_tool_calls(&text, &mut |_| {}).len()
@@ -435,6 +694,7 @@ fn run_focused_steps(
             session_id,
             step: StepStat {
                 step: step + 1,
+                group: group.to_string(),
                 tokens: outcome.done.total_tokens,
                 elapsed_ms: outcome.done.elapsed_ms,
                 tool_calls: step_tool_count,
@@ -463,6 +723,55 @@ fn run_focused_steps(
         if calls.is_empty() {
             break;
         }
+
+        // ---- `execute_plan`: drive the persisted plan's pending items as
+        // their own focused loops (blueprint §11). This runs *before* the
+        // dispatch phase, on the plain worker thread, so the nested loops can
+        // safely call `rt.block_on` themselves. The `ExecutePlan` call is then
+        // dropped from the batch (the plan loop already performed the work).
+        let mut plan_summary: Option<String> = None;
+        if calls.iter().any(|c| matches!(c, ToolCall::ExecutePlan { .. })) {
+            match execute_plan(
+                app, tool_state, &mut *gen, interrupt, tx, session_id, rt, request,
+                working_budget, max_steps,
+            ) {
+                Ok(pr) => {
+                    total_tokens += pr.outcome.total_tokens;
+                    input_tokens += pr.outcome.input_tokens;
+                    cache_read_tokens += pr.outcome.cache_read_tokens;
+                    cache_write_tokens += pr.outcome.cache_write_tokens;
+                    reasoning_tokens += pr.outcome.reasoning_tokens;
+                    generated_chars += pr.outcome.generated_chars;
+                    if pr.outcome.reason == "cancelled" {
+                        final_reason = "cancelled".to_string();
+                        break;
+                    }
+                    plan_summary = Some(pr.summary);
+                }
+                Err(e) => {
+                    messages.push(ContextMessage {
+                        role: "tool".into(),
+                        content: format!("`execute_plan` failed: {e}"),
+                        pinned: false,
+                    });
+                }
+            }
+        }
+        let calls: Vec<&ToolCall> = calls
+            .iter()
+            .filter(|c| !matches!(c, ToolCall::ExecutePlan { .. }))
+            .collect();
+        if calls.is_empty() {
+            if let Some(summary) = plan_summary {
+                messages.push(ContextMessage {
+                    role: "tool".into(),
+                    content: format!("`execute_plan` completed: {summary}"),
+                    pinned: false,
+                });
+            }
+            continue;
+        }
+
         if step + 1 >= max_steps {
             final_reason = "max-steps".to_string();
             break;
@@ -529,9 +838,252 @@ fn run_focused_steps(
 
     Ok(FocusOutcome {
         total_tokens,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
         generated_chars,
         reason: final_reason,
     })
+}
+
+/// Run the persisted plan's pending items, each as its own focused agent loop,
+/// streaming `agent://plan-step` events (blueprint §11 `step_started` /
+/// `step_completed`) and persisting statuses to `.ai/plan.json` + `.ai/plan.md`.
+///
+/// This is a plain (blocking) function called from the dispatch phase of
+/// [`run_focused_steps`] *before* `rt.block_on`, i.e. on the plain worker
+/// thread — so the nested per-item loops may safely call `rt.block_on` for
+/// their own tool dispatch. Re-entry is guarded by `ToolState.plan_executing`
+/// so a plan can never execute itself recursively.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_plan(
+    app: &AppHandle,
+    tool_state: &ToolState,
+    gen: &mut dyn TextGenerator,
+    interrupt: &CancellationToken,
+    tx: &Sender<WorkerEvent>,
+    session_id: u64,
+    rt: &tokio::runtime::Runtime,
+    request: &AgentTaskRequest,
+    working_budget: usize,
+    max_steps: usize,
+) -> Result<PlanRun, String> {
+    {
+        let mut guard = tool_state.plan_executing.lock().unwrap();
+        if *guard {
+            return Err("A plan is already being executed.".to_string());
+        }
+        *guard = true;
+    }
+    let result = execute_plan_inner(
+        app, tool_state, gen, interrupt, tx, session_id, rt, request, working_budget, max_steps,
+    );
+    *tool_state.plan_executing.lock().unwrap() = false;
+    result
+}
+
+/// The inner (unguarded) plan runner; see [`execute_plan`].
+#[allow(clippy::too_many_arguments)]
+fn execute_plan_inner(
+    app: &AppHandle,
+    tool_state: &ToolState,
+    gen: &mut dyn TextGenerator,
+    interrupt: &CancellationToken,
+    tx: &Sender<WorkerEvent>,
+    session_id: u64,
+    rt: &tokio::runtime::Runtime,
+    request: &AgentTaskRequest,
+    working_budget: usize,
+    max_steps: usize,
+) -> Result<PlanRun, String> {
+    let workspace = match &*tool_state.workspace.blocking_lock() {
+        Some(w) => w.clone(),
+        None => return Err("No workspace set - open a workspace first.".to_string()),
+    };
+    let plan = {
+        let guard = tool_state.plan.lock().unwrap();
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => plan::PlanState::load(&workspace).ok_or(
+                "No plan found. Call `create_plan` first (writes .ai/plan.json).".to_string(),
+            )?,
+        }
+    };
+
+    let total = plan.items.len();
+    if total == 0 {
+        return Ok(PlanRun {
+            summary: "The plan has no items.".to_string(),
+            outcome: FocusOutcome {
+                total_tokens: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                generated_chars: 0,
+                reason: "done".to_string(),
+            },
+        });
+    }
+
+    let mut total_tokens = 0u64;
+    let mut input_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
+    let mut generated_chars = 0u64;
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut reason = "done".to_string();
+
+    for (i, item) in plan.items.iter().enumerate() {
+        if interrupt.is_cancelled() {
+            reason = "cancelled".to_string();
+            break;
+        }
+        if item.status == PlanStatus::Completed || item.status == PlanStatus::Terminal {
+            if item.status == PlanStatus::Completed {
+                completed += 1;
+            }
+            continue;
+        }
+        let idx = i + 1;
+        set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::InProgress, None)?;
+        emit_plan_step(app, session_id, &plan.id, idx, &item.title, "in_progress", None);
+
+        let focus = if item.details.trim().is_empty() {
+            format!("Plan item {idx}/{total} — {}", item.title)
+        } else {
+            format!("Plan item {idx}/{total} — {}\n{}", item.title, item.details.trim())
+        };
+        let group = format!("Plan item {idx}/{total} · {}", item.title);
+        let mut messages = vec![ContextMessage {
+            role: "system".into(),
+            content: format!(
+                "You are executing one step of an approved plan titled `{}`. Complete \
+                 exactly this step, using the available tools, then give a short plain-text \
+                 report. Do NOT work on any other plan item.\n\nStep:\n{focus}",
+                plan.title
+            ),
+            pinned: true,
+        }];
+
+        let outcome = run_focused_steps(
+            gen, tool_state, app, interrupt, tx, session_id, rt, &mut messages, request,
+            Some(&focus), working_budget, max_steps, &group,
+        );
+        let (ok, error) = match outcome {
+            Ok(o) => {
+                total_tokens += o.total_tokens;
+                input_tokens += o.input_tokens;
+                cache_read_tokens += o.cache_read_tokens;
+                cache_write_tokens += o.cache_write_tokens;
+                reasoning_tokens += o.reasoning_tokens;
+                generated_chars += o.generated_chars;
+                if o.reason == "stuck" {
+                    (false, Some("the step failed repeatedly and the loop gave up".to_string()))
+                } else if o.reason == "cancelled" {
+                    (false, Some("cancelled".to_string()))
+                } else {
+                    (true, None)
+                }
+            }
+            Err(e) => (false, Some(e)),
+        };
+
+        if ok {
+            completed += 1;
+            set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::Completed, None)?;
+            emit_plan_step(app, session_id, &plan.id, idx, &item.title, "completed", None);
+        } else {
+            failed += 1;
+            let msg = error.unwrap_or_else(|| "failed".to_string());
+            set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::Terminal, Some(&msg))?;
+            emit_plan_step(app, session_id, &plan.id, idx, &item.title, "terminal", Some(&msg));
+        }
+    }
+
+    let summary = format!(
+        "{} items — {} completed, {} failed/terminated ({total} total).",
+        plan.title,
+        completed,
+        failed
+    );
+    Ok(PlanRun {
+        summary,
+        outcome: FocusOutcome {
+            total_tokens,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            generated_chars,
+            reason,
+        },
+    })
+}
+
+/// Result of [`execute_plan`]: a human summary + aggregated token accounting.
+pub(crate) struct PlanRun {
+    pub summary: String,
+    pub outcome: FocusOutcome,
+}
+
+/// Persist a status change for plan item `idx` (1-based) and refresh the in-memory
+/// state so subsequent items and tools see it.
+fn set_plan_status(
+    tool_state: &ToolState,
+    workspace: &std::path::Path,
+    _plan_id: &str,
+    idx: usize,
+    status: PlanStatus,
+    note: Option<&str>,
+) -> Result<(), String> {
+    let mut plan = {
+        let guard = tool_state.plan.lock().unwrap();
+        guard
+            .clone()
+            .unwrap_or(PlanState::load(workspace).ok_or("Plan disappeared while executing.")?)
+    };
+    let item = plan
+        .items
+        .get_mut(idx - 1)
+        .ok_or_else(|| format!("Plan item #{idx} not found."))?;
+    item.status = status;
+    if let Some(note) = note {
+        if !item.details.is_empty() {
+            item.details.push_str(" — ");
+        }
+        item.details.push_str(note);
+    }
+    plan.updated_at = super::now_ms();
+    plan.save(workspace)?;
+    *tool_state.plan.lock().unwrap() = Some(plan);
+    Ok(())
+}
+
+fn emit_plan_step(
+    app: &AppHandle,
+    session_id: u64,
+    plan_id: &str,
+    item_index: usize,
+    title: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "agent://plan-step",
+        PlanStepEvent {
+            session_id,
+            plan_id: plan_id.to_string(),
+            item_index,
+            title: title.to_string(),
+            status: status.to_string(),
+            error: error.map(str::to_string),
+        },
+    );
 }
 
 /// Decomposition phase: one generation asks the model to break the request into
@@ -614,6 +1166,10 @@ fn run_summary(
     });
     Ok(FocusOutcome {
         total_tokens: outcome.done.total_tokens,
+        input_tokens: outcome.done.input_tokens,
+        cache_read_tokens: outcome.done.cache_read_tokens,
+        cache_write_tokens: outcome.done.cache_write_tokens,
+        reasoning_tokens: outcome.done.reasoning_tokens,
         generated_chars: outcome.done.generated_chars,
         reason: outcome.done.stop_reason.clone(),
     })
@@ -707,6 +1263,57 @@ fn truncate(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     text.chars().take(limit).collect()
+}
+
+/// Returns `true` when `input` is a trivial greeting, thank-you, or farewell
+/// that should be answered conversationally without invoking the model.
+fn is_greeting(input: &str) -> bool {
+    let trimmed = input.trim().trim_end_matches(['!', '.', '?', ',', ';', ':']);
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "hi"
+            | "hello"
+            | "hey"
+            | "howdy"
+            | "sup"
+            | "yo"
+            | "hiya"
+            | "greetings"
+            | "thanks"
+            | "thank you"
+            | "ty"
+            | "thx"
+            | "cheers"
+            | "bye"
+            | "goodbye"
+            | "see you"
+            | "see ya"
+            | "good night"
+            | "gn"
+            | "how are you"
+            | "how r u"
+            | "what's up"
+            | "whats up"
+            | "wsg"
+    ) || trimmed.split_whitespace().count() <= 2 && trimmed.len() <= 20
+}
+
+/// Pick a short, friendly reply for a detected greeting.
+fn greeting_reply(input: &str) -> String {
+    let lower = input.trim().to_ascii_lowercase();
+    if lower.starts_with("bye") || lower == "goodbye" || lower == "see you" || lower == "see ya"
+        || lower == "good night" || lower == "gn"
+    {
+        "Goodbye! Feel free to come back anytime.".to_string()
+    } else if lower.starts_with("thank") || lower == "ty" || lower == "thx" || lower == "cheers" {
+        "You're welcome! Let me know if you need anything else.".to_string()
+    } else if lower.starts_with("how are") || lower == "sup" || lower == "what's up"
+        || lower == "whats up" || lower == "wsg"
+    {
+        "I'm doing great, thanks! Ready to help with your code. What would you like to work on?".to_string()
+    } else {
+        "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
+    }
 }
 
 #[cfg(test)]

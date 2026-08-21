@@ -239,7 +239,7 @@ export default function ModelBar(props: ModelBarProps) {
             <span className="text-[10px] text-zinc-500">
               <span
                 className={`mr-1.5 rounded px-1 py-px text-[9px] font-semibold uppercase ${
-                  isRemote ? "bg-violet-500/20 text-violet-300" : "bg-emerald-500/20 text-emerald-300"
+                  isRemote ? "bg-violet-500/20 text-violet-600" : "bg-emerald-500/20 text-emerald-600"
                 }`}
               >
                 {isRemote ? "remote" : "local"}
@@ -254,7 +254,7 @@ export default function ModelBar(props: ModelBarProps) {
           </div>
           <button
             onClick={onUnload}
-            className="rounded border border-border px-2 py-1 text-[11px] text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+            className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
           >
             Unload
           </button>
@@ -265,13 +265,13 @@ export default function ModelBar(props: ModelBarProps) {
           <button
             onClick={onLoad}
             disabled={loading}
-            className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-black hover:bg-cyan-300 disabled:opacity-60"
+            className="rounded bg-accent px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-cyan-500 disabled:opacity-60"
           >
             {loading ? "Loading model…" : "Load GGUF Model"}
           </button>
           <button
             onClick={() => setShowRemote((v) => !v)}
-            className="rounded border border-border px-3 py-1.5 text-[12px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+            className="rounded border border-border px-3 py-1.5 text-[12px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
           >
             Remote…
           </button>
@@ -281,14 +281,14 @@ export default function ModelBar(props: ModelBarProps) {
       {showRemote && !model && (
         <div className="absolute left-3 top-11 z-30 flex w-[28rem] flex-col gap-2 rounded-md border border-border bg-panel-2 p-3 shadow-2xl">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
               Connect a model provider
             </span>
             <button
               onClick={() => setShowRemote(false)}
               aria-label="Close"
               title="Close"
-              className="rounded p-1 text-zinc-500 hover:bg-panel hover:text-zinc-200"
+              className="rounded p-1 text-zinc-500 hover:bg-panel hover:text-zinc-800"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                 <path d="M18 6 6 18M6 6l12 12" />
@@ -349,7 +349,7 @@ export default function ModelBar(props: ModelBarProps) {
                 onClick={() => void fetchModels(configRef.current)}
                 disabled={!remote.baseUrl.trim() || modelsLoading}
                 title="Refresh model list"
-                className="shrink-0 rounded border border-border px-2 py-1 text-[11px] text-zinc-400 hover:border-zinc-500 hover:text-zinc-200 disabled:opacity-40"
+                className="shrink-0 rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40"
               >
                 {modelsLoading ? "…" : "↻"}
               </button>
@@ -359,7 +359,7 @@ export default function ModelBar(props: ModelBarProps) {
                 <option key={m} value={m} />
               ))}
             </datalist>
-            <span className="text-[9px] text-zinc-600">
+            <span className="text-[9px] text-zinc-400">
               {modelsLoading
                 ? "Fetching available models…"
                 : models.length > 0
@@ -371,16 +371,16 @@ export default function ModelBar(props: ModelBarProps) {
           </label>
 
           <div className="mt-1 flex items-end justify-between gap-3">
-            <p className="max-w-64 text-[10px] leading-snug text-zinc-600">{preset.hint}</p>
+            <p className="max-w-64 text-[10px] leading-snug text-zinc-400">{preset.hint}</p>
             <button
               onClick={submitRemote}
               disabled={!canConnect}
-              className="rounded bg-accent px-3 py-1 text-[11px] font-semibold text-black hover:bg-cyan-300 disabled:opacity-40"
+              className="rounded bg-accent px-3 py-1 text-[11px] font-semibold text-white hover:bg-cyan-500 disabled:opacity-40"
             >
               Connect
             </button>
           </div>
-          <p className="text-[9px] leading-snug text-zinc-600">
+          <p className="text-[9px] leading-snug text-zinc-400">
             Keys are held in memory only — never written to disk.
           </p>
         </div>
@@ -394,14 +394,14 @@ export default function ModelBar(props: ModelBarProps) {
               style={{ width: `${Math.round(progress * 100)}%` }}
             />
           </div>
-          <span className="w-10 text-right text-[11px] tabular-nums text-zinc-400">
+          <span className="w-10 text-right text-[11px] tabular-nums text-zinc-500">
             {Math.round(progress * 100)}%
           </span>
         </div>
       )}
 
       {model && !loading && (
-        <div className="flex flex-1 items-center justify-end gap-4 text-[11px] text-zinc-400">
+        <div className="flex flex-1 items-center justify-end gap-4 text-[11px] text-zinc-500">
           <label className="flex items-center gap-1.5">
             ctx
             <select
@@ -453,7 +453,7 @@ export default function ModelBar(props: ModelBarProps) {
             />
           </label>
           <details className="relative">
-            <summary className="cursor-pointer list-none rounded px-1.5 text-zinc-500 hover:text-zinc-300">
+            <summary className="cursor-pointer list-none rounded px-1.5 text-zinc-500 hover:text-zinc-700">
               adv
             </summary>
             <div className="absolute right-0 top-6 z-20 flex w-56 flex-col gap-2 rounded-md border border-border bg-panel-2 p-3 shadow-xl">
@@ -479,7 +479,7 @@ export default function ModelBar(props: ModelBarProps) {
                   className="spin-none w-16 rounded border border-border bg-panel px-1.5 py-0.5 outline-none"
                 />
               </label>
-              <p className="text-[10px] leading-snug text-zinc-600">
+              <p className="text-[10px] leading-snug text-zinc-400">
                 GPU/context settings take effect on the next model load. CPU-only
                 build by default.
               </p>
@@ -488,7 +488,7 @@ export default function ModelBar(props: ModelBarProps) {
           {isStreaming && (
             <button
               onClick={onCancel}
-              className="rounded border border-red-400/40 px-2.5 py-1 text-[11px] font-medium text-red-300 hover:bg-red-500/10"
+              className="rounded border border-red-400/40 px-2.5 py-1 text-[11px] font-medium text-red-600 hover:bg-red-500/10"
             >
               ■ Stop
             </button>

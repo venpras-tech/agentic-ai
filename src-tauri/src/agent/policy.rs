@@ -177,10 +177,72 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspace: Option<&Path>
         "deny" => Verdict::Deny(format!(
             "Tool `{tool}` is blocked by the workspace policy (.ai/policy.json)."
         )),
-        _ => Verdict::Ask {
-            request_id: state.next_request_id(),
-        },
+        _ => {
+            // Session memory: a tool the user allowed "for this session" skips
+            // the ask entirely (the memory is not written to policy.json).
+            if session_remembered(state, call) {
+                return Verdict::Allow;
+            }
+            Verdict::Ask {
+                request_id: state.next_request_id(),
+            }
+        }
     }
+}
+
+/// Memory key for a call: terminal commands are keyed by the exact command (one
+/// approved `cargo test` never silently unlocks a different command); all other
+/// tools are keyed by tool name.
+pub fn session_key(call: &ToolCall) -> String {
+    match call {
+        ToolCall::ExecuteTerminalCommand { command, .. } => {
+            format!("{}:{command}", call.name())
+        }
+        _ => call.name().to_string(),
+    }
+}
+
+/// Remember that `call` is allowed for the rest of this app session.
+pub fn remember_session(state: &super::ToolState, call: &ToolCall) {
+    state.session_allow.lock().unwrap().insert(session_key(call));
+}
+
+fn session_remembered(state: &super::ToolState, call: &ToolCall) -> bool {
+    state
+        .session_allow
+        .lock()
+        .unwrap()
+        .contains(&session_key(call))
+}
+
+/// Persist "always allow" for `call` by writing an `allow` rule into the
+/// workspace's `.ai/policy.json` (merging with any existing rules).
+pub fn remember_always(workspace: Option<&Path>, call: &ToolCall) -> Result<(), String> {
+    let Some(ws) = workspace else {
+        return Ok(());
+    };
+    let dir = ws.join(".ai");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let path = dir.join("policy.json");
+    let mut cfg = load_policy(Some(ws));
+    let tool = call.name().to_string();
+    // The injected red-zone rule must never be persisted back to disk.
+    let (rule_tool, command_patterns) = match call {
+        ToolCall::ExecuteTerminalCommand { command, .. } => (tool.clone(), vec![command.clone()]),
+        _ => (tool.clone(), Vec::new()),
+    };
+    cfg.rules.retain(|r| {
+        r.tool != "__red_zone__" && !(r.tool == rule_tool && r.command_patterns == command_patterns)
+    });
+    cfg.rules.push(PolicyRule {
+        tool: rule_tool,
+        policy: "allow".into(),
+        command_patterns,
+    });
+    let text = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("Failed to serialize policy: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Read-only tools never need approval (default allow) unless policy overrides.
@@ -189,9 +251,11 @@ pub fn default_allow(tool: &str) -> bool {
         tool,
         "glob_search_codebase"
             | "search_file_contents"
+            | "semantic_search_codebase"
             | "view_file_structure"
             | "read_file_range"
             | "read_skill"
+            | "read_plan"
             | "git_status"
             | "git_diff"
             | "run_tests"

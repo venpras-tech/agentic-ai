@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import TitleBar from "./components/TitleBar";
+import MenuBar from "./components/MenuBar";
 import ModelBar from "./components/ModelBar";
 import FileExplorer from "./components/FileExplorer";
 import EditorPane from "./components/EditorPane";
@@ -10,6 +11,9 @@ import Tabs from "./components/Tabs";
 import InterruptButton from "./components/InterruptButton";
 import PermissionModal from "./components/PermissionModal";
 import KnowledgePanel from "./components/KnowledgePanel";
+import SettingsModal from "./components/SettingsModal";
+import ConsolePanel from "./components/ConsolePanel";
+import type { ConsoleEntry } from "./components/ConsolePanel";
 
 import { useEngineEvents } from "./hooks/useEngineEvents";
 import { useTokenStream } from "./hooks/useTokenStream";
@@ -22,9 +26,11 @@ import type {
   GenParams,
   InferenceDone,
   KnowledgeReport,
+  LedgerEntry,
   ModelInfo,
   OpenFile,
   PermissionRequest,
+  PlanStepEvent,
   PolicySnapshot,
   RemoteModelConfig,
   StepEvent,
@@ -76,6 +82,13 @@ export default function App() {
     sessionId: number;
     planText: string;
   } | null>(null);
+  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  const [checkpoints, setCheckpoints] = useState<
+    { hash: string; subject: string; relative: string }[]
+  >([]);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showConsole, setShowConsole] = useState(false);
+  const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([]);
 
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
@@ -83,6 +96,9 @@ export default function App() {
   verifyRef.current = verify;
   const planSessionRef = useRef<number | null>(null);
   const planPromptRef = useRef<string | null>(null);
+  const sessionStartRef = useRef<Map<number, number>>(new Map());
+  const sessionLabelRef = useRef<Map<number, string>>(new Map());
+  const sessionHasStepsRef = useRef<Map<number, boolean>>(new Map());
 
   const refreshUsage = useCallback(() => {
     api
@@ -131,6 +147,7 @@ export default function App() {
       setIsStreaming(true);
       setError(null);
       setCurrentStep(null);
+      sessionStartRef.current.set(e.sessionId, performance.now());
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: "", sessionId: e.sessionId },
@@ -140,7 +157,9 @@ export default function App() {
       const text = streamsRef.current.get(e.sessionId) ?? "";
       setMessages((prev) =>
         prev.map((m) =>
-          m.sessionId === e.sessionId ? { ...m, content: text } : m,
+          m.sessionId === e.sessionId
+            ? { ...m, content: text, done: e.done }
+            : m,
         ),
       );
       clearStream(e.sessionId);
@@ -148,6 +167,26 @@ export default function App() {
       setIsStreaming(false);
       setCurrentStep(null);
       setLastDone(e.done);
+      setLedger((prev) => {
+        const start = sessionStartRef.current.get(e.sessionId);
+        const label = sessionLabelRef.current.get(e.sessionId) ?? "task";
+        const hasSteps = sessionHasStepsRef.current.get(e.sessionId) ?? false;
+        sessionStartRef.current.delete(e.sessionId);
+        sessionLabelRef.current.delete(e.sessionId);
+        sessionHasStepsRef.current.delete(e.sessionId);
+        const existing = prev.find((l) => l.sessionId === e.sessionId);
+        const stepTokens = existing?.tokens ?? 0;
+        const entry: LedgerEntry = {
+          sessionId: e.sessionId,
+          label,
+          tokens: hasSteps ? stepTokens : e.done.totalTokens,
+          toolCalls: existing?.toolCalls ?? 0,
+          elapsedMs: start != null ? Math.round(performance.now() - start) : e.done.elapsedMs,
+        };
+        return existing
+          ? prev.map((l) => (l.sessionId === e.sessionId ? entry : l))
+          : [...prev, entry];
+      });
       if (planSessionRef.current === e.sessionId) {
         planSessionRef.current = null;
         setPendingPlan({ sessionId: e.sessionId, planText: text });
@@ -182,6 +221,19 @@ export default function App() {
     onTool: (e) => {
       if (activeSessionId == null) return;
       const sid = activeSessionId;
+      setLedger((prev) => {
+        const idx = prev.findIndex((l) => l.sessionId === sid);
+        const entry: LedgerEntry = {
+          sessionId: sid,
+          label: sessionLabelRef.current.get(sid) ?? "task",
+          tokens: idx >= 0 ? prev[idx].tokens : 0,
+          toolCalls: (idx >= 0 ? prev[idx].toolCalls : 0) + 1,
+          elapsedMs: idx >= 0 ? prev[idx].elapsedMs : 0,
+        };
+        return idx >= 0
+          ? prev.map((l) => (l.sessionId === sid ? entry : l))
+          : [...prev, entry];
+      });
       setMessages((prev) =>
         prev.map((m) =>
           m.sessionId === sid
@@ -199,6 +251,40 @@ export default function App() {
     },
     onStep: (e: StepEvent) => {
       setCurrentStep(e.step.step);
+      sessionHasStepsRef.current.set(e.sessionId, true);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.sessionId === e.sessionId
+            ? {
+                ...m,
+                steps: [
+                  ...(m.steps ?? []),
+                  {
+                    step: e.step.step,
+                    group: e.step.group,
+                    tokens: e.step.tokens,
+                    elapsedMs: e.step.elapsedMs,
+                    toolCalls: e.step.toolCalls,
+                  },
+                ],
+              }
+            : m,
+        ),
+      );
+      setLedger((prev) => {
+        const sid = e.sessionId;
+        const idx = prev.findIndex((l) => l.sessionId === sid);
+        const entry: LedgerEntry = {
+          sessionId: sid,
+          label: sessionLabelRef.current.get(sid) ?? "task",
+          tokens: (idx >= 0 ? prev[idx].tokens : 0) + e.step.tokens,
+          toolCalls: idx >= 0 ? prev[idx].toolCalls : 0,
+          elapsedMs: idx >= 0 ? prev[idx].elapsedMs : 0,
+        };
+        return idx >= 0
+          ? prev.map((l) => (l.sessionId === sid ? entry : l))
+          : [...prev, entry];
+      });
     },
     onSubtask: (e: SubtaskEvent) => {
       if (e.subtask.status === "running") {
@@ -211,7 +297,32 @@ export default function App() {
         setCurrentSubtask(null);
       }
     },
+    onPlanStep: (e: PlanStepEvent) => {
+      if (activeSessionId == null) return;
+      const sid = activeSessionId;
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.sessionId !== sid) return m;
+          const group = `Plan · ${e.title}`;
+          const existing = m.steps ?? [];
+          if (e.status === "in_progress") {
+            return {
+              ...m,
+              steps: [
+                ...existing,
+                { step: existing.length + 1, group, tokens: 0, elapsedMs: 0, toolCalls: 0 },
+              ],
+            };
+          }
+          return m;
+        }),
+      );
+    },
     onToolOutput: (e: ToolOutputEvent) => {
+      setConsoleEntries((prev) => [
+        ...prev,
+        { tool: e.tool, stream: e.stream, chunk: e.chunk, ts: Date.now() },
+      ]);
       if (activeSessionId == null) return;
       const sid = activeSessionId;
       if (e.tool !== "execute_terminal_command" && e.tool !== "run_tests") return;
@@ -239,6 +350,16 @@ export default function App() {
     },
     onFileChanged: (e: FileChangedEvent) => {
       syncAgentFile(e);
+      if (e.diff && activeSessionId != null) {
+        const sid = activeSessionId;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.sessionId === sid
+              ? { ...m, diffs: [...(m.diffs ?? []), e] }
+              : m,
+          ),
+        );
+      }
     },
     onSkillsChanged: () => {
       api
@@ -377,15 +498,60 @@ export default function App() {
   }, []);
 
   const respondPermission = useCallback(
-    async (requestId: string, allowed: boolean) => {
+    async (requestId: string, decision: string) => {
       setPermissionReq(null);
       try {
-        await api.agentRespondPermission(requestId, allowed);
+        await api.agentRespondPermission(requestId, decision);
       } catch (e) {
         setError(String(e));
       }
     },
     [],
+  );
+
+  const refreshCheckpoints = useCallback(() => {
+    api
+      .gitCheckpoints()
+      .then(setCheckpoints)
+      .catch(() => setCheckpoints([]));
+  }, []);
+
+  const createCheckpoint = useCallback(async () => {
+    try {
+      const r = await api.gitCheckpoint();
+      setError(null);
+      refreshCheckpoints();
+      const text = r.success
+        ? `Checkpoint created.`
+        : `Checkpoint failed: ${r.error ?? r.summary}`;
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: text },
+      ]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refreshCheckpoints]);
+
+  const revertToCheckpoint = useCallback(
+    async (hash: string) => {
+      const ok = window.confirm(
+        `Hard-reset the workspace to checkpoint ${hash.slice(0, 7)}?\n\nThis discards all uncommitted changes and later commits. This cannot be undone.`,
+      );
+      if (!ok) return;
+      try {
+        const r = await api.gitRevert(hash);
+        setError(null);
+        refreshCheckpoints();
+        const text = r.success
+          ? `Reverted to checkpoint ${hash.slice(0, 8)}. Open files may be stale — save/reload to see the restored state.`
+          : `Revert failed: ${r.error ?? r.summary}`;
+        setMessages((prev) => [...prev, { role: "assistant", content: text }]);
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [refreshCheckpoints],
   );
 
   // ---- files ----
@@ -481,10 +647,31 @@ export default function App() {
         e.preventDefault();
         void saveActive();
       }
+      if ((e.ctrlKey || e.metaKey) && e.key === "o") {
+        e.preventDefault();
+        void openFilePicker();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setShowSettings(true);
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === "`") {
+        e.preventDefault();
+        setShowConsole((v) => !v);
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        loadModel();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [saveActive]);
+  }, [saveActive, loadModel]);
+
+  const openFilePicker = useCallback(async () => {
+    const path = await api.pickTextFile();
+    if (path) openFile(path);
+  }, [openFile]);
 
   const selectWorkspace = useCallback(async () => {
     const root = await api.pickWorkspaceFolder();
@@ -492,12 +679,38 @@ export default function App() {
       setWorkspaceRoot(root);
       await api.agentSetWorkspace(root).catch(() => {});
       refreshPolicy();
+      setCheckpoints([]);
       api
         .knowledgeReport()
         .then(setKnowledge)
         .catch(() => {});
+      api
+        .gitCheckpoints()
+        .then(setCheckpoints)
+        .catch(() => setCheckpoints([]));
+      api
+        .sessionLoad(root)
+        .then((records) => {
+          const replay: ChatMessage[] = [];
+          for (const r of records) {
+            const role = r["role"];
+            const content = r["content"];
+            if (typeof content !== "string") continue;
+            if (role === "user") replay.push({ role: "user", content });
+            else if (role === "assistant")
+              replay.push({ role: "assistant", content: content || "…" });
+          }
+          setMessages(replay);
+          for (const m of replay) {
+            api
+              .contextPushTurn(m.role, m.content)
+              .then(setUsage)
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
     }
-  }, [refreshPolicy]);
+  }, [refreshPolicy, setCheckpoints]);
 
   // ---- context: active-file buffer (debounced so typing doesn't spam IPC) ----
   useEffect(() => {
@@ -532,6 +745,7 @@ export default function App() {
         verify: opts?.verify ?? verifyRef.current,
         decompose: opts?.decompose ?? false,
       });
+      sessionLabelRef.current.set(sessionId, text.slice(0, 48));
       if (opts?.planMode) planSessionRef.current = sessionId;
     },
     [genParams],
@@ -582,11 +796,15 @@ export default function App() {
     setPendingPlan(null);
     if (!prompt) return;
     try {
+      if (workspaceRoot) {
+        await createCheckpoint();
+        refreshCheckpoints();
+      }
       await runAgentTask(prompt, { verify: true });
     } catch (e) {
       setError(String(e));
     }
-  }, [runAgentTask]);
+  }, [createCheckpoint, refreshCheckpoints, runAgentTask, workspaceRoot]);
 
   const rejectPlan = useCallback(() => {
     planPromptRef.current = null;
@@ -599,11 +817,20 @@ export default function App() {
     setPendingPlan(null);
     setLastDone(null);
     setCurrentStep(null);
+    setLedger([]);
   }, []);
 
   return (
     <div className="flex h-full w-full flex-col bg-editor text-ink">
       <TitleBar />
+      <MenuBar
+        onOpenFolder={selectWorkspace}
+        onOpenFile={openFilePicker}
+        onSettings={() => setShowSettings(true)}
+        onSelectModel={loadModel}
+        onConsole={() => setShowConsole((v) => !v)}
+        consoleVisible={showConsole}
+      />
       <ModelBar
         model={model}
         loading={modelLoading}
@@ -658,6 +885,11 @@ export default function App() {
           onOpenSkills={() => setShowKnowledge(true)}
         />
       </div>
+      <ConsolePanel
+        entries={consoleEntries}
+        visible={showConsole}
+        onClear={() => setConsoleEntries([])}
+      />
       <StatusBar
         model={model}
         workspaceRoot={workspaceRoot}
@@ -665,6 +897,10 @@ export default function App() {
         error={error}
         usage={usage}
         knowledge={knowledge}
+        ledger={ledger}
+        checkpoints={checkpoints}
+        onCheckpoint={createCheckpoint}
+        onRevert={revertToCheckpoint}
       />
       <div className="pointer-events-none absolute bottom-8 right-4 z-30">
         <InterruptButton visible={isStreaming} onAbort={abortAgentExecution} />
@@ -675,6 +911,12 @@ export default function App() {
         onRespond={respondPermission}
       />
       <KnowledgePanel open={showKnowledge} onClose={() => setShowKnowledge(false)} />
+      <SettingsModal
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        params={genParams}
+        onParamsChange={(patch) => setGenParams((prev) => ({ ...prev, ...patch }))}
+      />
     </div>
   );
 }

@@ -6,30 +6,30 @@ mod engine;
 mod remote;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use agent::context::{ContextManager, UsageReport, DEFAULT_LIMIT};
 use agent::interrupt::{AbortPayload, InterruptState};
 use agent::skills::{KnowledgeReport, KnowledgeState};
-use agent::{ToolCall, ToolResult, ToolState};
-use crossbeam_channel::bounded;
+use agent::{PermissionDecision, ToolCall, ToolResult, ToolState};
+use crossbeam_channel::{bounded, Sender};
 use engine::{
-    load_engine, InferenceDone, InferenceRequest, LoadProgressEvent, LocalGenerator, ModelInfo,
+    EnginePool, InferenceDone, InferenceRequest, LoadProgressEvent, LocalGenerator, ModelInfo,
     ModelInitParams, TextGenerator, WorkerEvent,
 };
 use remote::{RemoteGenerator, RemoteModelConfig};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
-/// Shared inference state. The engine lives in the mutex so that:
-///  * model load (blocking) can run in `spawn_blocking`,
-///  * a generation can run on its own native thread holding the lock for its
-///    entire duration,
-///  * the UI thread never blocks on llama.cpp.
+/// Shared inference state. The engine lives as an [`EnginePool`] — one worker
+/// thread per generator, each owning its context/client for its whole life.
+/// Model load (blocking) runs in `spawn_blocking`; generations dispatch to
+/// workers over channels, so there is no `'static` transmute of the engine and
+/// several generations can run concurrently (parallel sub-tasks).
 struct InferenceState {
-    engine: Mutex<Option<Box<dyn TextGenerator>>>,
+    pool: Mutex<Option<Arc<EnginePool>>>,
     info: Mutex<Option<ModelInfo>>,
     worker_tx: Mutex<Option<crossbeam_channel::Sender<WorkerEvent>>>,
 }
@@ -37,7 +37,7 @@ struct InferenceState {
 impl Default for InferenceState {
     fn default() -> Self {
         Self {
-            engine: Mutex::new(None),
+            pool: Mutex::new(None),
             info: Mutex::new(None),
             worker_tx: Mutex::new(None),
         }
@@ -126,6 +126,49 @@ struct ErrorEvent {
 // Model lifecycle
 // ---------------------------------------------------------------------------
 
+/// Local pool: load the GGUF once, then spawn `n_workers` contexts (each on
+/// its own worker thread). Compute threads are split across workers so the
+/// machine isn't oversubscribed. Returns the pool, whose `info()` is the model
+/// metadata.
+fn build_local_pool(
+    path: &std::path::Path,
+    params: &ModelInitParams,
+    event_tx: Sender<WorkerEvent>,
+    app: &AppHandle,
+) -> Result<EnginePool, String> {
+    let workers = params.n_workers.unwrap_or(2).clamp(1, 8) as usize;
+    let app_progress = app.clone();
+    let mut last_progress = 0.0f32;
+    let model = engine::load_model_with_progress(path, params, move |progress: f32| {
+        if progress - last_progress >= 0.01 || progress >= 1.0 {
+            last_progress = progress;
+            let _ = app_progress.emit_to(
+                "main",
+                "model-load-progress",
+                LoadProgressEvent {
+                    stage: "load",
+                    progress,
+                },
+            );
+        }
+        true
+    })?;
+    let total_threads = params.n_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(4)
+    }) as i32;
+    let per_threads = (total_threads as usize / workers).max(1) as i32;
+
+    let factory = || {
+        model
+            .new_engine_with_threads(per_threads)
+            .map(|e| Box::new(LocalGenerator::new(e)) as Box<dyn TextGenerator>)
+    };
+    let pool = EnginePool::spawn_with(factory, event_tx, workers)?;
+    Ok(pool)
+}
+
 /// Pick a GGUF model file, load it and return its metadata. Blocking model
 /// load is moved to `spawn_blocking` so the webview stays responsive.
 #[tauri::command]
@@ -146,34 +189,37 @@ async fn pick_and_load_model(
     };
     let path = picked.into_path().map_err(|e| e.to_string())?;
 
-    let engine_guard = state.engine.lock().await;
-    let info_guard = state.info.lock().await;
-    drop(info_guard);
-    drop(engine_guard);
-
     let params = params.unwrap_or_default();
     let params_clone = params.clone();
 
     // Make sure the frontend learns of the full path the user picked.
     let path_for_event = path.clone();
     let app_for_load = app.clone();
-
-    let engine = tokio::task::spawn_blocking(move || load_engine(&path, &params_clone, &app_for_load))
+    let event_tx = state
+        .worker_tx
+        .lock()
         .await
-        .map_err(|e| format!("Model load task panicked: {e}"))?
-        .map_err(|e| {
-            let _ = app.emit_to(
-                "main",
-                "model-load-progress",
-                LoadProgressEvent { stage: "error", progress: 0.0 },
-            );
-            e
-        })?;
+        .clone()
+        .unwrap_or_else(|| spawn_emitter(app.clone()));
 
-    let info = engine.info();
-    let mut engine_guard = state.engine.lock().await;
+    let pool = tokio::task::spawn_blocking(move || {
+        build_local_pool(&path, &params_clone, event_tx, &app_for_load)
+    })
+    .await
+    .map_err(|e| format!("Model load task panicked: {e}"))?
+    .map_err(|e| {
+        let _ = app.emit_to(
+            "main",
+            "model-load-progress",
+            LoadProgressEvent { stage: "error", progress: 0.0 },
+        );
+        e
+    })?;
+
+    let info = pool.info();
+    let mut pool_guard = state.pool.lock().await;
     let mut info_guard = state.info.lock().await;
-    *engine_guard = Some(Box::new(LocalGenerator::new(engine)));
+    *pool_guard = Some(Arc::new(pool));
     *info_guard = Some(info.clone());
 
     // Align the eviction engine's budget with the loaded model's context.
@@ -183,7 +229,7 @@ async fn pick_and_load_model(
     let _ = app.emit("model-loaded", &info);
     let _ = app.emit("model-path", &path_for_event);
     drop(info_guard);
-    drop(engine_guard);
+    drop(pool_guard);
     Ok(Some(info))
 }
 
@@ -195,7 +241,7 @@ async fn list_remote_models(config: RemoteModelConfig) -> Result<Vec<String>, St
 }
 
 /// Configure and activate the remote (OpenAI-compatible) backend. Swaps out
-/// any local engine, aligns the context budget, and fires the same
+/// any local pool, aligns the context budget, and fires the same
 /// `model-loaded` flow as a local load so the UI stays backend-agnostic.
 #[tauri::command]
 async fn configure_remote_model(
@@ -206,12 +252,24 @@ async fn configure_remote_model(
     config: RemoteModelConfig,
 ) -> Result<ModelInfo, String> {
     interrupt_state.trigger();
-    let gen = RemoteGenerator::new(config)?;
-    let info = gen.info();
+    // Remote backends are cheap to duplicate: give each worker its own client.
+    let workers = 4usize;
+    let event_tx = state
+        .worker_tx
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| spawn_emitter(app.clone()));
+    let factory = || {
+        RemoteGenerator::new(config.clone())
+            .map(|g| Box::new(g) as Box<dyn TextGenerator>)
+    };
+    let pool = EnginePool::spawn_with(factory, event_tx, workers)?;
+    let info = pool.info();
 
-    let mut engine_guard = state.engine.lock().await;
+    let mut pool_guard = state.pool.lock().await;
     let mut info_guard = state.info.lock().await;
-    *engine_guard = Some(Box::new(gen));
+    *pool_guard = Some(Arc::new(pool));
     *info_guard = Some(info.clone());
     context_state
         .inner
@@ -219,7 +277,7 @@ async fn configure_remote_model(
         .await
         .set_limit(info.context_size as usize);
     drop(info_guard);
-    drop(engine_guard);
+    drop(pool_guard);
 
     let _ = app.emit_to("main", "model-load-progress", LoadProgressEvent { stage: "done", progress: 1.0 });
     let _ = app.emit("model-loaded", &info);
@@ -232,16 +290,12 @@ async fn unload_model(
     interrupt_state: State<'_, InterruptState>,
 ) -> Result<(), String> {
     interrupt_state.trigger();
-    let engine_guard = state.engine.lock().await;
-    let info_guard = state.info.lock().await;
-    drop(info_guard);
-    drop(engine_guard);
-    let mut engine_guard = state.engine.lock().await;
+    let mut pool_guard = state.pool.lock().await;
     let mut info_guard = state.info.lock().await;
-    *engine_guard = None;
+    *pool_guard = None;
     *info_guard = None;
     drop(info_guard);
-    drop(engine_guard);
+    drop(pool_guard);
     Ok(())
 }
 
@@ -252,10 +306,10 @@ async fn model_status(state: State<'_, InferenceState>) -> Result<Option<ModelIn
     Ok(info_guard.clone())
 }
 
-/// Streaming inference. Spawns a dedicated native thread that holds the engine
-/// lock for the whole generation (see `StandaloneEngine` soundness note).
-/// A fresh circuit-breaker token is armed per run so an old cancellation can
-/// never leak into this one.
+/// Streaming inference. Dispatches to a worker in the pool (round-robin); the
+/// worker's own thread holds the generator for the whole generation. A fresh
+/// circuit-breaker token is armed per run so an old cancellation can never leak
+/// into this one.
 #[tauri::command]
 async fn stream_inference(
     app: AppHandle,
@@ -263,58 +317,7 @@ async fn stream_inference(
     interrupt_state: State<'_, InterruptState>,
     request: InferenceRequest,
 ) -> Result<u64, String> {
-    let mut engine_guard = state.engine.lock().await;
-    let Some(engine) = engine_guard.as_mut() else {
-        return Err("No model loaded".to_string());
-    };
-
-    let session_id = interrupt_state.next_session();
-    let interrupt = interrupt_state.arm();
-    let _ = app.emit("inference-started", StartedEvent { session_id });
-
-    let tx = state.worker_tx.lock().await.take().unwrap_or_else(|| spawn_emitter(app.clone()));
-
-    // SAFETY: `engine` is pinned inside `InferenceState.engine` for the app
-    // lifetime and only ever touched by one worker thread at a time (the tokio
-    // mutex serializes access; the worker exits before the next job starts).
-    let backend_ref: &'static mut Box<dyn TextGenerator> = unsafe {
-        std::mem::transmute::<&mut Box<dyn TextGenerator>, &'static mut Box<dyn TextGenerator>>(engine)
-    };
-    let tx_clone = tx.clone();
-
-    std::thread::spawn(move || {
-        let gen: &mut dyn TextGenerator = &mut **backend_ref;
-        let result = gen.generate(&request, session_id, &interrupt, &tx_clone);
-        let _ = tx_clone.send(match result {
-            Ok(outcome) => WorkerEvent::Done { session_id, done: outcome.done },
-            Err(message) => WorkerEvent::Error { session_id, message },
-        });
-    });
-
-    drop(engine_guard);
-    *state.worker_tx.lock().await = Some(tx);
-
-    Ok(session_id)
-}
-
-/// Agentic task execution: an orchestrated generate → tool-call → feedback
-/// loop (see `agent::orchestrator`). The whole loop runs on one native thread
-/// that holds the engine lock per step, so intermediate tool dispatches never
-/// touch llama.cpp. The circuit breaker token is armed once and shared with
-/// both generation and tool sub-processes.
-#[tauri::command]
-async fn agent_run_task(
-    app: AppHandle,
-    state: State<'_, InferenceState>,
-    interrupt_state: State<'_, InterruptState>,
-    context_state: State<'_, ContextState>,
-    tool_state: State<'_, ToolState>,
-    request: agent::orchestrator::AgentTaskRequest,
-) -> Result<u64, String> {
-    let mut engine_guard = state.engine.lock().await;
-    let Some(engine) = engine_guard.as_mut() else {
-        return Err("No model loaded".to_string());
-    };
+    let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
 
     let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
@@ -324,17 +327,93 @@ async fn agent_run_task(
         .worker_tx
         .lock()
         .await
-        .take()
+        .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
 
-    // SAFETY: `engine` is pinned inside `InferenceState.engine` for the app
-    // lifetime and only ever touched by one worker thread at a time (the tokio
-    // mutex + per-run tokenization of the orchestrator serializes access).
-    let backend_ref: &'static mut Box<dyn TextGenerator> = unsafe {
-        std::mem::transmute::<&mut Box<dyn TextGenerator>, &'static mut Box<dyn TextGenerator>>(engine)
-    };
+    let mut gen = pool.handle(0);
+    let tx_clone = tx.clone();
+
+    // ---- Greeting shortcut for plain chat (non-agent) mode.
+    // Tiny models hallucinate random content for greetings.  Return a canned
+    // reply so the user gets something sensible without burning tokens.
+    {
+        let prompt_lower = request.prompt.trim().to_ascii_lowercase();
+        let bare = prompt_lower.trim_end_matches(['!', '.', '?', ',', ';', ':']);
+        let is_greet = matches!(
+            bare,
+            "hi" | "hello" | "hey" | "howdy" | "sup" | "yo" | "hiya"
+                | "thanks" | "thank you" | "ty" | "thx" | "cheers"
+                | "bye" | "goodbye" | "see you" | "see ya"
+        ) || (bare.split_whitespace().count() <= 2 && bare.len() <= 20);
+        if is_greet {
+            let reply = if bare.starts_with("bye") || bare == "goodbye" || bare == "see you" || bare == "see ya" {
+                "Goodbye! Feel free to come back anytime.".to_string()
+            } else if bare.starts_with("thank") || bare == "ty" || bare == "thx" || bare == "cheers" {
+                "You're welcome! Let me know if you need anything else.".to_string()
+            } else {
+                "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
+            };
+            let _ = tx_clone.send(WorkerEvent::Token { session_id, delta: reply.clone() });
+            let _ = tx_clone.send(WorkerEvent::Done {
+                session_id,
+                done: engine::InferenceDone {
+                    total_tokens: 0,
+                    generated_chars: reply.len() as u64,
+                    tokens_per_sec: 0.0,
+                    elapsed_ms: 0,
+                    stop_reason: "done".into(),
+                    outcome: "completed".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+            });
+            return Ok(session_id);
+        }
+    }
+
+    std::thread::spawn(move || {
+        let result = gen.generate(&request, session_id, &interrupt, &tx_clone);
+        let _ = tx_clone.send(match result {
+            Ok(outcome) => WorkerEvent::Done { session_id, done: outcome.done },
+            Err(message) => WorkerEvent::Error { session_id, message },
+        });
+    });
+
+    Ok(session_id)
+}
+
+/// Agentic task execution: an orchestrated generate → tool-call → feedback
+/// loop (see `agent::orchestrator`). The whole loop runs on one native thread;
+/// every generation dispatches to an engine-pool worker, and a decomposed task
+/// with spare workers runs its subtasks concurrently. The circuit breaker token
+/// is armed once and shared with both generation and tool sub-processes.
+#[tauri::command]
+async fn agent_run_task(
+    app: AppHandle,
+    state: State<'_, InferenceState>,
+    interrupt_state: State<'_, InterruptState>,
+    context_state: State<'_, ContextState>,
+    tool_state: State<'_, ToolState>,
+    request: agent::orchestrator::AgentTaskRequest,
+) -> Result<u64, String> {
+    let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+
+    let session_id = interrupt_state.next_session();
+    let interrupt = interrupt_state.arm();
+    let _ = app.emit("inference-started", StartedEvent { session_id });
+
+    let tx = state
+        .worker_tx
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| spawn_emitter(app.clone()));
+
     // SAFETY: `ToolState` is Tauri-managed and outlives the app; the worker
-    // thread only reads its workspace root + MCP cache.
+    // thread(s) only read its workspace root + MCP cache, all behind mutexes.
     let tool_state_ref: &'static ToolState = unsafe {
         std::mem::transmute::<&ToolState, &'static ToolState>(tool_state.inner())
     };
@@ -342,12 +421,12 @@ async fn agent_run_task(
     let context_snapshot = context_state.inner.lock().await.messages();
     let app_for_thread = app.clone();
     let tx_clone = tx.clone();
-    let context_budget = engine.info().context_size as usize;
+    let context_budget = pool.info().context_size as usize;
+    let pool_for_thread = pool.clone();
 
     std::thread::spawn(move || {
-        let gen: &mut dyn TextGenerator = &mut **backend_ref;
-        let result = agent::orchestrator::run_agent_loop(
-            gen,
+        let result = agent::orchestrator::run_agent_loop_pool(
+            &pool_for_thread,
             tool_state_ref,
             &app_for_thread,
             &interrupt,
@@ -362,9 +441,6 @@ async fn agent_run_task(
             Err(message) => WorkerEvent::Error { session_id, message },
         });
     });
-
-    drop(engine_guard);
-    *state.worker_tx.lock().await = Some(tx);
 
     Ok(session_id)
 }
@@ -418,6 +494,26 @@ struct TextFile {
 #[tauri::command]
 async fn pick_workspace_folder(app: AppHandle) -> Result<Option<String>, String> {
     let picked = app.dialog().file().blocking_pick_folder();
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn pick_text_file(app: AppHandle) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Open file")
+        .add_filter("Text files", &[
+            "txt", "md", "json", "jsonc", "ts", "tsx", "js", "jsx", "css", "scss",
+            "html", "htm", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
+            "py", "rs", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb",
+            "php", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
+            "sql", "graphql", "gql", "proto", "lua", "r", "swift", "kt",
+            "vue", "svelte", "astro", "wxml", "wxss",
+        ])
+        .blocking_pick_file();
     Ok(picked
         .and_then(|p| p.into_path().ok())
         .map(|p| p.to_string_lossy().into_owned()))
@@ -646,18 +742,47 @@ async fn skill_set_active(
 // Permissions
 // ---------------------------------------------------------------------------
 
-/// Complete a pending permission-approval request from the UI.
+/// Complete a pending permission-approval request from the UI. The decision
+/// selects the remembered scope: `allow_once`, `allow_session`,
+/// `always_allow` or `deny` (anything else is treated as a deny).
 #[tauri::command]
 async fn agent_respond_permission(
     state: State<'_, ToolState>,
     request_id: String,
-    allowed: bool,
+    decision: String,
 ) -> Result<(), String> {
+    let decision = match decision.as_str() {
+        "allow_once" => PermissionDecision::AllowOnce,
+        "allow_session" => PermissionDecision::AllowSession,
+        "always_allow" => PermissionDecision::AlwaysAllow,
+        _ => PermissionDecision::Deny,
+    };
     let mut reqs = state.permission_requests.lock().await;
     if let Some(tx) = reqs.remove(&request_id) {
-        let _ = tx.send(allowed);
+        let _ = tx.send(decision);
     }
     Ok(())
+}
+
+/// Recent audit-log entries (`{workspace}/.ai/audit.jsonl`), newest first.
+#[tauri::command]
+async fn agent_audit_log(
+    state: State<'_, ToolState>,
+    limit: Option<usize>,
+) -> Result<Vec<Value>, String> {
+    let ws = state.workspace.lock().await.clone();
+    let Some(ws) = ws else { return Ok(Vec::new()) };
+    let path = ws.join(".ai/audit.jsonl");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read the audit log: {e}"))?;
+    let mut entries: Vec<Value> = text
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str(l.trim_end()).ok())
+        .collect();
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    entries.truncate(limit);
+    Ok(entries)
 }
 
 /// Effective policy snapshot for the UI.
@@ -665,6 +790,41 @@ async fn agent_respond_permission(
 async fn agent_policy_snapshot(state: State<'_, ToolState>) -> Result<Value, String> {
     let ws = state.workspace.lock().await.clone();
     Ok(agent::policy::snapshot(ws.as_deref()))
+}
+
+/// Create a git checkpoint commit directly from the UI (bypasses the agent
+/// tool loop; safe, additive — `git add -A` + `git commit`).
+#[tauri::command]
+async fn agent_git_checkpoint_cmd(
+    state: State<'_, ToolState>,
+    interrupt_state: State<'_, InterruptState>,
+    message: Option<String>,
+) -> Result<agent::ToolResult, String> {
+    agent::tools::git_checkpoint(&state, &interrupt_state.current(), message.as_deref()).await
+}
+
+/// List existing checkpoints (hash/subject/relative age), newest first, for
+/// the one-click revert UI.
+#[tauri::command]
+async fn agent_git_checkpoints_cmd(
+    state: State<'_, ToolState>,
+    interrupt_state: State<'_, InterruptState>,
+) -> Result<Vec<Value>, String> {
+    agent::tools::git_checkpoints(&state, &interrupt_state.current())
+        .await
+        .map(|v| v.into_iter().map(Value::from).collect())
+}
+
+/// Hard-reset to a checkpoint commit. Destructive by nature — the frontend
+/// confirms before calling; the workspace policy's `git_revert` ask-rule does
+/// not apply here because this is an explicit user action, not a model call.
+#[tauri::command]
+async fn agent_git_revert_cmd(
+    state: State<'_, ToolState>,
+    interrupt_state: State<'_, InterruptState>,
+    commit: Option<String>,
+) -> Result<agent::ToolResult, String> {
+    agent::tools::git_revert(&state, &interrupt_state.current(), commit.as_deref()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +965,7 @@ pub fn run() {
             abort_agent_execution,
             agent_run_task,
             pick_workspace_folder,
+            pick_text_file,
             list_directory,
             read_text_file,
             write_text_file,
@@ -819,7 +980,11 @@ pub fn run() {
             knowledge_report_cmd,
             skill_set_active,
             agent_respond_permission,
+            agent_audit_log,
             agent_policy_snapshot,
+            agent_git_checkpoint_cmd,
+            agent_git_checkpoints_cmd,
+            agent_git_revert_cmd,
             settings_load,
             settings_save,
             session_append,

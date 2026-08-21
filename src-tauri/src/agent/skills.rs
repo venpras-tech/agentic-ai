@@ -132,14 +132,15 @@ impl KnowledgeState {
                 if path.extension().map(|e| e == "md").unwrap_or(false) {
                     match parse_skill(&path, &dir) {
                         Ok(skill) => {
-                            // Preserve the previous active flag across rescans.
+                            // Preserve the previous active flag across rescans;
+                            // newly discovered skills are auto-active (opt-out).
                             let active = self
                                 .skills
                                 .lock()
                                 .unwrap()
                                 .get(&skill.name)
                                 .map(|s| s.active)
-                                .unwrap_or(false);
+                                .unwrap_or(true);
                             skills.insert(skill.name.clone(), Skill { active, ..skill });
                         }
                         Err(e) => {

@@ -1,83 +1,379 @@
 # Project Status — AI Editor
 
-_Last updated: 2026-08-14 (skills & rules → model pass — IN PROGRESS). This file
-is the source of truth for the session's progress. Read it at session start;
-update it whenever milestones change. Strategic plan: see `ROADMAP.md`._
+_Last updated: 2026-08-20 (P0 backlog shipped + P1-6 persistent plan tools shipped:
+turn lifecycle & outcomes, token accounting, remote stall/retry, audit log,
+permission decision memory, create_plan/read_plan/update_plan/execute_plan).
+This file is the source of truth for the session's progress. Read it at session
+start; update it whenever milestones change. Strategic plan: see `ROADMAP.md`._
 
-## ⏳ IN PROGRESS — "read any available skills & rules, train the model to work per them"
+---
 
-Goal from the user: the agent app should automatically read every available
-skill and rule and behave according to them, instead of only the manually
-toggled ones. Verification (`cargo check` / `cargo test` / `tsc` / `npm run
-build`) is running — see "Verify:" line below once done.
+## BLUEPRINT GAP ANALYSIS — vs the agentic-coding-tool blueprint
 
-### What changed this pass (2026-08-14, skills & rules pass)
+Reviewed `D:\software\cursor\prompt.txt` (engineering blueprint distilled from a
+production agentic coding tool). **Excluded as custom Cursor tools/APIs:**
+ConnectRPC/protobuf transport (we use Tauri commands + events), extension-host
+hooks (`PreToolUse`/`PostToolUse`/`execute_hook`/`AfterAgentThought`/…), Cursor
+subagent types (`CURSOR_GUIDE`, `MEDIA_REVIEW`, `BROWSER_USE`, `COMPUTER_USE`),
+computer-use, and the cloud/remote worker infra (VM targets, agent stores,
+"babysit PR"). Everything else below is a genuine gap we can build on our stack.
 
-**Gap found:** skills were *opt-in* (`parse_skill` set `active: false`) so the
-model never saw any skill unless the user toggled it in the KnowledgePanel;
-the model had no way to load a skill on demand; `prompt.ts` never told the
-model that the rules/skills sections in context are binding.
+### Already implemented (inventory, matches blueprint sections)
 
-**1. Skills are now auto-active (opt-out) — `skills.rs`**
-- `parse_skill` defaults `active: true`, so every available skill under
-  `{workspace}/.ai/skills/` (and the user-global `{config_dir}/skills/`) is
-  read and pinned into the context automatically. User toggles are preserved
-  across rescans and can turn any skill off from the KnowledgePanel.
-- `active_skills_content` gained context-budget protection: per-skill body cap
-  (`SKILL_BODY_CAP` = 3000 chars) + total cap (`SKILL_TOTAL_CAP` = 24000 chars),
-  skills sorted by name, and a footer listing clipped skills with a pointer to
-  the new `read_skill` tool — so skills can never blow the KV cache.
-- New `get_skill(name)` + `skill_names()` accessors.
+| Blueprint § | What we have |
+|---|---|
+| §1 architecture | Single-process split UI ⇄ Rust (Tauri IPC + events); orchestrator + tool layer + engine pool in the backend process |
+| §2 transport | Tauri `invoke` commands + `emit` events (not protobuf); local GGUF via llama.cpp + remote OpenAI-compatible SSE |
+| §3 turn lifecycle | `inference-started` / `inference-done` / `inference-error` / `execution-aborted` + session ids; `InferenceDone.outcome` = `completed \| failed \| interrupted \| error` with UI badges |
+| §4 streaming | `token_delta` (rAF-batched), `agent-step`, `agent-tool-event`, `agent-subtask`, `agent://tool-output` (shell streaming), `agent://plan-step` (plan item progress), diffs, summary text; `turn_ended` token breakdown (input/output/cache-read/cache-write/reasoning) |
+| §5 tool loop | generate → parse `<execute_tool>` → policy check → dispatch → feedback; per-call started/done/error tool cards; circuit breaker; self-healing retry; `TruncatedToolCall` equivalent via caps |
+| §6 permissions | red-zone deny (unconditional), `default_allow` read-only list, per-tool allow/ask/deny rules in `.ai/policy.json`, `ask` → `agent://permission-request` → UI **allow-once / allow-session / always-allow / deny** (decision memory); workspace path scoping |
+| §7 tool catalog | 21 tools: glob/search/semantic-search/view-structure/read/apply-diff/write/terminal(streaming)/MCP/run-tests/git(status,diff,commit,checkpoint,revert)/create-skill/create_plan/read_plan/update_plan/execute_plan |
+| §8 subagents | Sub-task decomposition (`/decompose`) now **parallel** via engine pool (one worker per subtask), per-subtask step-group labels |
+| §10 sessions | JSONL session log (`session_append`/`session_load`) replayed into chat + model context on workspace open |
+| §11 planning | Plan mode: `/plan` → plan text → **Approve & Execute** / Reject; persistent `create_plan`/`execute_plan` with `.ai/plan.json` + `.ai/plan.md`; git checkpoints + one-click revert + auto-checkpoint before plan execution |
+| §13 context | System-prompt assembly (rules + skills + MCP + active-file buffer), tokenizer-accurate counting, 80% sliding-window eviction |
+| §15 tests | 24 backend unit tests + ignored live-GGUF headless chat test |
 
-**2. New `read_skill` tool — model can load any skill's full text on demand**
-- `ToolCall::ReadSkill { name }` (serde tag parse), schema registered in
-  `core.rs`, dispatched in `tools.rs`, read-only so it defaults to **allow** in
-  `policy.rs` `default_allow`.
-- Returns the complete, untruncated skill body (name/description/source) so the
-  model can apply a clipped skill end-to-end; unknown name → helpful error
-  listing all available skills.
-- Tool inventory: 15 → **16** (add `read_skill`).
+### Missing concepts → backlog (prioritized)
 
-**3. Shared knowledge state — `main.rs` + `mod.rs`**
-- `ToolState` gained `knowledge: Arc<KnowledgeState>`; `run()` now creates ONE
-  `Arc<KnowledgeState>` managed by Tauri and handed into `ToolState`, so a scan
-  (`knowledge_scan` / `agent_set_workspace`) is immediately visible to both the
-  UI commands and the agent's `read_skill` tool. All knowledge commands now take
-  `State<'_, Arc<KnowledgeState>>`.
+**P0 — trust & turn quality (highest ROI) — ✅ shipped (2026-08-15)**
+1. **Turn lifecycle & outcomes** — `inference-done` now carries `outcome`
+   (`completed | failed | interrupted | error`, derived from stop reason /
+   stuck / cancelled) and the UI shows a per-turn badge + footer label.
+2. **Token accounting breakdown** — `InferenceDone` carries
+   `input_tokens / output_tokens / cache_read / cache_write / reasoning_tokens`
+   (blueprint §4 `turn_ended`); local = honest (write=input, read=0 — KV is
+   cleared per run), remote = provider `usage` parsed when present (OpenAI
+   `prompt_tokens`/`cached_tokens`/`reasoning_tokens`, Anthropic
+   `message_start`/`message_delta`).
+3. **Remote stall detection + retries** — 90s stall watchdog aborts a silent
+   stream with a typed error; transient request failures (connect error,
+   408/429/5xx) retry with exponential backoff (max 2) before streaming begins.
+4. **Audit log** — every tool-call policy verdict is appended to
+   `.ai/audit.jsonl` (tool, summary, decision, latency, success, error);
+   `agent_audit_log` command + **AuditMenu** panel in the status bar.
+5. **Permission decision memory** — `allow_once / allow_session / always_allow /
+   deny`; session memory is in-process (`ToolState.session_allow`, exact
+   command for terminal), `always_allow` writes a rule to `.ai/policy.json`.
 
-**4. System prompt now makes rules & skills binding — `prompt.ts`**
-- New "Knowledge" rules: the `## Project rules` section (AGENTS.md/.cursorrules/
-  CLAUDE.md/.ai/rules) is binding for every task; `## Skill instructions` are
-  the available skills and must be applied when they match the task; a skill
-  clipped from context must be loaded in full via `read_skill` before use; do
-  not invent skills that don't exist.
-- `read_skill` added to the documented tool list.
+**P1 — agent capabilities**
+6. **`create_plan` / `execute_plan`** — persistent markdown plan file the agent can edit; `step_started/step_completed` per plan item (§11). ✅ shipped (2026-08-20): `create_plan`, `read_plan`, `update_plan`, `execute_plan` tools; `.ai/plan.json` + `.ai/plan.md` persistence; `agent://plan-step` events in timeline; orchestrator intercepts `execute_plan` for per-item focused loops.
+7. **Goals & todos** — `create_goal/update_goal` (`OPEN|IN_PROGRESS|COMPLETED|TERMINAL`), `read_todos/update_todos` derived from the plan (§11).
+8. **First-class subagents** — `task` tool with `subagent_type` (`EXPLORE|BASH|DEBUG|CUSTOM`), per-child restricted `permission_mode`, `subagent_await` (§8). Today we have parallel decompose, not spawn/await.
+9. **`ask_question` / `send_to_user`** — async human interaction query mid-task (§7 Human tools; §3 `awaiting_input`).
+10. **Git toolchain** — add `blame`, `push`, `pull`, `create_branch`, `create_pr`, `pr_status`, `ci_status` (§7 Git/CI/PR).
+11. **File tool gaps** — `delete`; `read_lints`/`diagnostics` (tree-sitter backed, §7 Files).
 
-**5. Frontend wiring — `App.tsx` + `KnowledgePanel.tsx`**
-- `selectWorkspace` now calls `knowledgeScan()` (not just `knowledgeReport()`) so
-  rules+skills are scanned and pinned the moment a workspace opens.
-- `KnowledgePanel` copy updated: skills are auto-active (opt-out) with per-skill
-  toggles; `✧ N skills` StatusBar chip now reflects the auto-activated set.
+**P2 — concurrency & UX**
+12. **Background work & multitasking** — `spawn_background_shell` / `background_subagent` that survive turn end, pill/badge UI (not a modal), `abort_background_work` (§9).
+13. **Session management UI** — `list_sessions`, `fork_session`, watch lifecycle, statuses `AWAITING_INPUT|ERROR|ABORTED` (§10).
+14. **Modes** — `ASK` (every tool prompts), `DEBUG`, `CUSTOM` (per-mode system prompt + tool allowlist), `switch_mode` (§12). Today: AGENT vs PLAN only.
 
-### Changed files (this pass, so far)
-- `src-tauri/src/agent/skills.rs` — auto-active default, caps, `get_skill`/
-  `skill_names`, module doc, 2 new tests
-- `src-tauri/src/agent/mod.rs` — `ToolCall::ReadSkill` (+name/summary),
-  `ToolState.knowledge: Arc<KnowledgeState>`
-- `src-tauri/src/agent/core.rs` — `read_skill` JSON schema
-- `src-tauri/src/agent/tools.rs` — dispatch arm + `read_skill` impl
-- `src-tauri/src/agent/policy.rs` — `read_skill` in `default_allow`
-- `src-tauri/src/main.rs` — shared `Arc<KnowledgeState>` + `State` types
-- `src/lib/prompt.ts` — binding rules/skills instructions + `read_skill` doc
-- `src/App.tsx` — `knowledgeScan` on workspace select
-- `src/components/KnowledgePanel.tsx` — opt-out copy
+**P3 — scale & polish**
+15. **Compaction** — at ~80% context summarize older messages into a `ConversationSummaryArchive` instead of hard-evicting (§11; PreCompact equivalent).
+16. **Context usage tree + blob store** — per-component token contribution + blob store for large context (§13).
+17. **Smart-mode classifier tier** — lightweight local risk classifier + natural-language `allow_instructions/block_instructions` between allowlists and manual review (§6 tier 2).
 
-### Verify: (pending — `cargo check` / `cargo test` / `tsc` / `npm run build`)
+### Next implementation target
+P1 items 7–11 (goals & todos, first-class subagents, `ask_question`/`send_to_user`,
+git toolchain extensions, file-delete/lints). P1-6 (persistent plan tools)
+shipped 2026-08-20. See the **TODO / implementation log** table below.
+
+---
+
+## TODO / implementation log
+
+| # | Item | Status |
+|---|---|---|
+| — | Blueprint gap analysis (pass) | ✅ done |
+| P0-1 | Turn lifecycle & outcomes + UI badges | ✅ done |
+| P0-2 | Token accounting breakdown (`inference-done`) | ✅ done |
+| P0-3 | Remote stall detection + retry/backoff | ✅ done |
+| P0-4 | Tool-verdict audit log `.ai/audit.jsonl` + UI | ✅ done |
+| P0-5 | Permission decision memory (allow_once / always_allow / ask_first) | ✅ done |
+| P1-6 | `create_plan` / `execute_plan` (markdown plan file + per-item steps) | ✅ done |
+| P1-7 | Goals & todos tools | pending |
+| P1-8 | First-class subagents (`task` + restricted child perms + `subagent_await`) | pending |
+| P1-9 | `ask_question` / `send_to_user` | pending |
+| P1-10 | Git: blame / push / pull / branches / PR / CI | pending |
+| P1-11 | File: delete / read_lints / diagnostics | pending |
+| P2-12 | Background work + multitasking (pill UI, abort) | pending |
+| P2-13 | Session management UI (list / fork / watch) | pending |
+| P2-14 | Modes (ASK / DEBUG / CUSTOM / switch_mode) | pending |
+| P3-15 | Context compaction (summarize @ 80%) | pending |
+| P3-16 | Context usage tree + blob store | pending |
+| P3-17 | Smart-mode classifier tier + NL allow/block rules | pending |
+
+---
+
+## ✅ SHIPPED — P0 trust & turn quality (turn lifecycle, token accounting, remote stall/retry, audit log, permission memory) + P1-6 persistent plan tools, builds green
+
+- `cargo check` clean (zero warnings), `cargo test` **24/24** (1 ignored
+  live-GGUF), `npm run build` green.
+
+### What changed this pass (2026-08-20, P1-6 plan tools)
+
+**1. `create_plan` / `read_plan` / `update_plan` tool dispatch (P1-6)**
+- `plan.rs`: `PlanStatus` gains `#[derive(Default)]` (default = `NotStarted`) so
+  `#[serde(default)]` on `PlanItem.status` compiles.
+- `tools.rs`: new `create_plan`, `read_plan`, `update_plan` async fn
+  implementations wired into the `dispatch` match. `create_plan` builds a
+  `PlanState` via `plan::new_plan`, saves both `.ai/plan.json` and `.ai/plan.md`,
+  and caches it in `ToolState.plan`. `read_plan` loads from cache or disk and
+  returns the rendered markdown with completion stats. `update_plan` mutates a
+  single item's status/details, persists both files, and refreshes the cache.
+  `ExecutePlan` is intercepted by the orchestrator before dispatch (existing
+  path) — a defensive error arm is present but unreachable.
+- `orchestrator.rs`: `set_plan_status` param renamed to `_plan_id` (was unused).
+
+**2. Frontend wiring for plan step events**
+- `types.ts`: new `PlanStepEvent` interface (`sessionId`, `planId`, `itemIndex`,
+  `title`, `status`, `error?`).
+- `events.ts`: `PlanStepHandlerEvent` type alias + `onPlanStep?` in
+  `EngineHandlers`.
+- `ipc.ts`: `agent://plan-step` event subscription wired in
+  `subscribeEngineEvents`.
+- `hooks/useEngineEvents.ts`: `onPlanStep` passthrough.
+- `App.tsx`: `onPlanStep` handler appends a step chip (`Plan · <title>`) to the
+  current message's timeline on `in_progress`.
+
+**3. System prompt updated**
+- `prompt.ts`: tools 13–16 document `create_plan`, `read_plan`, `update_plan`,
+  `execute_plan` with JSON examples so the model knows when to use them.
+
+### Changed files (this pass)
+- `src-tauri/src/agent/plan.rs` — `PlanStatus` derives `Default`
+- `src-tauri/src/agent/tools.rs` — `create_plan`/`read_plan`/`update_plan`
+  dispatch arms + implementations; `plan` module import
+- `src-tauri/src/agent/orchestrator.rs` — `_plan_id` rename
+- `src/types.ts` — `PlanStepEvent`
+- `src/lib/events.ts` — `PlanStepHandlerEvent`, `onPlanStep?`
+- `src/lib/ipc.ts` — `onPlanStepEvent` subscription
+- `src/hooks/useEngineEvents.ts` — `onPlanStep` passthrough
+- `src/App.tsx` — `onPlanStep` handler, `PlanStepEvent` import
+- `src/lib/prompt.ts` — plan tools 13–16 in system prompt
+- `PROJECT_STATUS.md` / `ROADMAP.md` — kept in sync
+
 ### Next step
-Finish verification, then smoke test `npm run tauri:dev`: open a workspace with
-`.ai/skills/*.md`, confirm the model sees `## Skill instructions` in context and
-can call `read_skill`; then continue the roadmap (diff preview UI → session
-resume → semantic search → parallel agent threads).
+Smoke test `npm run tauri:dev`: (a) agent mode → model calls `create_plan` →
+confirm `.ai/plan.json` + `.ai/plan.md` created; (b) model calls `update_plan`
+→ confirm status persisted; (c) model calls `execute_plan` → watch per-item
+focused loops run with plan-step chips in the timeline. Then P1-7: goals &
+todos tools.
+
+---
+
+### What changed this pass (2026-08-15, P0 backlog)
+
+**1. Turn lifecycle & outcomes (P0-1)**
+- `InferenceDone` gains `outcome` (`"completed" | "failed" | "interrupted" |
+  "error"`): local/remote map `stop_reason == "cancelled"` → `interrupted`;
+  orchestrator maps `stuck` → `failed`, `cancelled` → `interrupted`, else
+  `completed` (typed `WorkerEvent::Error` stays the ERROR path).
+- UI: per-turn outcome badge on assistant messages (`OutcomeBadge`) and a
+  footer label (`done/failed/interrupted/error`) in `ChatPanel`.
+
+**2. Token accounting breakdown (P0-2)**
+- `InferenceDone` carries `input_tokens / output_tokens / cache_read_tokens /
+  cache_write_tokens / reasoning_tokens`.
+- Local (`run_generation`): honest accounting — KV cache is cleared per run, so
+  `cache_write = prompt_len`, `cache_read = 0`, `input = prompt_len`,
+  `output = total_tokens`, `reasoning = 0`.
+- Remote (`remote.rs`): `RemoteUsage` parses provider usage — OpenAI
+  `prompt_tokens` + `prompt_tokens_details.cached_tokens` +
+  `completion_tokens_details.reasoning_tokens`; Anthropic `message_start`
+  input/cache + `message_delta` output; chars/4 fallback when omitted.
+- Orchestrator aggregates the breakdown across steps/subtasks/summary so a whole
+  task reports correct totals (`FocusOutcome`/`SubResult` carry the fields).
+
+**3. Remote stall detection + retry/backoff (P0-3)**
+- 90s stall watchdog: a fresh `tokio::time::sleep` per chunk in the stream
+  `select!` aborts with a typed error when the provider goes silent.
+- `send_with_retry`: retries connect errors and 408/429/5xx with exponential
+  backoff (1s/2s, max 2) — only *before* streaming begins, never mid-stream
+  (which would duplicate output).
+
+**4. Audit log `.ai/audit.jsonl` (P0-4)**
+- `tools.rs::audit` appends one JSONL record per tool call at each dispatch exit:
+  `{ts, id, tool, summary, decision, startedAt, latencyMs, success, error}`.
+  Decisions: `allow | deny | granted | granted-session | granted-always |
+  declined | timed-out | aborted`. Summary only — raw args/file contents are
+  never logged (no secrets in the audit trail).
+- `agent_audit_log(limit)` command (newest first) + **AuditMenu** status-bar
+  panel (decision badges, recency, ok/blocked summary).
+
+**5. Permission decision memory (P0-5)**
+- `PermissionDecision` enum (`allow_once | allow_session | always_allow |
+  deny`) rides the permission-response channel; `agent_respond_permission`
+  now takes `decision: String`.
+- Session memory: `ToolState.session_allow` (`HashSet`), keyed by tool name —
+  or the exact command for `execute_terminal_command` (one approved `cargo
+  test` never silently unlocks a different command). `policy::check` consults
+  it before asking.
+- `always_allow`: `policy::remember_always` merges an `allow` rule into
+  `.ai/policy.json` (red-zone rule never persisted back).
+- `PermissionModal` now offers **Allow once / Allow for session / Always allow /
+  Deny** (Enter = allow once, Esc = deny), with scope hints.
+- `ask_approval` returns `AskOutcome` so dispatch distinguishes granted scopes,
+  declined, timed-out and aborted for both memory and the audit trail.
+
+### Changed files (this pass)
+- `src-tauri/src/engine.rs` — `InferenceDone` breakdown + `outcome`;
+  `run_generation` local accounting; FakeGen test updated
+- `src-tauri/src/remote.rs` — `RemoteUsage`, `usage_from_chat` /
+  `usage_from_anthropic`, `send_with_retry` + `backoff` + `retriable`,
+  90s stall watchdog in both streamers
+- `src-tauri/src/agent/orchestrator.rs` — breakdown aggregation through
+  `FocusOutcome`/`SubResult`/`finish_outcome` + `outcome` mapping
+- `src-tauri/src/agent/mod.rs` — `PermissionDecision`, `ToolState.session_allow`,
+  permission channel type
+- `src-tauri/src/agent/policy.rs` — `session_key` / `remember_session` /
+  `remember_always`; session memory consulted in `check`
+- `src-tauri/src/agent/tools.rs` — `AskOutcome` + `ask_approval` rewrite,
+  dispatch decision wiring, `audit` (JSONL)
+- `src-tauri/src/main.rs` — `agent_respond_permission(decision)`,
+  `agent_audit_log` command, registered both
+- `src/types.ts` — `InferenceDone` fields + `ChatMessage.done`, `AuditEntry`,
+  `PermissionDecision`
+- `src/lib/ipc.ts` — decision arg + `agentAuditLog`
+- `src/components/PermissionModal.tsx` — 4 decision buttons
+- `src/components/ChatPanel.tsx` — `OutcomeBadge` + `outcomeLabel`, footer
+  token breakdown
+- `src/components/AuditMenu.tsx` (new) + `src/components/StatusBar.tsx` —
+  audit panel
+- `src/App.tsx` — decision passthrough, store `done` on messages
+- `PROJECT_STATUS.md` / `ROADMAP.md` — kept in sync
+
+### Next step
+Smoke test `npm run tauri:dev`: (a) run an agentic task → watch outcome badges,
+per-turn token breakdown and the AuditMenu entries appear; (b) make a mutating
+tool call → pick "Allow for session" then call again (no re-prompt), and "Always
+allow" → confirm the rule lands in `.ai/policy.json`; (c) remote backend →
+kill the network mid-stream → 90s stall abort + retry on startup. Then P1:
+`create_plan`/`execute_plan`, goals & todos, first-class subagents.
+
+---
+
+- `cargo check` clean (zero warnings), `cargo test` **22/22** (1 ignored live-GGUF),
+  `npm run build` green.
+
+### What changed this pass (2026-08-15, parallel-threads + timeline pass)
+
+**1. Engine pool — parallel agent threads, transmute removed**
+- `engine.rs`: `StandaloneEngine._backend` is now `Arc<LlamaBackend>`;
+  `LoadedModel` (`load_model_with_progress`) loads the GGUF once and shares it
+  across N contexts via `new_engine_with_threads(threads)` (compute threads
+  split across workers).
+- New `EnginePool` / `EngineWorker` / `PoolGenerator`: each worker owns a
+  generator on its own native thread for its whole life; `PoolGenerator`
+  implements `TextGenerator` by message-passing over crossbeam channels.
+  `EnginePool::drop` signals `EngineMsg::Stop` + joins (contexts released
+  before the model drops). No `'static` transmute of the engine anywhere.
+- `main.rs`: `InferenceState.engine` → `pool: Mutex<Option<Arc<EnginePool>>>`.
+  `build_local_pool` (workers = `ModelInitParams.n_workers`, default **2**,
+  clamp 1..=8; local GGUF loaded once + per-worker contexts) and
+  `build_remote_pool` (**4** remote clients). `stream_inference` /
+  `agent_run_task` dispatch to `pool.handle(...)` on the worker thread; the
+  only remaining transmute is the `ToolState` read-only reference (documented).
+
+**2. Parallel sub-task execution (`orchestrator.rs`)**
+- `run_agent_loop_pool(pool, …)` (old single-generator `run_agent_loop`
+  removed): sequential phases drive `pool.handle(0)`; a decomposed task with
+  >1 subtask and >1 worker runs subtasks **concurrently** via
+  `std::thread::scope` — one `pool.handle(i)` + one current-thread tokio
+  runtime per subtask thread, each emitting its own running/done/failed
+  `SubtaskStat` + steps. Results are merged as synthesized "Completed:
+  Subtask i/n · title — done/failed" system messages before the shared summary
+  turn. Single-worker runs fall back to the identical sequential loop.
+
+**3. Step-group timeline**
+- Every `StepStat` now carries a `group` phase label: `"Plan"` (plan mode),
+  `"Execute"` (flat), `"Subtask i/n · title"` (decompose).
+- `types.ts` `StepStat.group` + `StepTimelineStep` + `ChatMessage.steps?`;
+  `App.tsx` appends each `agent-step` to its session's message.
+- `ChatPanel.tsx` new `StepTimeline` component: groups steps by phase label
+  (first-seen order), collapsible header showing `N steps · X tok · Y tool(s)`,
+  rows `#n · tok · ms · tool(s)`. Single-phase turns collapse to one header.
+
+### Changed files (this pass)
+- `src-tauri/src/engine.rs` — `LoadedModel`, `load_model_with_progress`,
+  `EngineMsg`/`EnginePool`/`PoolGenerator`/`EngineWorker` + `Drop` join,
+  `ModelInitParams.n_workers`, `StepStat.group`, pool unit test (+1);
+  removed pre-pool single-context helpers
+- `src-tauri/src/agent/orchestrator.rs` — `run_focused_steps(group)` labels,
+  new `run_agent_loop_pool` with parallel `std::thread::scope` subtasks,
+  removed `run_agent_loop`
+- `src-tauri/src/main.rs` — `InferenceState.pool`, `build_local_pool` /
+  `build_remote_pool`, pool-based `stream_inference` / `agent_run_task`
+- `src/types.ts` — `StepStat.group`, `StepTimelineStep`, `ChatMessage.steps?`
+- `src/App.tsx` — append steps to message timeline in `onStep`
+- `src/components/ChatPanel.tsx` — `StepTimeline` grouped/collapsible UI
+- `PROJECT_STATUS.md` / `ROADMAP.md` — kept in sync
+
+### Next step
+Smoke test `npm run tauri:dev`: (a) `/plan` then Approve → watch "Plan" phase
+steps, then "Subtask i/n · title" steps render concurrently with tool cards;
+(b) `/decompose` a multi-part task → confirm parallel subtask chips and grouped
+timeline; (c) remote backend → 4 workers. Then the remaining roadmap items:
+**diff preview UI** and **session resume** (see ROADMAP).
+
+---
+
+## ✅ SHIPPED — checkpoints/undo UI + cost/token ledger + auto-checkpoint on plan approve, builds green
+
+- `cargo check` clean, `cargo test` **21/21**, `npm run build` green.
+
+### What changed this pass (2026-08-15, checkpoint & ledger pass)
+
+**1. Direct git checkpoint / revert commands (bypass the agent tool loop)**
+- `tools.rs`: `git_checkpoint` / `git_revert` now `pub`; new `git_checkpoints`
+  helper lists tagged `checkpoint:` commits (hash/subject/relative age, newest
+  first) for the UI.
+- `main.rs`: new `#[tauri::command]`s `agent_git_checkpoint_cmd`,
+  `agent_git_checkpoints_cmd`, `agent_git_revert_cmd` (registered in
+  `invoke_handler`). They call the real tool fns with `InterruptState::current()`
+  as the cancellation token. Revert is `reset --hard` — destructive, so the
+  frontend confirms before calling.
+
+**2. Checkpoint / one-click revert UI**
+- New `src/components/CheckpointMenu.tsx`: a ↺ chip (with count) in the StatusBar
+  opening a dropdown — "◆ Save checkpoint" on top, then the checkpoint list, each
+  row one-click hard-resets the workspace to that commit (with `window.confirm`).
+- `App.tsx` wires `createCheckpoint` / `revertToCheckpoint` / `refreshCheckpoints`;
+  checkpoint list refreshes on workspace open and after every create/revert.
+  Checkpoint/revert results are surfaced as timeline messages.
+
+**3. Auto-checkpoint before destructive work**
+- Approving a `/plan` now creates a checkpoint first (when a workspace is set),
+  so the whole pre-approval state is always recoverable in one click.
+
+**4. Aggregate cost/token ledger**
+- New `types.ts` `LedgerEntry {sessionId, label, tokens, toolCalls, elapsedMs}`.
+- `App.tsx` tracks one entry per session: tokens from `agent-step` `StepStat.tokens`
+  (marked via `sessionHasStepsRef` so plain streaming falls back to
+  `InferenceDone.totalTokens` — no double counting), tool calls from
+  `agent-tool-event`, elapsed wall-time from session start.
+- StatusBar now shows `Σ N sessions · X tok · Y tool(s) · Zms` with a per-session
+  breakdown in the tooltip. Cleared with the chat.
+
+### Changed files (this pass)
+- `src-tauri/src/agent/tools.rs` — `pub` git_checkpoint/git_revert, new
+  `git_checkpoints` helper
+- `src-tauri/src/main.rs` — 3 new commands (checkpoint / checkpoints / revert)
+- `src/types.ts` — `CheckpointInfo`, `ToolResultInfo`, `LedgerEntry`
+- `src/lib/ipc.ts` — `gitCheckpoint` / `gitCheckpoints` / `gitRevert` wrappers
+- `src/components/CheckpointMenu.tsx` — NEW
+- `src/components/StatusBar.tsx` — ledger chip + checkpoint menu
+- `src/App.tsx` — ledger state/refs, checkpoint handlers, auto-checkpoint on plan
+  approve, ledger cleared on chat clear
+- `PROJECT_STATUS.md` / `ROADMAP.md` — kept in sync
+
+### Next step
+Smoke test `npm run tauri:dev`: (a) open a workspace, save a checkpoint, make a
+breaking edit, then one-click revert from the StatusBar menu; (b) run an agentic
+task and watch the Σ session/token/tool ledger accumulate; (c) approve a `/plan`
+and confirm a checkpoint is created automatically.
 
 ---
 
@@ -435,7 +731,7 @@ Next step: `npm run tauri dev` to relaunch, then smoke-test streaming again
 ## What this project is
 
 `D:\ai` — **AI Editor**: an ultra-fast, low-memory, fully **local/offline** AI
-code editor.
+code editor with 21 agentic tools.
 
 - Frontend: React 19 + Vite 6 + Tailwind v4 + Monaco editor
 - Desktop shell: Tauri 2 (Rust) — frameless window, host-side fs + model I/O
@@ -443,6 +739,8 @@ code editor.
   GGUF models
 - Streaming: Rust worker thread → bounded crossbeam MPSC → Tauri events →
   rAF-batched React state
+- Agent: orchestrator (generate → parse → dispatch → feedback, plan mode,
+  parallel subtasks via engine pool, self-healing retry) + 21-tool layer
 
 ## Completed
 
@@ -527,19 +825,62 @@ code editor.
 ## In progress / next
 
 - ~~BLOCKED: bindgen/libclang~~ → **RESOLVED** (see Toolchain above).
-- Next: `npm run tauri dev` → smoke-test: load a GGUF, open a workspace folder,
-  edit a file, send a chat prompt, verify streaming + tok/s stats, Stop button.
-- Known follow-ups when testing: ~~acquire a GGUF model~~ **done** —
-  `models\qwen2.5-0.5b-instruct-q4_k_m.gguf`; verify model `info()` metadata,
-  KV-cache reuse, stop-word trimming.
+- **P1-6 shipped**: persistent `create_plan`/`execute_plan` with per-item focused
+  loops, `read_plan`, `update_plan`, `.ai/plan.json` + `.ai/plan.md` persistence,
+  `agent://plan-step` events, system prompt updated.
+- **Next P1 items** (highest ROI first):
+  - **P1-7: Goals & todos** — `create_goal`/`update_goal`/`read_todos`/`update_todos`
+    for tracking progress across sessions; derives from the plan state.
+  - **P1-8: First-class subagents** — `task` tool with `subagent_type`
+    (`EXPLORE|BASH|DEBUG|CUSTOM`), per-child restricted `permission_mode`,
+    `subagent_await` for async spawn/await (currently: parallel decompose only).
+  - **P1-9: `ask_question` / `send_to_user`** — async human interaction mid-task;
+    the agent pauses and waits for the user to answer a clarifying question.
+  - **P1-10: Git toolchain** — `blame`, `push`, `pull`, `create_branch`,
+    `create_pr`, `pr_status`, `ci_status` (§7 Git/CI/PR).
+  - **P1-11: File tool gaps** — `delete`; `read_lints`/`diagnostics` (tree-sitter
+    backed, §7 Files).
+- **Smoke test**: `npm run tauri:dev` with a model that exercises the plan tools
+  end-to-end.
 
 ## Pending / next steps (ordered)
 
-1. `npm run tauri dev` (compiles the dev binary + links ~1-3 min, then opens the
+### Immediate — smoke test
+1. `npm run tauri:dev` (compiles the dev binary + links ~1-3 min, then opens the
    window). Command: `npm run tauri:dev` from `D:\ai`.
-2. Smoke-test the full flow (load model → chat → edit → save).
+2. Smoke-test the full flow: load model → chat → agent task → verify plan tools
+   work end-to-end (model calls `create_plan` → `update_plan` → `execute_plan`).
 3. `npm run tauri build` later for a production bundle (release build is slow;
    uses opt-level 3 + lto).
+
+### P1 — agent capabilities (next implementation target)
+4. **P1-7: Goals & todos** — `create_goal`/`update_goal`/`read_todos`/`update_todos`
+   for tracking progress across sessions; derives from the plan state.
+5. **P1-8: First-class subagents** — `task` tool with `subagent_type`
+   (`EXPLORE|BASH|DEBUG|CUSTOM`), per-child restricted `permission_mode`,
+   `subagent_await` for async spawn/await.
+6. **P1-9: `ask_question` / `send_to_user`** — async human interaction mid-task;
+   the agent pauses and waits for the user to answer a clarifying question.
+7. **P1-10: Git toolchain** — `blame`, `push`, `pull`, `create_branch`,
+   `create_pr`, `pr_status`, `ci_status`.
+8. **P1-11: File tool gaps** — `delete`; `read_lints`/`diagnostics` (tree-sitter
+   backed).
+
+### P2 — concurrency & UX
+9. **P2-12: Background work & multitasking** — `spawn_background_shell` /
+   `background_subagent` that survive turn end, pill/badge UI, `abort_background_work`.
+10. **P2-13: Session management UI** — `list_sessions`, `fork_session`, watch
+    lifecycle, statuses `AWAITING_INPUT|ERROR|ABORTED`.
+11. **P2-14: Modes** — `ASK` (every tool prompts), `DEBUG`, `CUSTOM` (per-mode
+    system prompt + tool allowlist), `switch_mode`.
+
+### P3 — scale & polish
+12. **P3-15: Context compaction** — at ~80% context summarize older messages into
+    a `ConversationSummaryArchive` instead of hard-evicting.
+13. **P3-16: Context usage tree + blob store** — per-component token contribution
+    + blob store for large context.
+14. **P3-17: Smart-mode classifier** — lightweight local risk classifier +
+    natural-language `allow_instructions`/`block_instructions`.
 
 ## API notes (verified against llama-cpp-2 0.1.154 docs.rs)
 
@@ -573,9 +914,27 @@ D:\ai
 ├─ index.html, package.json, vite.config.ts, tsconfig.json, .gitignore
 ├─ app-icon.png            (source icon; icons in src-tauri/icons)
 ├─ src/                    (React frontend)
+│  ├─ components/          (ChatPanel, StatusBar, EditorPane, PermissionModal,
+│  │                       KnowledgePanel, CheckpointMenu, AuditMenu, etc.)
+│  ├─ hooks/               (useTokenStream, useEngineEvents, useDebouncedResize)
+│  └─ lib/                 (ipc, events, monaco, prompt, settings)
 └─ src-tauri/
    ├─ Cargo.toml, build.rs, tauri.conf.json, capabilities/default.json, icons/
-   └─ src/ engine.rs, main.rs
+   └─ src/
+      ├─ engine.rs          (GGUF pool, TextGenerator trait, streaming)
+      ├─ remote.rs          (OpenAI-compatible SSE, stall watchdog, retries)
+      ├─ main.rs            (Tauri commands, InferenceState, pool management)
+      └─ agent/
+         ├─ mod.rs           (ToolCall enum, ToolState, PlanStepEvent, PermissionDecision)
+         ├─ orchestrator.rs  (generate → parse → dispatch → feedback loop, plan/subtask/decompose)
+         ├─ tools.rs         (21 tool implementations + dispatch + audit)
+         ├─ core.rs          (JSON schemas, <execute_tool> parser)
+         ├─ policy.rs        (allow/ask/deny, red-zone, workspace scoping, decision memory)
+         ├─ context.rs       (token tracking, 80% sliding-window eviction)
+         ├─ plan.rs          (PlanState, PlanStatus, .ai/plan.json + .ai/plan.md)
+         ├─ skills.rs        (rules + toggleable skill bundles)
+         ├─ interrupt.rs     (circuit breaker, CancellationToken)
+         └─ mcp.rs           (minimal stdio JSON-RPC MCP client)
 ```
 
 ## Session environment gotchas

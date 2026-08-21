@@ -5,7 +5,7 @@
 //! envelope so the orchestrator gets a uniform response shape regardless of
 //! whether the tool succeeded or failed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,10 +17,24 @@ use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Language, Node, Parser};
 
-use super::{now_ms, policy, AgentToolEvent, FileChangedEvent, PermissionRequestEvent, ToolCall, ToolResult, ToolState};
+use super::{
+    now_ms, plan, policy, AgentToolEvent, FileChangedEvent, PermissionDecision, PermissionRequestEvent,
+    ToolCall, ToolResult, ToolState,
+};
 
 /// How long the agent waits for a human to approve an `ask`-policy tool.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The outcome of an `ask`-policy gate, including what the user chose so the
+/// caller can apply decision memory and record the audit trail.
+enum AskOutcome {
+    GrantedOnce,
+    GrantedSession,
+    GrantedAlways,
+    Declined,
+    TimedOut,
+    Aborted,
+}
 
 /// Execute a [`ToolCall`], emitting `agent://tool-event` events to the UI.
 ///
@@ -57,15 +71,17 @@ pub async fn dispatch(
     // ---- policy gate ----
     let workspace = state.workspace.lock().await.clone();
     let verdict = policy::check(state, call, workspace.as_deref());
+    let mut decision = "allow".to_string();
     let allowed = match &verdict {
         policy::Verdict::Allow => true,
         policy::Verdict::Deny(reason) => {
+            decision = "deny".to_string();
             let result = ToolResult::err(tool, format!("`{tool}` blocked"), reason.clone());
             let duration_ms = started.elapsed().as_millis() as u64;
             emit(
                 app,
                 &AgentToolEvent {
-                    id,
+                    id: id.clone(),
                     tool: tool.to_string(),
                     status: "error".into(),
                     summary: result.summary.clone(),
@@ -74,10 +90,49 @@ pub async fn dispatch(
                     detail: result.error.clone(),
                 },
             );
+            audit(
+                state,
+                workspace.as_deref(),
+                &id,
+                tool,
+                &call.summary(),
+                &decision,
+                started_at,
+                duration_ms,
+                Some(false),
+                Some(reason.as_str()),
+            );
             return Ok(result);
         }
         policy::Verdict::Ask { request_id } => {
-            ask_approval(app, state, request_id, tool, call.summary(), &interrupt).await
+            match ask_approval(app, state, request_id, tool, call.summary(), &interrupt).await {
+                AskOutcome::GrantedOnce => {
+                    decision = "granted".to_string();
+                    true
+                }
+                AskOutcome::GrantedSession => {
+                    decision = "granted-session".to_string();
+                    policy::remember_session(state, call);
+                    true
+                }
+                AskOutcome::GrantedAlways => {
+                    decision = "granted-always".to_string();
+                    let _ = policy::remember_always(workspace.as_deref(), call);
+                    true
+                }
+                AskOutcome::Declined => {
+                    decision = "declined".to_string();
+                    false
+                }
+                AskOutcome::TimedOut => {
+                    decision = "timed-out".to_string();
+                    false
+                }
+                AskOutcome::Aborted => {
+                    decision = "aborted".to_string();
+                    false
+                }
+            }
         }
     };
     if !allowed {
@@ -87,7 +142,7 @@ pub async fn dispatch(
         emit(
             app,
             &AgentToolEvent {
-                id,
+                id: id.clone(),
                 tool: tool.to_string(),
                 status: "error".into(),
                 summary: result.summary.clone(),
@@ -95,6 +150,18 @@ pub async fn dispatch(
                 duration_ms: Some(duration_ms),
                 detail: result.error.clone(),
             },
+        );
+        audit(
+            state,
+            workspace.as_deref(),
+            &id,
+            tool,
+            &call.summary(),
+            &decision,
+            started_at,
+            duration_ms,
+            Some(false),
+            Some(msg.as_str()),
         );
         return Ok(result);
     }
@@ -121,6 +188,17 @@ pub async fn dispatch(
             )
             .await
         }
+        ToolCall::SemanticSearchCodebase { query, include, root, respect_gitignore, top_k } => {
+            semantic_search_codebase(
+                state,
+                query,
+                include.as_deref(),
+                root.as_deref(),
+                respect_gitignore.unwrap_or(true),
+                top_k.unwrap_or(10),
+            )
+            .await
+        }
         ToolCall::CreateSkill { name, description, content } => {
             create_skill(app, state, name, description.as_deref(), content).await
         }
@@ -137,6 +215,11 @@ pub async fn dispatch(
         ToolCall::GitCheckpoint { message } => git_checkpoint(state, &interrupt, message.as_deref()).await,
         ToolCall::GitRevert { commit } => git_revert(state, &interrupt, commit.as_deref()).await,
         ToolCall::RunTests { command } => run_tests(app, state, &interrupt, command.as_deref()).await,
+        ToolCall::CreatePlan { title, goal, items } => create_plan(state, title, goal, items).await,
+        ToolCall::ReadPlan {} => read_plan(state).await,
+        ToolCall::UpdatePlan { item, status, details } => update_plan(state, *item, status, details.as_deref()).await,
+        // ExecutePlan is intercepted by the orchestrator before dispatch; treat as unreachable.
+        ToolCall::ExecutePlan {} => Ok(ToolResult::err("execute_plan", "execute_plan is handled by the orchestrator".into(), "should not reach dispatch".into())),
     };
 
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -155,7 +238,7 @@ pub async fn dispatch(
     emit(
         app,
         &AgentToolEvent {
-            id,
+            id: id.clone(),
             tool: tool.to_string(),
             status: if final_result.success { "done".into() } else { "error".into() },
             summary: final_result.summary.clone(),
@@ -165,7 +248,60 @@ pub async fn dispatch(
         },
     );
 
+    audit(
+        state,
+        workspace.as_deref(),
+        &id,
+        tool,
+        &call.summary(),
+        &decision,
+        started_at,
+        duration_ms,
+        Some(final_result.success),
+        final_result.error.as_deref(),
+    );
+
     Ok(final_result)
+}
+
+/// Append one line to `{workspace}/.ai/audit.jsonl` describing a tool call's
+/// policy decision and outcome. Best effort: a missing/read-only workspace or
+/// disk error never breaks the agent loop. Only the human-readable summary is
+/// logged — raw args (file content, secrets) are never written.
+fn audit(
+    state: &ToolState,
+    workspace: Option<&Path>,
+    id: &str,
+    tool: &str,
+    summary: &str,
+    decision: &str,
+    started_at: u64,
+    duration_ms: u64,
+    success: Option<bool>,
+    error: Option<&str>,
+) {
+    let _ = state;
+    let Some(ws) = workspace else { return };
+    let dir = ws.join(".ai");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("audit.jsonl");
+    let entry = json!({
+        "ts": now_ms(),
+        "id": id,
+        "tool": tool,
+        "summary": summary,
+        "decision": decision,
+        "startedAt": started_at,
+        "latencyMs": duration_ms,
+        "success": success,
+        "error": error,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{entry}");
+    }
 }
 
 /// Emit a `agent://permission-request` and wait for the user's decision.
@@ -176,7 +312,7 @@ async fn ask_approval(
     tool: &str,
     summary: String,
     interrupt: &CancellationToken,
-) -> bool {
+) -> AskOutcome {
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
         let mut reqs = state.permission_requests.lock().await;
@@ -192,14 +328,27 @@ async fn ask_approval(
         },
     );
 
-    let granted = tokio::select! {
-        r = rx => r.unwrap_or(false),
-        _ = tokio::time::sleep(PERMISSION_TIMEOUT) => false,
-        _ = interrupt.clone().cancelled_owned() => false,
+    enum Rcvd {
+        Decision(PermissionDecision),
+        TimedOut,
+        Aborted,
+    }
+    let rcvd = tokio::select! {
+        r = rx => Rcvd::Decision(r.unwrap_or(PermissionDecision::Deny)),
+        _ = tokio::time::sleep(PERMISSION_TIMEOUT) => Rcvd::TimedOut,
+        _ = interrupt.clone().cancelled_owned() => Rcvd::Aborted,
     };
     let mut reqs = state.permission_requests.lock().await;
     reqs.remove(request_id);
-    granted
+
+    match rcvd {
+        Rcvd::Decision(PermissionDecision::AllowOnce) => AskOutcome::GrantedOnce,
+        Rcvd::Decision(PermissionDecision::AllowSession) => AskOutcome::GrantedSession,
+        Rcvd::Decision(PermissionDecision::AlwaysAllow) => AskOutcome::GrantedAlways,
+        Rcvd::Decision(PermissionDecision::Deny) => AskOutcome::Declined,
+        Rcvd::TimedOut => AskOutcome::TimedOut,
+        Rcvd::Aborted => AskOutcome::Aborted,
+    }
 }
 
 /// Compute a unified diff between two strings (best effort).
@@ -496,6 +645,284 @@ async fn search_file_contents(
             "truncated": truncated,
         })),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// semantic_search_codebase
+// ---------------------------------------------------------------------------
+
+/// Stopwords dropped from both index and query tokens. Code tokens (identifiers
+/// like `auth`, `login`, `token`) are kept; only high-frequency connectors are
+/// removed so ranking stays code-aware.
+const SEM_STOPWORDS: &[&str] = &[
+    "the", "and", "are", "for", "not", "but", "with", "this", "that", "from", "have",
+    "has", "was", "were", "you", "your", "will", "into", "than", "then", "them", "their",
+    "been", "being", "about", "would", "could", "should", "there", "here", "when",
+    "where", "which", "while", "after", "before", "also", "over", "under", "each",
+    "between", "within", "above", "such", "only", "very", "just", "can", "make",
+    "make", "used", "use", "using", "does", "doing", "done", "does", "was",
+    "its", "it's", "our", "out", "all", "any", "both", "few", "more", "most",
+];
+
+/// Split a token stream into lowercase word tokens, keeping meaningful code
+/// identifiers. Handles camelCase / snake_case / UPPER segments and drops
+/// stopwords + 1-2 char noise.
+fn sem_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for seg in text.split(|c: char| !c.is_alphanumeric()) {
+        if seg.is_empty() {
+            continue;
+        }
+        // Split camelCase boundaries: lower→Upper, digit→letter.
+        let mut current = String::new();
+        let chars: Vec<char> = seg.chars().collect();
+        for i in 0..chars.len() {
+            let c = chars[i];
+            if i > 0 && c.is_uppercase() && !current.is_empty()
+                && (chars[i - 1].is_lowercase() || chars[i - 1].is_ascii_digit())
+            {
+                if !current.is_empty() {
+                    out.push(current.to_lowercase());
+                    current.clear();
+                }
+            }
+            current.push(c);
+        }
+        if !current.is_empty() {
+            out.push(current.to_lowercase());
+        }
+    }
+    out.into_iter()
+        .filter(|t| t.len() >= 2 && !SEM_STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// One indexed chunk: a window of lines from a file.
+struct SemChunk {
+    /// Relative path.
+    path: String,
+    /// 1-based start line of the window.
+    start_line: usize,
+    /// TF vector of token → count within the window.
+    tf: HashMap<String, usize>,
+}
+
+/// Build the in-memory TF-IDF index over the workspace and rank windows by
+/// cosine similarity to `query`. Fully local — no external embeddings model.
+async fn semantic_search_codebase(
+    state: &ToolState,
+    query: &str,
+    include: Option<&str>,
+    root: Option<&str>,
+    respect_gitignore: bool,
+    top_k: usize,
+) -> Result<ToolResult, String> {
+    let root = resolve_root(state, root).await?;
+    let include_matcher = include
+        .filter(|inc| !inc.trim().is_empty())
+        .map(|inc| {
+            GlobBuilder::new(inc)
+                .case_insensitive(true)
+                .build()
+                .map(|g| g.compile_matcher())
+        })
+        .transpose()
+        .map_err(|e| format!("Invalid include glob `{include:?}`: {e}"))?;
+
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .hidden(true)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .require_git(false)
+        .follow_links(false);
+    builder.filter_entry(|entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let name = entry.file_name().to_string_lossy();
+            return !SKIP_DIRS.contains(&name.as_ref());
+        }
+        true
+    });
+
+    const WINDOW_LINES: usize = 40;
+    const WINDOW_STEP: usize = 20;
+    const MAX_FILES: usize = 600;
+    const MAX_CHUNKS: usize = 4000;
+
+    let mut chunks: Vec<SemChunk> = Vec::new();
+    let mut files_indexed = 0usize;
+
+    for entry in builder.build() {
+        let entry = entry.map_err(|e| format!("Walk error: {e}"))?;
+        if files_indexed >= MAX_FILES || chunks.len() >= MAX_CHUNKS {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Some(ft) if ft.is_file() => ft,
+            _ => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = rel_path(&root, path);
+        if let Some(m) = &include_matcher {
+            if !m.is_match(&rel) {
+                continue;
+            }
+        }
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        if meta.len() > MAX_SEARCH_FILE_SIZE {
+            continue;
+        }
+        files_indexed += 1;
+
+        let Ok(bytes) = tokio::fs::read(path).await else { continue };
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let mut start = 0usize;
+        while start < lines.len() && chunks.len() < MAX_CHUNKS {
+            let end = (start + WINDOW_LINES).min(lines.len());
+            let window = lines[start..end].join("\n");
+            let tf = count_tf(&window);
+            if !tf.is_empty() {
+                chunks.push(SemChunk {
+                    path: rel.clone(),
+                    start_line: start + 1,
+                    tf,
+                });
+            }
+            if end == lines.len() {
+                break;
+            }
+            start += WINDOW_STEP;
+        }
+    }
+
+    if chunks.is_empty() {
+        return Ok(ToolResult::ok(
+            "semantic_search_codebase",
+            format!("No indexable files under `{}`", root.to_string_lossy()),
+            Some(String::new()),
+            Some(json!({ "matches": 0, "root": root.to_string_lossy() })),
+        ));
+    }
+
+    // IDF: log(N / df).
+    let n = chunks.len() as f64;
+    let mut df: HashMap<&str, usize> = HashMap::new();
+    for c in &chunks {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for t in c.tf.keys() {
+            if seen.insert(t) {
+                *df.entry(t.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Query vector.
+    let q_tokens = sem_tokens(query);
+    let mut q_tf: HashMap<&str, usize> = HashMap::new();
+    for t in &q_tokens {
+        *q_tf.entry(t.as_str()).or_insert(0) += 1;
+    }
+    let q_vec: Vec<(&str, f64)> = q_tf
+        .iter()
+        .filter(|(t, _)| df.contains_key(*t))
+        .map(|(t, &f)| {
+            let idf = (n / (*df.get(t).unwrap() as f64)).ln() + 1.0;
+            (*t, f as f64 * idf)
+        })
+        .collect();
+
+    if q_vec.is_empty() {
+        return Ok(ToolResult::ok(
+            "semantic_search_codebase",
+            format!("No overlap between query `{query}` and the indexed codebase"),
+            Some(String::new()),
+            Some(json!({ "matches": 0, "root": root.to_string_lossy() })),
+        ));
+    }
+
+    // Score chunks by cosine similarity of TF-IDF vectors.
+    let mut scored: Vec<(f64, &SemChunk)> = Vec::with_capacity(chunks.len());
+    for c in &chunks {
+        let mut dot = 0.0;
+        let mut c_norm = 0.0;
+        for (t, &count) in &c.tf {
+            let idf = (n / (*df.get(t.as_str()).unwrap() as f64)).ln() + 1.0;
+            let w = count as f64 * idf;
+            c_norm += w * w;
+            if let Some((_, qw)) = q_vec.iter().find(|(qt, _)| qt == t) {
+                dot += qw * w;
+            }
+        }
+        if c_norm > 0.0 && dot > 0.0 {
+            scored.push((dot / c_norm.sqrt(), c));
+        }
+    }
+
+    let mut q_norm_sq = 0.0;
+    for (_, w) in &q_vec {
+        q_norm_sq += w * w;
+    }
+    let q_norm = q_norm_sq.sqrt();
+    if q_norm > 0.0 {
+        for (s, _) in scored.iter_mut() {
+            *s /= q_norm;
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    const SEM_MAX_RESULTS: usize = 25;
+    let total = scored.len();
+    let k = top_k.min(SEM_MAX_RESULTS).min(total);
+    let mut out = String::new();
+    let mut rank = 1usize;
+    for (score, c) in scored.iter().take(k) {
+        out.push_str(&format!(
+            "{rank:>2}. {:.2}  {}:{}:{}\n",
+            score,
+            c.path,
+            c.start_line,
+            c.start_line + WINDOW_LINES - 1
+        ));
+        rank += 1;
+    }
+
+    let summary = format!(
+        "Semantic search `{query}` — {total} matching region(s), showing top {k} (indexed {files_indexed} file(s))"
+    );
+    Ok(ToolResult::ok(
+        "semantic_search_codebase",
+        summary,
+        Some(out),
+        Some(json!({
+            "matches": total,
+            "filesIndexed": files_indexed,
+            "root": root.to_string_lossy(),
+            "topK": k,
+            "query": query,
+        })),
+    ))
+}
+
+fn count_tf(text: &str) -> HashMap<String, usize> {
+    let mut tf: HashMap<String, usize> = HashMap::new();
+    for t in sem_tokens(text) {
+        *tf.entry(t).or_insert(0) += 1;
+    }
+    tf
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,7 +1842,7 @@ async fn git_commit(state: &ToolState, interrupt: &CancellationToken, message: &
 
 /// Save a checkpoint: a real commit tagged with a `checkpoint:` prefix so
 /// `git_revert` can find it later.
-async fn git_checkpoint(state: &ToolState, interrupt: &CancellationToken, message: Option<&str>) -> Result<ToolResult, String> {
+pub async fn git_checkpoint(state: &ToolState, interrupt: &CancellationToken, message: Option<&str>) -> Result<ToolResult, String> {
     let msg = match message {
         Some(m) if !m.trim().is_empty() => m.to_string(),
         _ => format!("checkpoint: {}", now_ms()),
@@ -1428,9 +1855,63 @@ async fn git_checkpoint(state: &ToolState, interrupt: &CancellationToken, messag
     git_capture(state, interrupt, &["commit", "-m", &msg], None).await
 }
 
+/// List checkpoint commits (newest first): hash + subject + ISO-ish timestamp.
+/// Returns `Ok(Vec::new())` if the workspace isn't a git repo or has none.
+pub async fn git_checkpoints(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+) -> Result<Vec<serde_json::Value>, String> {
+    let res = git_capture(
+        state,
+        interrupt,
+        &["log", "--grep=^checkpoint:", "--format=%H%x1f%s%x1f%ct", "-n", "20"],
+        None,
+    )
+    .await?;
+    if !res.success {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    if let Some(stdout) = res.stdout {
+        for line in stdout.lines() {
+            let mut parts = line.splitn(3, '\x1f');
+            let (Some(hash), Some(subject), Some(ts)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let time = ts
+                .trim()
+                .parse::<i64>()
+                .map(|s| {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let secs = if s >= 0 { s as u64 } else { 0 };
+                    let d = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+                    let elapsed = d.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    let ago = since.saturating_sub(elapsed).as_secs();
+                    if ago < 60 {
+                        "just now".to_string()
+                    } else if ago < 3600 {
+                        format!("{}m ago", ago / 60)
+                    } else if ago < 86400 {
+                        format!("{}h ago", ago / 3600)
+                    } else {
+                        format!("{}d ago", ago / 86400)
+                    }
+                })
+                .unwrap_or_default();
+            out.push(json!({
+                "hash": hash,
+                "subject": subject,
+                "relative": time,
+            }));
+        }
+    }
+    Ok(out)
+}
+
 /// Revert to a checkpoint commit (or the most recent `checkpoint:` one). Uses
 /// `reset --hard`; gated by policy `ask`, so a human always approves it.
-async fn git_revert(state: &ToolState, interrupt: &CancellationToken, commit: Option<&str>) -> Result<ToolResult, String> {
+pub async fn git_revert(state: &ToolState, interrupt: &CancellationToken, commit: Option<&str>) -> Result<ToolResult, String> {
     let target = match commit {
         Some(c) if !c.trim().is_empty() => c.to_string(),
         _ => {
@@ -1442,4 +1923,129 @@ async fn git_revert(state: &ToolState, interrupt: &CancellationToken, commit: Op
         }
     };
     git_capture(state, interrupt, &["reset", "--hard", &target], None).await
+}
+
+// ---------------------------------------------------------------------------
+// plan tools
+// ---------------------------------------------------------------------------
+
+async fn create_plan(
+    state: &ToolState,
+    title: &str,
+    goal: &str,
+    items: &[String],
+) -> Result<ToolResult, String> {
+    let workspace = resolve_root(state, None).await?;
+    let plan = plan::new_plan(title, goal, items.to_vec());
+    plan.save(&workspace)?;
+    // Cache the active plan in ToolState so subsequent tools/loops see it.
+    *state.plan.lock().unwrap() = Some(plan.clone());
+    let md = plan.render_markdown();
+    Ok(ToolResult::ok(
+        "create_plan",
+        format!("Plan `{}` created with {} items. See `.ai/plan.md`.", plan.title, plan.items.len()),
+        Some(md),
+        None,
+    ))
+}
+
+async fn read_plan(state: &ToolState) -> Result<ToolResult, String> {
+    let workspace = resolve_root(state, None).await?;
+    let plan = {
+        let guard = state.plan.lock().unwrap();
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => plan::PlanState::load(&workspace)
+                .ok_or_else(|| "No plan found. Call `create_plan` first.".to_string())?,
+        }
+    };
+    let md = plan.render_markdown();
+    Ok(ToolResult::ok(
+        "read_plan",
+        format!("Plan `{}` — {}/{} items completed.", plan.title, plan.items.iter().filter(|i| i.status == plan::PlanStatus::Completed).count(), plan.items.len()),
+        Some(md),
+        None,
+    ))
+}
+
+async fn update_plan(
+    state: &ToolState,
+    item: usize,
+    status: &str,
+    details: Option<&str>,
+) -> Result<ToolResult, String> {
+    let workspace = resolve_root(state, None).await?;
+    let new_status = plan::PlanStatus::from_label(status)
+        .ok_or_else(|| format!("Unknown status `{status}`. Use: not_started, in_progress, completed, terminal."))?;
+    let mut plan = {
+        let guard = state.plan.lock().unwrap();
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => plan::PlanState::load(&workspace)
+                .ok_or_else(|| "No plan found. Call `create_plan` first.".to_string())?,
+        }
+    };
+    let total_items = plan.items.len();
+    let plan_item = plan
+        .items
+        .get_mut(item - 1)
+        .ok_or_else(|| format!("Plan item #{item} not found (plan has {total_items} items)."))?;
+    let title = plan_item.title.clone();
+    plan_item.status = new_status;
+    if let Some(d) = details {
+        if !plan_item.details.is_empty() {
+            plan_item.details.push_str(" — ");
+        }
+        plan_item.details.push_str(d);
+    }
+    plan.updated_at = now_ms();
+    plan.save(&workspace)?;
+    *state.plan.lock().unwrap() = Some(plan.clone());
+    Ok(ToolResult::ok(
+        "update_plan",
+        format!("Updated plan item #{item} `{title}` → {}.", new_status.label()),
+        None,
+        None,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sem_tokens_splits_identifiers_and_drops_stopwords() {
+        let toks = sem_tokens("authLogin getUserToken the and");
+        assert!(toks.contains(&"auth".to_string()));
+        assert!(toks.contains(&"login".to_string()));
+        assert!(toks.contains(&"get".to_string()));
+        assert!(toks.contains(&"user".to_string()));
+        assert!(toks.contains(&"token".to_string()));
+        assert!(!toks.contains(&"the".to_string()));
+        assert!(!toks.contains(&"and".to_string()));
+        assert!(toks.contains(&"authlogin".to_string()) == false);
+    }
+
+    #[test]
+    fn sem_tokens_handles_snake_case_and_numbers() {
+        let toks = sem_tokens("handle_2fa user_id_42");
+        assert!(toks.contains(&"handle".to_string()));
+        assert!(toks.contains(&"2fa".to_string()));
+        assert!(toks.contains(&"user".to_string()));
+        assert!(toks.contains(&"id".to_string()));
+        assert!(toks.contains(&"42".to_string()));
+    }
+
+    #[test]
+    fn sem_tokens_filters_short_noise() {
+        let toks = sem_tokens("a b x y");
+        assert_eq!(toks, Vec::<String>::new());
+    }
+
+    #[test]
+    fn count_tf_counts_tokens() {
+        let tf = count_tf("foo bar foo");
+        assert_eq!(tf.get("foo"), Some(&2));
+        assert_eq!(tf.get("bar"), Some(&1));
+    }
 }

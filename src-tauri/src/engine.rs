@@ -1,14 +1,15 @@
 //! Standalone llama.cpp inference engine, fully isolated from the UI thread.
 //!
 //! This module owns the loaded GGUF model + context (`StandaloneEngine`) and
-//! exposes two entry points used by the command layer:
+//! exposes the entry points used by the command layer:
 //!
-//! * [`load_engine`] - blocking model load (run inside `spawn_blocking`), with
-//!   progress pushed to the frontend through Tauri's emitter.
-//! * [`run_generation`] - the token loop. It is executed on a dedicated native
-//!   OS thread that holds the engine's mutex via `blocking_lock` for the whole
-//!   generation, streaming decoded tokens out through a bounded cross-beam MPSC
-//!   channel. The UI thread never touches llama.cpp.
+//! * [`load_model_with_progress`] - blocking model load (run inside
+//!   `spawn_blocking`), which shares one loaded model across the contexts of an
+//!   [`EnginePool`].
+//! * [`run_generation`] - the token loop, executed on a dedicated native worker
+//!   thread that holds a context for the whole generation, streaming decoded
+//!   tokens out through a bounded cross-beam MPSC channel. The UI thread never
+//!   touches llama.cpp.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -25,7 +26,6 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 
 /// A loaded GGUF model, its context and the owned llama backend.
@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 pub struct StandaloneEngine {
     context: LlamaContext<'static>,
     model: Arc<LlamaModel>,
-    _backend: LlamaBackend,
+    _backend: Arc<LlamaBackend>,
 }
 
 // Safety: all llama.cpp calls are serialized by the owning async mutex and the
@@ -54,25 +54,27 @@ impl StandaloneEngine {
     /// Cheap metadata snapshot. Never touches the engine lock on the caller's
     /// thread; it is read while the caller already holds the lock.
     pub fn info(&self) -> ModelInfo {
-        let name = self
-            .model
-            .meta_val_str("general.name")
-            .unwrap_or_else(|_| "unknown".to_string());
-        let architecture = self
-            .model
-            .meta_val_str("general.architecture")
-            .unwrap_or_default();
-        ModelInfo {
-            name,
-            architecture,
-            n_vocab: self.model.n_vocab(),
-            n_ctx_train: self.model.n_ctx_train(),
-            n_embd: self.model.n_embd(),
-            n_layer: self.model.n_layer(),
-            n_params: self.model.n_params(),
-            size_bytes: self.model.size(),
-            context_size: self.context.n_ctx(),
-        }
+        model_info(&self.model, self.context.n_ctx())
+    }
+}
+
+fn model_info(model: &LlamaModel, n_ctx: u32) -> ModelInfo {
+    let name = model
+        .meta_val_str("general.name")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let architecture = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default();
+    ModelInfo {
+        name,
+        architecture,
+        n_vocab: model.n_vocab(),
+        n_ctx_train: model.n_ctx_train(),
+        n_embd: model.n_embd(),
+        n_layer: model.n_layer(),
+        n_params: model.n_params(),
+        size_bytes: model.size(),
+        context_size: n_ctx,
     }
 }
 
@@ -86,6 +88,10 @@ pub struct ModelInitParams {
     pub context_size: Option<u32>,
     /// Compute threads; defaults to all available cores.
     pub n_threads: Option<u32>,
+    /// How many parallel engine workers (each with its own context) to spawn.
+    /// Defaults to 2; threads are split across workers so the machine is not
+    /// oversubscribed.
+    pub n_workers: Option<u32>,
 }
 
 /// A single streaming inference request (camelCase over the wire).
@@ -116,6 +122,19 @@ pub struct ModelInfo {
 }
 
 /// Terminal statistics for a finished generation (camelCase).
+///
+/// Token accounting mirrors the API conventions of the providers we speak to:
+/// * `input_tokens` — the prompt that was sent (and filled the KV cache, since
+///   every generation starts from a clean cache),
+/// * `output_tokens` — the tokens the model produced,
+/// * `cache_read_tokens` — tokens served from an existing prompt cache (0 for
+///   local llama.cpp, which clears the KV cache every run),
+/// * `cache_write_tokens` — tokens written into the prompt cache,
+/// * `reasoning_tokens` — thinking tokens the model emitted (remote providers
+///   that report them; 0 otherwise).
+///
+/// `outcome` classifies the turn lifecycle: `"completed" | "failed" |
+/// "interrupted" | "error"` (see the blueprint's `finished` event).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceDone {
@@ -124,6 +143,13 @@ pub struct InferenceDone {
     pub tokens_per_sec: f64,
     pub elapsed_ms: u64,
     pub stop_reason: String,
+    /// Turn lifecycle outcome: "completed" | "failed" | "interrupted" | "error".
+    pub outcome: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 /// Per-step telemetry for agentic tasks (camelCase).
@@ -131,6 +157,9 @@ pub struct InferenceDone {
 #[serde(rename_all = "camelCase")]
 pub struct StepStat {
     pub step: usize,
+    /// Phase/group this step belongs to, e.g. "Plan", "Execute" or
+    /// "Subtask 1/3 · Fix lint" — lets the frontend render a grouped timeline.
+    pub group: String,
     pub tokens: u64,
     pub elapsed_ms: u64,
     pub tool_calls: usize,
@@ -224,36 +253,219 @@ impl TextGenerator for LocalGenerator {
     }
 }
 
-/// Blocking model load. Call from `tokio::task::spawn_blocking` so the UI
-/// thread never stalls on mmap + tensor deserialization.
-pub fn load_engine(path: &Path, params: &ModelInitParams, app: &AppHandle) -> Result<StandaloneEngine, String> {
-    let app_progress = app.clone();
-    let mut last_progress = 0.0f32;
-    load_engine_with_progress(path, params, move |progress: f32| {
-        // Throttle the event stream to avoid flooding the webview.
-        if progress - last_progress >= 0.01 || progress >= 1.0 {
-            last_progress = progress;
-            let _ = app_progress.emit_to(
-                "main",
-                "model-load-progress",
-                LoadProgressEvent {
-                    stage: "load",
-                    progress,
-                },
-            );
+// ---------------------------------------------------------------------------
+// Engine pool: one worker thread per generator, no `'static` transmute.
+//
+// The old design transmuted a `&mut Box<dyn TextGenerator>` to `'static` and
+// handed it to a fresh `std::thread::spawn` per generation. The pool instead
+// owns every generator inside a dedicated worker thread for its whole life;
+// callers hold cheap cloneable [`PoolGenerator`] handles that proxy requests
+// over a channel and block on a reply. That removes the unsoundness *and* lets
+// several generations run truly concurrently (one per worker), which is what
+// parallel sub-tasks need.
+// ---------------------------------------------------------------------------
+
+/// One message to an engine worker thread.
+pub enum EngineMsg {
+    Generate {
+        request: InferenceRequest,
+        session_id: u64,
+        interrupt: CancellationToken,
+        reply: crossbeam_channel::Sender<Result<GenerationOutcome, String>>,
+    },
+    Stop,
+}
+
+/// A handle to one worker in an [`EnginePool`]. Cheap to clone (shares the
+/// worker's channel); implements [`TextGenerator`] by message-passing, so the
+/// orchestrator can hold one handle per worker and drive concurrent subtasks.
+#[derive(Clone)]
+pub struct PoolGenerator {
+    tx: crossbeam_channel::Sender<EngineMsg>,
+    info: ModelInfo,
+}
+
+impl PoolGenerator {
+    fn new(tx: crossbeam_channel::Sender<EngineMsg>, info: ModelInfo) -> Self {
+        Self { tx, info }
+    }
+}
+
+impl TextGenerator for PoolGenerator {
+    fn info(&self) -> ModelInfo {
+        self.info.clone()
+    }
+
+    fn generate(
+        &mut self,
+        request: &InferenceRequest,
+        session_id: u64,
+        interrupt: &CancellationToken,
+        _tx: &Sender<WorkerEvent>,
+    ) -> Result<GenerationOutcome, String> {
+        let (reply_tx, reply_rx) =
+            crossbeam_channel::bounded::<Result<GenerationOutcome, String>>(1);
+        self.tx
+            .send(EngineMsg::Generate {
+                request: request.clone(),
+                session_id,
+                interrupt: interrupt.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| "Engine worker is gone".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "Engine worker is gone".to_string())?
+    }
+}
+
+struct EngineWorker {
+    tx: crossbeam_channel::Sender<EngineMsg>,
+    info: ModelInfo,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+/// A pool of engine worker threads, each owning its own generator (own
+/// llama.cpp context for local models, own client for remote). Generations
+/// dispatch to workers round-robin; parallel subtasks take one worker each.
+pub struct EnginePool {
+    workers: Vec<EngineWorker>,
+}
+
+impl EnginePool {
+    /// Spawn `count` worker threads from a factory that builds one generator
+    /// per worker. `event_tx` is the shared channel that token/step events
+    /// stream through to the UI.
+    pub fn spawn_with<F>(
+        mut factory: F,
+        event_tx: Sender<WorkerEvent>,
+        count: usize,
+    ) -> Result<Self, String>
+    where
+        F: FnMut() -> Result<Box<dyn TextGenerator>, String>,
+    {
+        let mut workers = Vec::with_capacity(count.max(1));
+        for _ in 0..count.max(1) {
+            let inner = factory()?;
+            let info = inner.info();
+            let (tx, rx) = crossbeam_channel::unbounded::<EngineMsg>();
+            let event_tx = event_tx.clone();
+            let handle = std::thread::spawn(move || {
+                let mut inner = inner;
+                for msg in rx.iter() {
+                    match msg {
+                        EngineMsg::Generate {
+                            request,
+                            session_id,
+                            interrupt,
+                            reply,
+                        } => {
+                            let result =
+                                inner.generate(&request, session_id, &interrupt, &event_tx);
+                            let _ = reply.send(result);
+                        }
+                        EngineMsg::Stop => break,
+                    }
+                }
+            });
+            workers.push(EngineWorker {
+                tx,
+                info,
+                _handle: handle,
+            });
         }
-        true
-    })
+        Ok(Self { workers })
+    }
+
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn info(&self) -> ModelInfo {
+        self.workers
+            .first()
+            .map(|w| w.info.clone())
+            .unwrap_or_else(|| ModelInfo {
+                name: "unloaded".into(),
+                architecture: String::new(),
+                n_vocab: 0,
+                n_ctx_train: 0,
+                n_embd: 0,
+                n_layer: 0,
+                n_params: 0,
+                size_bytes: 0,
+                context_size: 4096,
+            })
+    }
+
+    /// Round-robin handle to worker `idx % len`.
+    pub fn handle(&self, idx: usize) -> PoolGenerator {
+        let w = &self.workers[idx % self.workers.len()];
+        PoolGenerator::new(w.tx.clone(), w.info.clone())
+    }
+}
+
+impl Drop for EnginePool {
+    /// Signal every worker to shut down and join it, so llama.cpp contexts are
+    /// released before the model is dropped.
+    fn drop(&mut self) {
+        for w in &self.workers {
+            let _ = w.tx.send(EngineMsg::Stop);
+        }
+        let workers = std::mem::take(&mut self.workers);
+        for w in workers {
+            let _ = w._handle.join();
+        }
+    }
+}
+
+/// A loaded GGUF model (backend + weights), shared across several contexts.
+/// The expensive part of a load (mmap + tensor deserialization) happens once;
+/// each [`LoadedModel::new_engine_with_threads`] then creates a fresh context
+/// cheaply, so a parallel engine pool can share one model load.
+pub struct LoadedModel {
+    backend: Arc<LlamaBackend>,
+    model: Arc<LlamaModel>,
+    n_ctx: u32,
+}
+
+impl LoadedModel {
+    /// Create a new standalone engine (own context) using a specific thread
+    /// count (used to split compute across pool workers).
+    pub fn new_engine_with_threads(&self, threads: i32) -> Result<StandaloneEngine, String> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_threads(threads)
+            .with_n_threads_batch(threads)
+            .with_n_batch(512);
+
+        let context = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| format!("Failed to create the model context: {e}"))?;
+
+        // SAFETY: `model` and `backend` are pinned in `Arc`s stored in the
+        // same struct (backend declared after context, so freed after it) and
+        // are dropped after `context` (field order), so the erased borrows
+        // never dangle.
+        let context: LlamaContext<'static> = unsafe { std::mem::transmute(context) };
+
+        Ok(StandaloneEngine {
+            context,
+            model: self.model.clone(),
+            _backend: self.backend.clone(),
+        })
+    }
 }
 
 /// AppHandle-free model load used by tests and headless tooling. `on_progress`
 /// receives llama.cpp's load progress (0.0 → 1.0) and may cancel by returning
 /// `false`.
-pub fn load_engine_with_progress<F>(
+pub fn load_model_with_progress<F>(
     path: &Path,
     params: &ModelInitParams,
     mut on_progress: F,
-) -> Result<StandaloneEngine, String>
+) -> Result<LoadedModel, String>
 where
     F: FnMut(f32) -> bool + Send + 'static,
 {
@@ -261,18 +473,12 @@ where
         return Err(format!("Model file does not exist: {}", path.display()));
     }
 
-    let backend = LlamaBackend::init()
-        .map_err(|e| format!("Failed to initialize the llama backend: {e}"))?;
+    let backend = Arc::new(
+        LlamaBackend::init()
+            .map_err(|e| format!("Failed to initialize the llama backend: {e}"))?,
+    );
 
     let n_gpu_layers = params.n_gpu_layers.unwrap_or(0);
-    let n_threads = params
-        .n_threads
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(4)
-        })
-        .clamp(1, 256) as i32;
     let requested_ctx = params.context_size.unwrap_or(4096);
 
     let model_params = LlamaModelParams::default()
@@ -287,25 +493,10 @@ where
     // allocate more than `n_ctx_train`).
     let n_ctx = requested_ctx.clamp(64, model.n_ctx_train().max(64));
 
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_n_threads(n_threads)
-        .with_n_threads_batch(n_threads)
-        .with_n_batch(512);
-
-    let model = Arc::new(model);
-    let context = model
-        .new_context(&backend, ctx_params)
-        .map_err(|e| format!("Failed to create the model context: {e}"))?;
-
-    // SAFETY: `model` is pinned in the `Arc` stored in the same struct and is
-    // dropped after `context` (field order), so the erased borrow never dangles.
-    let context: LlamaContext<'static> = unsafe { std::mem::transmute(context) };
-
-    Ok(StandaloneEngine {
-        context,
-        model,
-        _backend: backend,
+    Ok(LoadedModel {
+        backend,
+        model: Arc::new(model),
+        n_ctx,
     })
 }
 
@@ -444,6 +635,9 @@ pub fn run_generation(
         0.0
     };
 
+    // Local llama.cpp clears the KV cache before every run, so the prompt was
+    // fully written into cache (write = input) and nothing was served from a
+    // previous run's cache (read = 0). No reasoning tokens are reported.
     Ok(GenerationOutcome {
         done: InferenceDone {
             total_tokens,
@@ -451,6 +645,16 @@ pub fn run_generation(
             tokens_per_sec,
             elapsed_ms: elapsed.as_millis() as u64,
             stop_reason: stop_reason.to_string(),
+            outcome: if stop_reason == "cancelled" {
+                "interrupted".to_string()
+            } else {
+                "completed".to_string()
+            },
+            input_tokens: prompt_len as u64,
+            output_tokens: total_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: prompt_len as u64,
+            reasoning_tokens: 0,
         },
         full_text,
     })
@@ -489,6 +693,100 @@ mod tests {
     use super::*;
     use crossbeam_channel::bounded;
 
+    /// Deterministic fake generator so the pool can be tested without a model.
+    struct FakeGen {
+        tag: String,
+    }
+
+    impl TextGenerator for FakeGen {
+        fn info(&self) -> ModelInfo {
+            ModelInfo {
+                name: self.tag.clone(),
+                architecture: "fake".into(),
+                n_vocab: 0,
+                n_ctx_train: 0,
+                n_embd: 0,
+                n_layer: 0,
+                n_params: 0,
+                size_bytes: 0,
+                context_size: 2048,
+            }
+        }
+
+        fn generate(
+            &mut self,
+            request: &InferenceRequest,
+            session_id: u64,
+            _interrupt: &CancellationToken,
+            tx: &Sender<WorkerEvent>,
+        ) -> Result<GenerationOutcome, String> {
+            let _ = tx.send(WorkerEvent::Token {
+                session_id,
+                delta: self.tag.clone(),
+            });
+            Ok(GenerationOutcome {
+                done: InferenceDone {
+                    total_tokens: request.max_tokens as u64,
+                    generated_chars: request.max_tokens as u64,
+                    tokens_per_sec: 0.0,
+                    elapsed_ms: 1,
+                    stop_reason: "done".into(),
+                    outcome: "completed".into(),
+                    input_tokens: 1,
+                    output_tokens: request.max_tokens as u64,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 1,
+                    reasoning_tokens: 0,
+                },
+                full_text: self.tag.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn pool_runs_generations_on_separate_workers_in_parallel() {
+        let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
+        let pool = EnginePool::spawn_with(
+            || {
+                Ok(Box::new(FakeGen { tag: "worker".into() }) as Box<dyn TextGenerator>)
+            },
+            ev_tx.clone(),
+            2,
+        )
+        .expect("spawn pool");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.info().name, "worker");
+
+        let request = InferenceRequest {
+            prompt: "p".into(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop_words: None,
+        };
+        let interrupt = CancellationToken::new();
+
+        let mut g1 = pool.handle(0);
+        let mut g2 = pool.handle(1);
+        let ev1 = ev_tx.clone();
+        let ev2 = ev_tx.clone();
+        let req1 = request.clone();
+        let req2 = request.clone();
+        let i1 = interrupt.clone();
+        let i2 = interrupt.clone();
+
+        let h1 = std::thread::spawn(move || g1.generate(&req1, 1, &i1, &ev1));
+        let h2 = std::thread::spawn(move || g2.generate(&req2, 2, &i2, &ev2));
+
+        let o1 = h1.join().expect("worker 1 thread").expect("generation 1 ok");
+        let o2 = h2.join().expect("worker 2 thread").expect("generation 2 ok");
+        assert_eq!(o1.full_text, "worker");
+        assert_eq!(o2.full_text, "worker");
+        assert_eq!(o1.done.total_tokens, 8);
+        assert_eq!(o2.done.total_tokens, 8);
+    }
+
     /// End-to-end headless chat test: load the real GGUF, run `run_generation`
     /// (the exact path the app's chat uses, including the chunked prompt
     /// decode), and confirm tokens actually stream. Skipped when the model file
@@ -507,9 +805,10 @@ mod tests {
             context_size: Some(2048),
             n_threads: Some(4),
             n_gpu_layers: Some(0),
+            n_workers: None,
         };
-        let mut engine =
-            load_engine_with_progress(&path, &params, |_| true).expect("load engine");
+        let model = load_model_with_progress(&path, &params, |_| true).expect("load model");
+        let mut engine = model.new_engine_with_threads(4).expect("build engine");
 
         let (tx, rx) = bounded::<WorkerEvent>(512);
         let interrupt = CancellationToken::new();
