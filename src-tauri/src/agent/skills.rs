@@ -39,6 +39,10 @@ pub struct Skill {
     pub source: String,
     /// Whether the user has toggled this skill into the active context.
     pub active: bool,
+    /// Absolute backing path — the `.md` file itself, or the `SKILL.md`
+    /// inside a folder-format skill. Used by `uninstall`; not serialized.
+    #[serde(skip)]
+    pub abs_path: PathBuf,
 }
 
 /// Snapshot for the UI: rules text + every available skill.
@@ -110,15 +114,20 @@ impl KnowledgeState {
         let mut rules = String::new();
         let mut rules_sources = Vec::new();
         for f in rules_files {
-            let body = std::fs::read_to_string(&f).map_err(|e| {
-                format!("Failed to read rules file `{}`: {e}", f.display())
-            })?;
+            let body = std::fs::read_to_string(&f)
+                .map_err(|e| format!("Failed to read rules file `{}`: {e}", f.display()))?;
             let rel = f.strip_prefix(workspace).unwrap_or(&f);
             rules_sources.push(rel.to_string_lossy().into_owned());
-            rules.push_str(&format!("### From {}\n{}\n\n", rel.to_string_lossy(), body.trim()));
+            rules.push_str(&format!(
+                "### From {}\n{}\n\n",
+                rel.to_string_lossy(),
+                body.trim()
+            ));
         }
 
-        // Load skills.
+        // Load skills. Two layouts are supported inside each skills dir:
+        //   flat    `{dir}/name.md`
+        //   folder  `{dir}/name/SKILL.md`   (scripts/data may sit alongside)
         let mut skills: HashMap<String, Skill> = HashMap::new();
         for dir in &skills_dirs {
             if !dir.is_dir() {
@@ -129,23 +138,33 @@ impl KnowledgeState {
             for entry in entries {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
-                if path.extension().map(|e| e == "md").unwrap_or(false) {
-                    match parse_skill(&path, &dir) {
-                        Ok(skill) => {
-                            // Preserve the previous active flag across rescans;
-                            // newly discovered skills are auto-active (opt-out).
-                            let active = self
-                                .skills
-                                .lock()
-                                .unwrap()
-                                .get(&skill.name)
-                                .map(|s| s.active)
-                                .unwrap_or(true);
-                            skills.insert(skill.name.clone(), Skill { active, ..skill });
-                        }
-                        Err(e) => {
-                            let _ = e; // skip malformed files silently
-                        }
+                let parsed: Result<Skill, String> = if path.is_dir() {
+                    let skill_md = path.join("SKILL.md");
+                    if skill_md.is_file() {
+                        parse_skill(&skill_md, dir)
+                    } else {
+                        continue; // plain folder, not a skill
+                    }
+                } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                    parse_skill(&path, dir)
+                } else {
+                    continue;
+                };
+                match parsed {
+                    Ok(skill) => {
+                        // Preserve the previous active flag across rescans;
+                        // newly discovered skills are auto-active (opt-out).
+                        let active = self
+                            .skills
+                            .lock()
+                            .unwrap()
+                            .get(&skill.name)
+                            .map(|s| s.active)
+                            .unwrap_or(true);
+                        skills.insert(skill.name.clone(), Skill { active, ..skill });
+                    }
+                    Err(_e) => {
+                        // skip malformed files silently
                     }
                 }
             }
@@ -172,6 +191,95 @@ impl KnowledgeState {
             }
             None => Err(format!("No skill named `{name}`")),
         }
+    }
+
+    /// Install a skill from a source path — a `*.md` file or a folder
+    /// containing `SKILL.md` — into the workspace (`{ws}/.ai/skills`) or the
+    /// user-global (`{config}/skills`) skills directory. Fails if the
+    /// destination already exists. Call `scan` afterwards to pick it up.
+    pub fn install(
+        workspace: &Path,
+        config_dir: &Path,
+        source: &Path,
+        global: bool,
+    ) -> Result<String, String> {
+        let is_md_file = source.is_file() && source.extension().map(|e| e == "md").unwrap_or(false);
+        let skill_md = source.join("SKILL.md");
+        let is_folder = source.is_dir() && skill_md.is_file();
+        if !is_md_file && !is_folder {
+            return Err("Source must be a .md file or a folder containing SKILL.md".to_string());
+        }
+
+        let dest_dir = if global {
+            config_dir.join("skills")
+        } else {
+            workspace.join(".ai").join("skills")
+        };
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|e| format!("Failed to create `{}`: {e}", dest_dir.display()))?;
+
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| "Invalid source path".to_string())?;
+        let dest = dest_dir.join(file_name);
+        if dest.exists() {
+            return Err(format!(
+                "`{}` already exists in the target skills directory",
+                file_name.to_string_lossy()
+            ));
+        }
+
+        if is_folder {
+            copy_dir_recursive(source, &dest)?;
+        } else {
+            std::fs::copy(source, &dest).map_err(|e| format!("Copy failed: {e}"))?;
+        }
+
+        // Validate the installed copy parses (also gives the real name).
+        parse_skill(
+            &if is_folder {
+                dest.join("SKILL.md")
+            } else {
+                dest
+            },
+            &dest_dir,
+        )
+        .map(|s| s.name)
+    }
+
+    /// Delete a skill's backing file/folder from disk. Returns the removed
+    /// path. Call `scan` afterwards so the in-memory map matches.
+    pub fn uninstall(&self, name: &str) -> Result<PathBuf, String> {
+        let path = {
+            let skills = self.skills.lock().unwrap();
+            skills
+                .get(name)
+                .ok_or_else(|| format!("No skill named `{name}`"))?
+                .abs_path
+                .clone()
+        };
+        // Folder-format skills have abs_path = `<dir>/SKILL.md`; removing
+        // just the file would orphan bundled scripts, so drop the whole
+        // folder. Flat skills are plain files removed directly.
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("Failed to stat `{}`: {e}", path.display()))?;
+        let is_skill_md = path
+            .file_name()
+            .map(|f| f.eq_ignore_ascii_case("SKILL.md"))
+            .unwrap_or(false);
+        let target = if meta.is_dir() || is_skill_md {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target).map_err(|e| format!("Remove failed: {e}"))?;
+        } else {
+            std::fs::remove_file(&target).map_err(|e| format!("Remove failed: {e}"))?;
+        }
+        Ok(target)
     }
 
     /// Snapshot for the UI.
@@ -264,7 +372,23 @@ fn parse_skill(path: &Path, dir: &Path) -> Result<Skill, String> {
         content: body,
         source,
         active: true,
+        abs_path: path.to_path_buf(),
     })
+}
+
+/// Recursively copy a directory tree (used to install folder-format skills).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir failed: {e}"))?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(|e| format!("copy failed: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Split `---\nkey: value\n---\nbody` frontmatter. Missing/malformed frontmatter
@@ -311,7 +435,8 @@ mod tests {
 
     #[test]
     fn parses_frontmatter() {
-        let text = "---\nname: rust-checks\ndescription: Typecheck + test\n---\n# Body\ncargo check";
+        let text =
+            "---\nname: rust-checks\ndescription: Typecheck + test\n---\n# Body\ncargo check";
         let (name, desc, body) = split_frontmatter(text);
         assert_eq!(name, "rust-checks");
         assert_eq!(desc, "Typecheck + test");
@@ -332,8 +457,16 @@ mod tests {
         let ws = dir.join("ws");
         let skills = ws.join(".ai").join("skills");
         std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(skills.join("alpha.md"), "---\nname: alpha\ndescription: A\n---\n# Alpha\nbody\n").unwrap();
-        std::fs::write(skills.join("beta.md"), "---\nname: beta\ndescription: B\n---\n# Beta\nbody\n").unwrap();
+        std::fs::write(
+            skills.join("alpha.md"),
+            "---\nname: alpha\ndescription: A\n---\n# Alpha\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skills.join("beta.md"),
+            "---\nname: beta\ndescription: B\n---\n# Beta\nbody\n",
+        )
+        .unwrap();
 
         let ks = KnowledgeState::default();
         let report = ks.scan(&ws, &dir.join("cfg")).unwrap();
@@ -373,6 +506,91 @@ mod tests {
 
         let pinned = ks.active_skills_content();
         assert!(pinned.contains("was truncated to save context"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folder_skills_with_skill_md_are_discovered() {
+        let dir = std::env::temp_dir().join(format!("ai-skill-folder-{}", std::process::id()));
+        let ws = dir.join("ws");
+        let tools = ws.join(".ai").join("skills").join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            tools.join("SKILL.md"),
+            "---\nname: tools\ndescription: Folder skill\n---\n# Tools\nuse run.sh",
+        )
+        .unwrap();
+        std::fs::write(tools.join("run.sh"), "echo hi").unwrap();
+        // A plain folder without SKILL.md must be ignored.
+        std::fs::create_dir_all(ws.join(".ai").join("skills").join("notaskill")).unwrap();
+
+        let ks = KnowledgeState::default();
+        let report = ks.scan(&ws, &dir.join("cfg")).unwrap();
+
+        assert_eq!(report.skills.len(), 1);
+        let s = &report.skills[0];
+        assert_eq!(s.name, "tools");
+        assert_eq!(s.source.replace('\\', "/"), "tools/SKILL.md");
+
+        // Uninstall removes the whole folder (scripts included).
+        let removed = ks.uninstall("tools").unwrap();
+        assert!(removed.ends_with("tools"));
+        assert!(!ws.join(".ai").join("skills").join("tools").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_and_uninstall_roundtrip_global_and_workspace() {
+        let dir = std::env::temp_dir().join(format!("ai-skill-inst-{}", std::process::id()));
+        let ws = dir.join("ws");
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Flat .md file -> workspace scope.
+        let src_md = dir.join("solo.md");
+        std::fs::write(
+            &src_md,
+            "---\nname: solo\ndescription: S\n---\n# Solo\nbody",
+        )
+        .unwrap();
+        let name1 = KnowledgeState::install(&ws, &cfg, &src_md, false).unwrap();
+        assert_eq!(name1, "solo");
+        assert!(ws.join(".ai").join("skills").join("solo.md").is_file());
+
+        // Folder w/ SKILL.md + data file -> global scope.
+        let src_folder = dir.join("packy");
+        std::fs::create_dir_all(src_folder.join("data")).unwrap();
+        std::fs::write(
+            src_folder.join("SKILL.md"),
+            "---\nname: packy\ndescription: P\n---\n# Packy",
+        )
+        .unwrap();
+        std::fs::write(src_folder.join("data").join("x.txt"), "hi").unwrap();
+        let name2 = KnowledgeState::install(&ws, &cfg, &src_folder, true).unwrap();
+        assert_eq!(name2, "packy");
+        assert!(cfg
+            .join("skills")
+            .join("packy")
+            .join("data")
+            .join("x.txt")
+            .is_file());
+
+        // Duplicate install is refused.
+        assert!(KnowledgeState::install(&ws, &cfg, &src_folder, true).is_err());
+
+        // Both are discoverable after a scan; uninstall cleans them up.
+        let ks = KnowledgeState::default();
+        let report = ks.scan(&ws, &cfg).unwrap();
+        let mut names: Vec<String> = report.skills.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["packy".to_string(), "solo".to_string()]);
+
+        ks.uninstall("solo").unwrap();
+        ks.uninstall("packy").unwrap();
+        assert!(!ws.join(".ai").join("skills").join("solo.md").exists());
+        assert!(!cfg.join("skills").join("packy").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -10,8 +10,14 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` powers the BN-11 system tray (Show/Quit menu, built in main.rs).
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+# Auto-update support. The updater itself is only registered at runtime when a
+# signing key is configured (see main.rs); the process plugin powers
+# "restart to install". Permissions are wired in capabilities/default.json.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.38", features = ["full"] }
@@ -21,6 +27,8 @@ encoding_rs = "0.8"
 # Remote (OpenAI-compatible API) backend for the model router.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
+# URL type used by the updater endpoint configuration.
+url = "2"
 # Hugging Face tokenizers - exact BPE/Unigram token counting for the context
 # eviction engine. `default-features = false` keeps the build light; `fancy-regex`
 # is the pure-Rust pre-tokenizer backend (no C++ esaxx / C onig bindings).
@@ -33,6 +41,8 @@ tree-sitter = "0.24"
 tree-sitter-typescript = "0.23"
 similar = { version = "2.5", features = ["inline"] }
 regex = "1.11"
+# OS Trash for `delete_file_or_folder` (Bionic §3.2): deletes are recoverable.
+trash = "5"
 # Pinned exactly: llama-cpp-2 explicitly does not follow semver, so a lockstep
 # pin protects against API drift in the volatile llama.cpp bindings.
 # CPU-only baseline: `common` + `sampler`. GPU backends are opt-in Cargo
@@ -48,6 +58,10 @@ llama-cpp-2 = { version = "=0.1.154", default-features = false, features = ["com
 
 [features]
 default = []
+# Embed the frontend bundle (`../dist`) into the binary. Required for any
+# build that must run without the vite dev server (release, CI boot smoke).
+# `tauri dev` / debug builds intentionally leave it off so devUrl + HMR work.
+custom-protocol = ["tauri/custom-protocol"]
 # Enable llama.cpp's CUDA compute backend (requires an NVIDIA toolkit + NVCC).
 gpu-cuda = ["llama-cpp-2/cuda"]
 # Enable llama.cpp's Apple Metal backend (macOS only).

@@ -84,9 +84,21 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     m.insert(
         "glob_search_codebase",
         json_schema(vec![
-            prop("pattern", "string", "Glob pattern relative to the workspace root, e.g. `**/*.rs` or `src/**/main.*`."),
-            prop_opt("root", "string", "Absolute directory to search (defaults to the workspace root)."),
-            prop_opt("respect_gitignore", "boolean", "Whether to skip paths ignored by git (default true)."),
+            prop(
+                "pattern",
+                "string",
+                "Glob pattern relative to the workspace root, e.g. `**/*.rs` or `src/**/main.*`.",
+            ),
+            prop_opt(
+                "root",
+                "string",
+                "Absolute directory to search (defaults to the workspace root).",
+            ),
+            prop_opt(
+                "respect_gitignore",
+                "boolean",
+                "Whether to skip paths ignored by git (default true).",
+            ),
         ]),
     );
     m.insert(
@@ -101,8 +113,16 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     m.insert(
         "view_file_structure",
         json_schema(vec![
-            prop("path", "string", "Absolute path to the source file to parse."),
-            prop_opt("max_depth", "integer", "Maximum AST depth to scan for declarations (default 4)."),
+            prop(
+                "path",
+                "string",
+                "Absolute path to the source file to parse.",
+            ),
+            prop_opt(
+                "max_depth",
+                "integer",
+                "Maximum AST depth to scan for declarations (default 4).",
+            ),
         ]),
     );
     m.insert(
@@ -110,7 +130,11 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
         json_schema(vec![
             prop("path", "string", "Absolute path to the file."),
             prop("start_line", "integer", "First 1-based line to read."),
-            prop("end_line", "integer", "Last 1-based line to read (clamped to EOF)."),
+            prop(
+                "end_line",
+                "integer",
+                "Last 1-based line to read (clamped to EOF).",
+            ),
         ]),
     );
     m.insert(
@@ -123,48 +147,148 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     m.insert(
         "execute_terminal_command",
         json_schema(vec![
-            prop("command", "string", "Shell command to run. Avoid destructive or interactive commands."),
-            prop_opt("timeout_secs", "integer", "Timeout in seconds (1..300, default 30)."),
-            prop_opt("cwd", "string", "Working directory for the command (defaults to workspace root)."),
+            prop(
+                "command",
+                "string",
+                "Shell command to run. Avoid destructive or interactive commands.",
+            ),
+            prop_opt(
+                "timeout_secs",
+                "integer",
+                "Timeout in seconds (1..300, default 30).",
+            ),
+            prop_opt(
+                "cwd",
+                "string",
+                "Working directory for the command (defaults to workspace root).",
+            ),
         ]),
     );
     m.insert(
         "call_mcp_tool",
         json_schema(vec![
-            prop("server_bin", "string", "Executable path of the MCP server (stdio transport)."),
-            prop_opt("server_args", "array", "Command-line arguments for the MCP server."),
+            prop_opt("server", "string", "Name of a configured MCP server from the catalog (see list_mcp_servers)."),
+            prop_opt("server_bin", "string", "Ad-hoc executable path of an MCP server (stdio transport); use when no catalog entry exists."),
+            prop_opt("server_args", "array", "Command-line arguments for the ad-hoc MCP server executable."),
             prop("tool", "string", "Tool name exposed by the MCP server."),
             prop_opt("arguments", "object", "JSON arguments for the tool call."),
             prop_opt("timeout_secs", "integer", "Timeout in seconds (default 30)."),
         ]),
     );
+    m.insert("list_mcp_servers", json_schema(vec![]));
+    m.insert(
+        "add_mcp_server",
+        json_schema(vec![
+            prop(
+                "name",
+                "string",
+                "Short unique catalog name, e.g. \"playwright\".",
+            ),
+            prop(
+                "bin",
+                "string",
+                "Executable path or PATH command for the stdio MCP server.",
+            ),
+            prop_opt(
+                "args",
+                "array",
+                "Command-line arguments for the executable.",
+            ),
+        ]),
+    );
+    m.insert(
+        "remove_mcp_server",
+        json_schema(vec![prop(
+            "name",
+            "string",
+            "Catalog name of the server to remove.",
+        )]),
+    );
+    m.insert(
+        "attach_file",
+        json_schema(vec![prop(
+            "path",
+            "string",
+            "Absolute path of the text file to chunk + index for semantic search.",
+        )]),
+    );
+    m.insert(
+        "search_attached_files",
+        json_schema(vec![
+            prop(
+                "query",
+                "string",
+                "Natural-language query over the attached files.",
+            ),
+            prop_opt(
+                "top_k",
+                "integer",
+                "How many chunks to return (1..20, default 5).",
+            ),
+        ]),
+    );
+    m.insert(
+        "detach_file",
+        json_schema(vec![prop(
+            "path",
+            "string",
+            "Path of a previously attached file to remove from the index.",
+        )]),
+    );
+    m.insert(
+        "transcribe_audio",
+        json_schema(vec![
+            prop(
+                "path",
+                "string",
+                "Absolute path of an audio/video file (wav, mp3, m4a, webm…).",
+            ),
+            prop_opt(
+                "language",
+                "string",
+                "ISO language hint, e.g. \"en\" or \"de\" (default: auto-detect).",
+            ),
+        ]),
+    );
     m.insert(
         "git_status",
-        json_schema(vec![prop_opt("git_status", "boolean", "Whether to return the porcelain status (default true).")]),
+        json_schema(vec![prop_opt(
+            "git_status",
+            "boolean",
+            "Whether to return the porcelain status (default true).",
+        )]),
     );
     m.insert(
         "git_diff",
-        json_schema(vec![
-            prop_opt("path", "string", "Optional path to scope the diff to a single file (relative to workspace root)."),
-        ]),
+        json_schema(vec![prop_opt(
+            "path",
+            "string",
+            "Optional path to scope the diff to a single file (relative to workspace root).",
+        )]),
     );
     m.insert(
         "git_commit",
-        json_schema(vec![
-            prop("message", "string", "Commit message describing the change."),
-        ]),
+        json_schema(vec![prop(
+            "message",
+            "string",
+            "Commit message describing the change.",
+        )]),
     );
     m.insert(
         "git_checkpoint",
-        json_schema(vec![
-            prop_opt("message", "string", "Optional checkpoint label; auto-generates a message when omitted."),
-        ]),
+        json_schema(vec![prop_opt(
+            "message",
+            "string",
+            "Optional checkpoint label; auto-generates a message when omitted.",
+        )]),
     );
     m.insert(
         "git_revert",
-        json_schema(vec![
-            prop_opt("commit", "string", "The checkpoint commit to revert to (defaults to the most recent checkpoint)."),
-        ]),
+        json_schema(vec![prop_opt(
+            "commit",
+            "string",
+            "The checkpoint commit to revert to (defaults to the most recent checkpoint).",
+        )]),
     );
     m.insert(
         "run_tests",
@@ -175,7 +299,11 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     m.insert(
         "write_file",
         json_schema(vec![
-            prop("path", "string", "Absolute path of the file to write (must be inside the workspace)."),
+            prop(
+                "path",
+                "string",
+                "Absolute path of the file to write (must be inside the workspace).",
+            ),
             prop("content", "string", "Full new file content."),
         ]),
     );
@@ -211,22 +339,157 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
             prop("items", "array", "The ordered list of concrete steps to take. Each item should be a single self-contained directive the agent can execute."),
         ]),
     );
-    m.insert(
-        "read_plan",
-        json_schema(vec![]),
-    );
+    m.insert("read_plan", json_schema(vec![]));
     m.insert(
         "update_plan",
         json_schema(vec![
-            prop("item", "integer", "1-based index of the plan item to update."),
-            prop("status", "string", "New status: `not_started`, `in_progress`, `completed` or `terminal`."),
-            prop_opt("details", "string", "Optional extra detail/result to record for the item (appended)."),
+            prop(
+                "item",
+                "integer",
+                "1-based index of the plan item to update.",
+            ),
+            prop(
+                "status",
+                "string",
+                "New status: `not_started`, `in_progress`, `completed` or `terminal`.",
+            ),
+            prop_opt(
+                "details",
+                "string",
+                "Optional extra detail/result to record for the item (appended).",
+            ),
         ]),
     );
     m.insert(
         "execute_plan",
+        json_schema(vec![prop_opt(
+            "execute_plan",
+            "boolean",
+            "Whether to begin executing the active plan (default true).",
+        )]),
+    );
+    m.insert(
+        "list_dir",
         json_schema(vec![
-            prop_opt("execute_plan", "boolean", "Whether to begin executing the active plan (default true)."),
+            prop_opt("path", "string", "Directory to list (absolute, or relative to the workspace root). Defaults to the workspace root."),
+        ]),
+    );
+    m.insert(
+        "read_file_chars",
+        json_schema(vec![
+            prop("path", "string", "Absolute path to the text file."),
+            prop_opt("offset", "integer", "0-based UTF-8 character offset to start reading from (default 0)."),
+            prop_opt("limit", "integer", "Maximum characters to return (default 4000, max 24000). The result ends with <EOF> or a continuation hint."),
+        ]),
+    );
+    m.insert(
+        "create_folder",
+        json_schema(vec![
+            prop("path", "string", "Folder to create (mkdir -p semantics; absolute or relative to the workspace root). Depth is capped at 50 segments."),
+        ]),
+    );
+    m.insert(
+        "copy_file_or_folder",
+        json_schema(vec![
+            prop(
+                "src",
+                "string",
+                "Source file or folder (copied recursively).",
+            ),
+            prop(
+                "dst",
+                "string",
+                "Destination path; must not exist unless canOverwrite is true.",
+            ),
+            prop_opt(
+                "can_overwrite",
+                "boolean",
+                "Replace an existing destination (default false).",
+            ),
+        ]),
+    );
+    m.insert(
+        "move_file_or_folder",
+        json_schema(vec![
+            prop("src", "string", "Source file or folder to move/rename."),
+            prop(
+                "dst",
+                "string",
+                "Destination path; must not exist unless canOverwrite is true.",
+            ),
+            prop_opt(
+                "can_overwrite",
+                "boolean",
+                "Replace an existing destination (default false).",
+            ),
+        ]),
+    );
+    m.insert(
+        "delete_file_or_folder",
+        json_schema(vec![
+            prop("path", "string", "File or folder to delete. Folders are removed recursively; the item goes to the OS Trash so it stays recoverable."),
+        ]),
+    );
+    m.insert("get_scratchpad_folder", json_schema(vec![]));
+    m.insert(
+        "set_todo_list",
+        json_schema(vec![
+            prop("items", "array", "The full todo list as short imperative strings, in execution order. Replaces any previous list."),
+        ]),
+    );
+    m.insert("get_todo_list", json_schema(vec![]));
+    m.insert(
+        "mark_todo_item_done",
+        json_schema(vec![prop(
+            "item",
+            "integer",
+            "1-based index of the todo item to mark done.",
+        )]),
+    );
+    m.insert(
+        "web_search",
+        json_schema(vec![
+            prop("query", "string", "The web search query."),
+            prop_opt(
+                "max_results",
+                "integer",
+                "How many results to return (default 8, max 10).",
+            ),
+        ]),
+    );
+    m.insert(
+        "web_extract",
+        json_schema(vec![
+            prop("url", "string", "Public http(s) URL of the page to fetch. Private/loopback hosts and embedded credentials are rejected."),
+        ]),
+    );
+    m.insert(
+        "download_file",
+        json_schema(vec![
+            prop("url", "string", "Public http(s) URL of the file to download (max 100 MiB)."),
+            prop("path", "string", "Destination path INSIDE the workspace; must not exist yet (absolute, or relative to the workspace root)."),
+        ]),
+    );
+    m.insert(
+        "run_python",
+        json_schema(vec![
+            prop(
+                "code",
+                "string",
+                "The Python source code to run (a single script).",
+            ),
+            prop_opt(
+                "timeout_secs",
+                "integer",
+                "Execution timeout in seconds (default 30, max 120).",
+            ),
+        ]),
+    );
+    m.insert(
+        "run_javascript",
+        json_schema(vec![
+            prop("code", "string", "The JavaScript/TypeScript source to run (a single module). Deno preferred, Node.js >= 20 fallback."),
+            prop_opt("timeout_secs", "integer", "Execution timeout in seconds (default 30, max 120)."),
         ]),
     );
     m

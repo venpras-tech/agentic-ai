@@ -137,7 +137,11 @@ fn newest_cuda_dir(base: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.join("bin").join(nvcc_name()).is_file())
         .collect();
-    versions.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    versions.sort_by_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
     versions.last().cloned()
 }
 

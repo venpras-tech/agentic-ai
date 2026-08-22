@@ -8,6 +8,33 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Boot-failure reporter installed BEFORE the bundle loads, so even a
+      // module-evaluation crash in main.tsx is surfaced to a headless smoke
+      // run instead of silently timing out. Uses the raw Tauri internals
+      // bridge (@tauri-apps/api is not imported yet at this point).
+      (function () {
+        var report = function (msg) {
+          try {
+            var w = window;
+            if (
+              w.__TAURI_INTERNALS__ &&
+              typeof w.__TAURI_INTERNALS__.invoke === "function"
+            ) {
+              w.__TAURI_INTERNALS__.invoke("smoke_fail", { message: msg });
+            }
+          } catch (_) {}
+        };
+        window.addEventListener("error", function (e) {
+          report(
+            "early error: " + e.message + " @ " + e.filename + ":" + e.lineno + ":" + e.colno,
+          );
+        });
+        window.addEventListener("unhandledrejection", function (e) {
+          report("early rejection: " + String(e.reason));
+        });
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

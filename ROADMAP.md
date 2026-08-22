@@ -1,9 +1,12 @@
 # Roadmap — From "local chat + editor" to "super agentic coding agent"
 
-_Last updated: 2026-08-20 (P0 trust & turn quality shipped + P1-6 persistent plan
-tools shipped: turn lifecycle outcomes, token accounting breakdown, remote
-stall/retry, tool-verdict audit log, permission decision memory,
-create_plan/read_plan/update_plan/execute_plan).
+_Last updated: 2026-08-22 (boot-smoke root cause fixed — `custom-protocol`
+feature; smoke + live-GGUF verified end-to-end. Earlier: Bionic backlog
+BN-2…BN-8 verified
+complete — todos, web tools, sandboxed code execution, Coder/YOLO hardening,
+skills v2, MCP catalog manager w/ env + allowed-tools filtering, model hub +
+local OpenAI-compatible API server. BN-9/BN-10 partial: neural embedder and
+Voice Keyboard overlay remain).
 Strategic plan derived from a full codebase audit (`src/` +
 `src-tauri/src/`). Companion to `PROJECT_STATUS.md` (session status / source of
 truth for what has shipped)._
@@ -177,7 +180,11 @@ concurrent generations.
     subtask chips + grouped step timeline and `/plan → Approve` phases.
     **P1-6 shipped**: persistent `create_plan`/`execute_plan` with per-item
     focused loops, `read_plan`, `update_plan`, `.ai/plan.json` + `.ai/plan.md`
-    persistence, plan-step events in the timeline. Remaining P1: goals & todos,
+    persistence, plan-step events in the timeline. **P1-7 shipped**:
+    `set_todo_list` / `get_todo_list` / `mark_todo_item_done` persisted to
+    `.ai/todos.json`, live `TodoCard` via `agent://todo-update`, and the
+    orchestrator refuses to end a session while items remain open (bounded
+    nudges). Bionic BN-2…BN-8 also shipped (see PROJECT_STATUS). Remaining P1:
     first-class subagents, `ask_question`/`send_to_user`, git blame/push/pull/
     branches/PR/CI, file delete/read_lints, `ast-grep`-style tree-sitter
     queries, token-budget-aware tool fan-out caps, KV-cache reuse across steps,

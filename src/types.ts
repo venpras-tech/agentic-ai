@@ -170,6 +170,25 @@ export interface FileNode {
   isDir: boolean;
 }
 
+/** One chat under a project (projects/chats sidebar tree). */
+export interface SessionChatInfo {
+  /** Empty string for the default (legacy) chat. */
+  id: string;
+  title: string;
+  updatedAtMs: number;
+  turns: number;
+}
+
+/** One project with all of its chats, newest activity first. */
+export interface SessionProjectInfo {
+  /** Filesystem-safe key; stable across launches. */
+  key: string;
+  /** Original workspace path when known; use this for API calls. */
+  name: string;
+  lastActiveMs: number;
+  chats: SessionChatInfo[];
+}
+
 export interface ContextUsage {
   totalTokens: number;
   limit: number;
@@ -185,6 +204,8 @@ export interface PermissionRequest {
   tool: string;
   summary: string;
   timestampMs: number;
+  /** Independent LLM shell-approval review (Bionic §3.3), when available. */
+  review?: string;
 }
 
 export interface Skill {
@@ -201,6 +222,58 @@ export interface KnowledgeReport {
   skills: Skill[];
 }
 
+export interface McpServerConfig {
+  name: string;
+  bin: string;
+  args: string[];
+  /** Extra environment variables for the spawned server process. */
+  env?: Record<string, string>;
+  /** Non-empty: only these tool names are callable (`*` suffix = prefix wildcard). */
+  allowedTools?: string[];
+  enabled: boolean;
+}
+
+export interface HfFile {
+  name: string;
+  size: number | null;
+}
+
+export interface HfModel {
+  repoId: string;
+  author: string | null;
+  likes: number;
+  downloads: number;
+  files: HfFile[];
+}
+
+export interface DownloadedModel {
+  repoId: string;
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+}
+
+export interface ApiServerStatus {
+  running: boolean;
+  port: number | null;
+}
+
+export interface HubDownloadProgress {
+  repoId: string;
+  file: string;
+  receivedBytes?: number;
+  totalBytes?: number | null;
+  done?: boolean;
+  cancelled?: boolean;
+  error?: string;
+}
+
+export interface AttachedFileInfo {
+  path: string;
+  bytes: number;
+  chunkCount: number;
+}
+
 export interface PolicyRule {
   tool: string;
   policy: string;
@@ -210,6 +283,10 @@ export interface PolicyRule {
 export interface PolicySnapshot {
   default: string;
   rules: PolicyRule[];
+  /** YOLO sub-mode: ROUTINE shell commands skip approval (session-only). */
+  yolo?: boolean;
+  /** Per-session path grants for paths outside the workspace. */
+  pathGrants?: { path: string; mode: "read" | "write" }[];
 }
 
 export interface CheckpointInfo {
@@ -244,4 +321,17 @@ export interface PlanStepEvent {
   title: string;
   status: "in_progress" | "completed" | "terminal" | "failed";
   error?: string;
+}
+
+/** One todo entry (Bionic §3.2 PLANNING). */
+export interface TodoItem {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+/** Live todo-list snapshot (agent://todo-update). */
+export interface TodoUpdateEvent {
+  items: TodoItem[];
+  updatedAt: number;
 }

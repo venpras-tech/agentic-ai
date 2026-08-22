@@ -1,10 +1,250 @@
 # Project Status — AI Editor
 
-_Last updated: 2026-08-20 (P0 backlog shipped + P1-6 persistent plan tools shipped:
-turn lifecycle & outcomes, token accounting, remote stall/retry, audit log,
-permission decision memory, create_plan/read_plan/update_plan/execute_plan).
-This file is the source of truth for the session's progress. Read it at session
-start; update it whenever milestones change. Strategic plan: see `ROADMAP.md`._
+_Last updated: 2026-08-22 (**boot-smoke root cause fixed**: `custom-protocol`
+feature; smoke + live-GGUF verified end-to-end). This file is the source of
+truth for the session's progress. Read it at session start; update it whenever
+milestones change. Strategic plan: see `ROADMAP.md`._
+
+---
+
+## ✅ SHIPPED — boot-smoke `custom-protocol` fix, all builds & smokes green
+
+### What changed this pass (2026-08-22, evening)
+
+**1. Boot-smoke root cause FIXED (was failing since BN-2…BN-8 landed)**
+- Symptom: release exe timed out (`AI_EDITOR_SMOKE_TIMEOUT`) — CDP probe showed
+  the webview sitting on `chrome-error://chromewebdata` → `ERR_CONNECTION_REFUSED`
+  against `http://localhost:1420`.
+- Root cause: `[features]` never declared `custom-protocol`. Without it, tauri
+  emits `cfg(dev)` even for `--release`, so binaries serve `devUrl` instead of
+  embedding `../dist`. Plain `cargo build --release` (CI's recipe) could never
+  pass.
+- Fix: `Cargo.toml` gains `custom-protocol = ["tauri/custom-protocol"]`
+  (NOT default — debug/dev keeps HMR); `ci.yml` boot-smoke now builds with
+  `cargo build --release --features custom-protocol`.
+- Diagnostics added permanently: `smoke_fail` command + early error reporter in
+  `index.html` and `main.tsx` — webview-side boot failures now print
+  `AI_EDITOR_SMOKE_FAIL: …` on stderr instead of silently timing out.
+- **Verified**: `AI_EDITOR_SMOKE_OK`, exit 0 · live-GGUF headless chat ✅.
+
+### Changed files (this pass)
+- `src-tauri/Cargo.toml` — `custom-protocol` feature
+- `.github/workflows/ci.yml` — boot-smoke builds with the feature
+- `src-tauri/src/main.rs` — `smoke_fail` command (registered)
+- `index.html` / `src/main.tsx` — boot-failure reporters
+- `src-lekshan/components/PermissionSheet.tsx` (new),
+  `src-lekshan/components/Transcript.tsx` (TodoCard, OutcomeBadge, DoneMeta),
+  `src-lekshan/App.tsx` (permission/todo wiring)
+- Docs: `PROJECT_STATUS.md` / `ROADMAP.md`
+
+### Verification (this pass)
+- `npx tsc --noEmit` exit 0 · `npm run build` green
+- `cargo fmt --check` clean · `clippy --all-targets -D warnings` exit 0 ·
+  `cargo test` 64/64 (+1 live-GGUF) 
+- Boot smoke `AI_EDITOR_SMOKE_OK` exit 0 · `cargo test -- --ignored` ✅
+
+### Next step
+P1-8 first-class subagents (`task` tool + restricted child perms +
+`subagent_await`) — design survey already done (Option A: synchronous `task`
+reusing pool handles with occupancy leasing + depth guard); or BN-9/BN-10
+remainders (neural embedder, Voice Keyboard overlay).
+
+---
+
+## ✅ SHIPPED — Bionic backlog sweep: todos, web tools, sandboxed code, hardening, skills v2, MCP manager, model hub + API server (+ MCP env/allow-list finish), builds green
+
+### What changed this pass (2026-08-22)
+
+The tree contained a large untracked implementation pass (BN-2 through BN-8,
+plus parts of BN-9/BN-10) left **uncompiled** mid-refactor: `McpServerConfig`
+had grown `env` + `allowed_tools` fields whose callers were not updated.
+This pass finished that refactor and verified everything:
+
+**1. Compile fixes + allowed-tools enforcement (BN-7 finish)**
+- `mcp.rs`: new `McpServerConfig::tool_allowed` / `matches_allow_list` — empty
+  list allows everything, entries with a trailing `*` act as prefix wildcards;
+  3 new unit tests (wildcard matching, JSON roundtrip of env/allowedTools).
+- `tools.rs` `call_mcp_tool`: catalog lookup now carries the entry's `env`
+  (passed to `McpHandle::spawn`) and enforces the allow-list before dispatch
+  with a typed error naming the server + its filter. Ad-hoc `serverBin` calls
+  stay unfiltered. Connection-cache keying unchanged (`bin args`).
+- `tools.rs` `list_mcp_servers`: entries now surface `[allowed tools: …]`.
+- `add_mcp_server`: initializes the new fields (empty) — the *model* cannot
+  grant itself broad access; filters are user-managed.
+- Frontend: `McpServerConfig` type gains optional `env` / `allowedTools`;
+  SettingsModal shows an ⚑ badge with the filter count + tooltip.
+
+**2. Verified already-implemented (this pass's audit)**
+
+| Item | Evidence |
+|---|---|
+| BN-2 todos | `todo.rs`, 3 tools + schemas + default-allow, `.ai/todos.json`, orchestrator refuses to finish while items open (bounded nudges), live `TodoCard` via `agent://todo-update` |
+| BN-3 web | `web_search` (DDG HTML parse, no API key), `web_extract` (text/* only, private hosts refused), `download_file` (≤100 MiB, NEW file only, approval EVERY call via `policy::always_ask`) |
+| BN-4 sandboxed code | `run_python` (`-I`, scratchpad cwd, interpreter discovery), `run_javascript` (Deno lockdown flags, Node ≥20 fallback), typed error when absent |
+| BN-5 hardening | YOLO sub-mode (`agent_set_yolo`; ROUTINE-only auto-approve, red-zone never), LLM shell-review second opinion rendered on approval buttons, `agent_grant_path` / `agent_revoke_path` per-session `{path, mode}` grants |
+| BN-6 skills v2 | SKILL.md folder format (scripts/data alongside), global scope install, `skill_install` / `skill_uninstall` / `skill_set_active`, @-mention autocomplete in composer |
+| BN-7 MCP manager | Persisted catalog (`mcp-servers.json`), `list/add/remove_mcp_server`, `agent_reset_mcp` reconnect, duplicate-name protection, env + allowed-tools filtering (this pass) |
+| BN-8 hub + server | `hf_search` / `hf_download_model` (resume, cancel, progress events), Models tab UI; local OpenAI-compatible REST server (`v1/models`, `v1/chat/completions`, `v1/completions`, loopback-only) with start/stop/status + tab UI |
+
+**Still open (deliberately scoped):**
+- BN-9 remainder: neural (nomic-embed-class GGUF) embedder — attachments RAG
+  currently ships dependency-free hashed n-gram embeddings.
+- BN-10 remainder: Voice Keyboard overlay window — composer push-to-talk
+  dictation (`voice_transcribe_data` + whisper) and the `transcribe_audio`
+  tool are done.
+- Vision companion (deferred from BN-11).
+
+### Changed files (this pass)
+- `src-tauri/src/agent/mcp.rs` — `tool_allowed` / `matches_allow_list` + 3 tests
+- `src-tauri/src/agent/tools.rs` — catalog env carry-through, allow-list
+  enforcement, listing surfaces filter, `add_mcp_server` init, BTreeMap import
+- `src/types.ts` — `McpServerConfig.env?` / `allowedTools?`
+- `src/components/SettingsModal.tsx` — allow-list badge on MCP rows
+- Docs: `PROJECT_STATUS.md` / `ROADMAP.md`
+
+### Next step
+P1-8 (first-class subagents) or close out BN-9/BN-10 remainders (neural
+embedder, Voice Keyboard overlay).
+
+---
+
+## ✅ SHIPPED — BN-11 UI polish + BN-12 packaging, builds green
+
+- `cargo fmt` clean · `cargo clippy --all-targets -- -D warnings` exit 0
+  (~30 pre-existing warnings fixed) · `cargo test` **62/62** (1 ignored
+  live-GGUF) · `npm run build` green · **boot smoke verified locally**:
+  `AI_EDITOR_SMOKE_OK`, exit 0.
+
+### What changed this pass (2026-08-21/22)
+
+**1. Multi-chat sessions (backend, main.rs)**
+- Helpers `session_key` / `chat_key` / `session_file`; named chats persist to
+  `sessions/<key>/<chat>.jsonl`, default chat keeps the legacy flat
+  `<key>.jsonl`; `sessions/projects.json` maps keys → original paths.
+- Commands: `session_append` / `session_load` (+ optional `chat_id`),
+  `session_projects` (`SessionProjectInfo { key, name, lastActiveMs, chats[] }`
+  incl. per-chat title/turns/updatedAtMs), `session_delete_chat`.
+- Unit tests for key sanitization + file layout (62 total).
+
+**2. Tray icon** — `build_tray()` (Show AI Editor / Quit, left-click shows),
+tauri feature `tray-icon`.
+
+**3. Headless boot smoke (BN-12)** — env `AI_EDITOR_SMOKE=1`: frontend probes
+`smoke_active` then invokes `smoke_boot_ok` (prints `AI_EDITOR_SMOKE_OK`,
+exit 0). Rust watchdog thread fails after 120s via `std::process::exit(1)`
+(`AppHandle::exit(1)` proved unreliable — code was swallowed by teardown).
+**Verified**: debug build requires the vite dev server (debug binaries serve
+`devUrl`, not the embedded bundle); release builds embed `dist` and need
+nothing else — that's what CI uses.
+
+**4. CI (`.github/workflows/ci.yml`)**
+- rust matrix job now runs `npm ci && npm run build` first — `generate_context!`
+  embeds `../dist` at compile time, so fresh checkouts previously could not
+  compile clippy/tests at all.
+- New **boot-smoke** job (windows-latest): npm build → `cargo build --release`
+  → launch with `AI_EDITOR_SMOKE=1` → require exit 0 + `AI_EDITOR_SMOKE_OK`
+  (180s outer timeout > 120s watchdog).
+
+**5. Clippy hygiene** — ~30 warnings fixed across engine/orchestrator/tools/
+rag/plan/api-server (dead code, needless borrows, field renames with serde
+rename_all preserving wire format).
+
+### Changed files (this pass)
+- Backend: `src-tauri/src/main.rs` (session commands, tray, smoke),
+  `Cargo.toml` (tray-icon)
+- Frontend: `src/App.tsx`, `src/main.tsx`, `src/types.ts`, `src/lib/ipc.ts`,
+  `src/components/{ProjectsPanel,FileExplorer}.tsx`, `MenuBar.tsx`
+- CI: `.github/workflows/ci.yml`
+- Docs: `PROJECT_STATUS.md` / `ROADMAP.md`
+
+### Next step
+✅ BN-2 shipped 2026-08-22 (see top section). Remaining follow-ups: vision
+companion (deferred from BN-11).
+
+---
+
+## BIONIC GAP ANALYSIS — vs `D:\software\Bionic\Bionic_Agent_Recreation_Prompt.txt`
+
+Reviewed 2026-08-21. The prompt specifies "Nova", a privacy-first local agentic
+AI workstation (Electron/Node in the spec). We map every requirement onto our
+existing Tauri 2 / Rust / React stack — architecture is equivalent (Rust main
+process hosts the agent engine; engine-pool worker threads replace utility
+worker processes; JSONL journals replace SQLite). Per the prompt's own guidance,
+implementation order is: §1–3 core agent → §4 skills → §5 RAG → §8 models/server
+→ §6–7 MCP/voice → §9–10 polish. **§3.2 tool catalog + §3.3 permission model are
+the heart — do not omit.**
+
+### What we already satisfy (evidence)
+
+| Bionic § | Requirement | Our implementation |
+|---|---|---|
+| §1 | Local-first inference, no telemetry | llama.cpp GGUF via `llama-cpp-2` (CPU; CUDA/Metal feature flags), optional OpenAI-compatible remote |
+| §2.2 | Model formats, stop sequences, per-model configs | GGUF ✓, stop words ✓, gen params persisted ✓ |
+| §2.3 | Session journal, streaming everything | JSONL session log + replay ✓; tokens/steps/tools/diffs streamed ✓ |
+| §3.1 | ReAct loop, parallel calls, budgets, retries | orchestrator: generate→parse→dispatch→feedback, `join_all`, step budget, self-heal retry, stuck detection ✓ |
+| §3.1 | Modes | Chat/Agent toggle + Plan mode ✓ (Coder+YOLO missing) |
+| §3.2 FS | read_file_lines / find_files / search_content / edit_file | `read_file_range` / `glob_search_codebase` / `search_file_contents` / `apply_file_diff` (exact-match, error codes) ✓ |
+| §3.2 Shell | shell_command w/ approval + destructive detector | `execute_terminal_command` + red-zone deny + permission modal ✓ |
+| §3.2 Planning | todo list tools | partial — plan tools (`create_plan/read_plan/update_plan/execute_plan`) cover most |
+| §3.2 Meta | skill create/read | `create_skill` / `read_skill` ✓ |
+| §3.3 | Default deny outside workspace, approval UI, decision memory, audit | policy.json allow/ask/deny + red-zone + PermissionModal (once/session/always) + `.ai/audit.jsonl` ✓ |
+| §4 | Skills w/ frontmatter + toggles | `.ai/skills/*.md` frontmatter skills + KnowledgePanel toggles ✓ (folder format/global scope missing) |
+| §6 | MCP stdio client | `call_mcp_tool` (stdio JSON-RPC) ✓ |
+| §9 | Transcript cards, token meter, checkpoints | tool cards, diff cards, step timeline, ctx gauge, CheckpointMenu ✓ |
+
+### Gaps → BN backlog (prioritized per the prompt's build order)
+
+**BN-1 — §3.2 filesystem completion (IN PROGRESS this pass)**: `list_dir`,
+`read_file_chars`, `create_folder` (depth cap 50), `copy_file_or_folder`,
+`move_file_or_folder` (`can_overwrite=false` default), `delete_file_or_folder`
+(OS Trash), `get_scratchpad_folder` (per-session scratchpad OUTSIDE the
+workspace; scratchpad paths exempt from workspace scoping).
+
+**BN-2 — §3.2 planning todos**: `set_todo_list` / `get_todo_list` /
+`mark_todo_item_done` rendered live in UI (= roadmap P1-7 goals & todos;
+session cannot finish while items remain).
+
+**BN-3 — §3.2 web tools**: `web_search`, `web_extract`, `download_file`
+(public HTTP(S) only, ≤100 MiB, NEW file inside workspace, reject credentials +
+private/loopback targets, approval EVERY call).
+
+**BN-4 — §3.2 sandboxed code execution**: `run_python` / `run_javascript`.
+Decision (documented in lieu of Pyodide/Deno bundling): discover interpreters
+on PATH at call time; Deno runs with the spec's exact lockdown flag set
+(`--allow-read=. --allow-write=. --no-prompt --deny-net --deny-env --deny-sys
+--deny-run --deny-ffi`); Python runs isolated (`-I`) with cwd-scoped temp dir +
+timeout; clear typed error when neither is installed.
+
+**BN-5 — §3.3 hardening**: Coder mode + YOLO sub-mode (skip ROUTINE shell
+approvals, never red-zone); independent LLM shell-approval reviewer pass;
+per-session path grants `{path, mode}`.
+
+**BN-6 — §4 skills upgrade**: SKILL.md folder format (scripts/data alongside),
+global scope (`~/.ai/skills`), install/uninstall/enable/disable flows,
+@-mention popup in composer.
+
+**BN-7 — §6 MCP manager**: persisted server catalog (named servers, args),
+restart/reconnect, allowed-tools filtering, duplicate-label protection.
+
+**BN-8 — §8 model hub + API server**: HuggingFace download (URL/search,
+resume), local OpenAI-compatible REST server over the loaded model
+(v1/models, v1/chat/completions, v1/embeddings), headless serve mode.
+
+**BN-9 — §5 RAG**: attachments pipeline, chunk/embed/cite (nomic-embed-class
+GGUF), per-project vector index (upgrade from TF-IDF).
+
+**BN-10 — §7 voice**: composer push-to-talk dictation (local Whisper ASR),
+Voice Keyboard overlay typing into the focused app, `transcribe_file`.
+
+**BN-11 — §9 UI polish**: projects/chats sidebar tree, vision companion
+(text-only model + image consult), settings pages (MCP manager, server config,
+voice wizard), tray icon.
+
+**BN-12 — §10 packaging**: tauri-updater config, E2E smoke tests, CI.
+
+Excluded as stack-specific Electron details (we keep Tauri): multi-window
+webpack entries, Node worker processes, Squirrel updater, backend-extension
+DLL manifests, MLX backend (macOS-only; our Metal feature covers it).
 
 ---
 
@@ -93,7 +333,7 @@ shipped 2026-08-20. See the **TODO / implementation log** table below.
 | P0-4 | Tool-verdict audit log `.ai/audit.jsonl` + UI | ✅ done |
 | P0-5 | Permission decision memory (allow_once / always_allow / ask_first) | ✅ done |
 | P1-6 | `create_plan` / `execute_plan` (markdown plan file + per-item steps) | ✅ done |
-| P1-7 | Goals & todos tools | pending |
+| P1-7 | Goals & todos tools (`set/get_todo_list`, `mark_todo_item_done`, live UI, finish-block) | ✅ done (2026-08-22) |
 | P1-8 | First-class subagents (`task` + restricted child perms + `subagent_await`) | pending |
 | P1-9 | `ask_question` / `send_to_user` | pending |
 | P1-10 | Git: blame / push / pull / branches / PR / CI | pending |
@@ -104,6 +344,82 @@ shipped 2026-08-20. See the **TODO / implementation log** table below.
 | P3-15 | Context compaction (summarize @ 80%) | pending |
 | P3-16 | Context usage tree + blob store | pending |
 | P3-17 | Smart-mode classifier tier + NL allow/block rules | pending |
+| BN-1 | Bionic §3.2 filesystem completion (7 tools: list_dir, read_file_chars, create_folder, copy/move/delete_file_or_folder, get_scratchpad_folder) | ✅ done (2026-08-21) |
+| BN-2 | Bionic §3.2 todo-list tools (= P1-7) | ✅ done (2026-08-22) |
+| BN-3 | Bionic §3.2 web tools (search/extract/download w/ SSRF guards) | ✅ done (2026-08-22) |
+| BN-4 | Bionic §3.2 sandboxed run_python/run_javascript | ✅ done (2026-08-22) |
+| BN-5 | Bionic §3.3 Coder+YOLO mode, LLM approval reviewer, per-session path grants | ✅ done (2026-08-22) |
+| BN-6 | Bionic §4 SKILL.md folders + global scope + @-mentions | ✅ done (2026-08-22) |
+| BN-7 | Bionic §6 MCP server catalog/manager (+ env, allowed-tools filter) | ✅ done (2026-08-22) |
+| BN-8 | Bionic §8 HF model hub + local OpenAI-compatible API server | ✅ done (2026-08-22) |
+| BN-9 | Bionic §5 RAG attachments/embeddings/citations | ◐ partial — hashed n-gram embedder shipped; neural GGUF embedder pending |
+| BN-10 | Bionic §7 voice (dictation + Voice Keyboard) | ◐ partial — transcribe tool + composer dictation shipped; Voice Keyboard overlay pending |
+| BN-11 | Bionic §9 UI polish (sidebar tree, settings pages, tray) — vision companion deferred | ✅ done (2026-08-22) |
+| BN-12 | Bionic §10 updater + E2E boot smoke + CI | ✅ done (2026-08-22) |
+
+---
+
+## ✅ SHIPPED — BN-1 Bionic filesystem tool completion (7 new tools), builds green
+
+- `cargo check` clean (only pre-existing warnings), `cargo test` **33/33**
+  (1 ignored live-GGUF; was 24 — 9 new tests), `npm run build` green.
+
+### What changed this pass (2026-08-21, BN-1)
+
+**1. Seven new tools (Bionic §3.2 FILESYSTEM completion)**
+- `list_dir(path?)` — dirs first then files, alphabetical, `/` markers +
+  byte sizes, 2000-entry cap. Default-allow (read-only).
+- `read_file_chars(path, offset?, limit?)` — UTF-8 **character-offset** reads
+  for huge files / very long lines; default 4000, hard cap 24000 chars;
+  result ends with `<EOF>` or an explicit continuation hint with the next
+  offset. Default-allow.
+- `create_folder(path)` — mkdir -p semantics, 50-segment depth cap
+  (`folder_depth_ok`). Ask-policy.
+- `copy_file_or_folder(src, dst, canOverwrite=false)` — recursive copy;
+  refuses existing destination unless `canOverwrite` (then pre-clears it).
+- `move_file_or_folder(...)` — same overwrite rule; same-volume rename fast
+  path, cross-device fallback = copy + hard-delete source.
+- `delete_file_or_folder(path)` — recursive delete to the **OS Trash** via the
+  new `trash = "5"` crate; canonicalized guards refuse the workspace root and
+  the `.ai` state folder.
+- `get_scratchpad_folder()` — per-session scratchpad at
+  `%TEMP%/ai-editor-scratchpad/session-<id>`, deliberately OUTSIDE the
+  workspace; paths under the scratchpad root are **exempt from workspace
+  scoping** in `policy::check` so temp files need no extra approvals.
+
+**2. Policy & safety (Bionic §3.3 alignment)**
+- `policy.rs`: `call_target_path` → `call_target_paths` (Vec) so copy/move
+  scope **both endpoints**; relative paths now resolve against the workspace
+  before scoping; scratchpad exemption; `default_allow` gains the three
+  read-only tools.
+- **Fixed a latent Windows bug**: `is_within` now strips the `\\?\`
+  extended-length prefix after `canonicalize`, so brand-new files/folders
+  (which don't canonicalize) no longer compare inconsistently against the
+  existing workspace root — previously a new top-level file could be judged
+  "outside the workspace".
+
+**3. Model-facing docs**
+- `prompt.ts`: tools 17–23 documented with JSON examples + usage guidance
+  (explore with list_dir first; use the scratchpad for intermediates).
+
+### Changed files (this pass)
+- `src-tauri/Cargo.toml` — +`trash = "5"`
+- `src-tauri/src/agent/mod.rs` — 7 ToolCall variants + names + summaries,
+  `scratchpad_root()` / `session_scratchpad()`
+- `src-tauri/src/agent/tools.rs` — implementations + dispatch arms + helpers
+  (`abs_from`, `char_slice`, `folder_depth_ok`, `copy_recursive`,
+  `clear_destination`) + 6 unit tests
+- `src-tauri/src/agent/core.rs` — JSON schemas for the 7 tools
+- `src-tauri/src/agent/policy.rs` — multi-path scoping, scratchpad exemption,
+  `is_within` Windows-prefix fix, default_allow, 3 unit tests
+- `src/lib/prompt.ts` — tools 17–23 in the system prompt
+- `PROJECT_STATUS.md` — this log
+
+### Next step
+Smoke test `npm run tauri:dev`: ask the agent to "create a folder `tmp-demo`,
+write a file into it, move it, then list the directory" → verify tool cards,
+permission prompts on mutating ops only, and Trash recovery. Then **BN-2**
+(todo-list tools = P1-7), which also completes Bionic §3.2 PLANNING.
 
 ---
 
@@ -731,7 +1047,7 @@ Next step: `npm run tauri dev` to relaunch, then smoke-test streaming again
 ## What this project is
 
 `D:\ai` — **AI Editor**: an ultra-fast, low-memory, fully **local/offline** AI
-code editor with 21 agentic tools.
+code editor with 28 agentic tools.
 
 - Frontend: React 19 + Vite 6 + Tailwind v4 + Monaco editor
 - Desktop shell: Tauri 2 (Rust) — frameless window, host-side fs + model I/O
@@ -828,58 +1144,59 @@ code editor with 21 agentic tools.
 - **P1-6 shipped**: persistent `create_plan`/`execute_plan` with per-item focused
   loops, `read_plan`, `update_plan`, `.ai/plan.json` + `.ai/plan.md` persistence,
   `agent://plan-step` events, system prompt updated.
-- **Next P1 items** (highest ROI first):
-  - **P1-7: Goals & todos** — `create_goal`/`update_goal`/`read_todos`/`update_todos`
-    for tracking progress across sessions; derives from the plan state.
-  - **P1-8: First-class subagents** — `task` tool with `subagent_type`
-    (`EXPLORE|BASH|DEBUG|CUSTOM`), per-child restricted `permission_mode`,
-    `subagent_await` for async spawn/await (currently: parallel decompose only).
-  - **P1-9: `ask_question` / `send_to_user`** — async human interaction mid-task;
-    the agent pauses and waits for the user to answer a clarifying question.
-  - **P1-10: Git toolchain** — `blame`, `push`, `pull`, `create_branch`,
-    `create_pr`, `pr_status`, `ci_status` (§7 Git/CI/PR).
-  - **P1-11: File tool gaps** — `delete`; `read_lints`/`diagnostics` (tree-sitter
-    backed, §7 Files).
-- **Smoke test**: `npm run tauri:dev` with a model that exercises the plan tools
-  end-to-end.
+- **BN-1 shipped (2026-08-21)**: Bionic §3.2 filesystem completion — 7 new tools
+  (`list_dir`, `read_file_chars`, `create_folder`, `copy_file_or_folder`,
+  `move_file_or_folder`, `delete_file_or_folder` → OS Trash,
+  `get_scratchpad_folder`) + scratchpad scoping exemption + Windows
+  `\\?\` path-normalization fix in `policy::is_within`. Tool count: **28**.
+  This also closes the old P1-11 `delete` gap.
+- **Next (highest ROI first)**:
+  - **BN-2 = P1-7: Goals & todos** — Bionic §3.2 `set_todo_list` /
+    `get_todo_list` / `mark_todo_item_done` rendered live in UI; session should
+    not finish while items remain.
+  - **P1-8 / BN-5**: first-class subagents (`task` + restricted child perms +
+    `subagent_await`); Coder+YOLO mode + LLM shell-approval reviewer.
+  - **P1-9**: `ask_question` / `send_to_user`.
+  - **P1-10**: git blame/push/pull/branches/PR/CI.
+  - **BN-3/BN-4**: web tools (search/extract/download w/ SSRF guards);
+    sandboxed `run_python`/`run_javascript`.
+- **Smoke test**: `npm run tauri:dev` — exercise the BN-1 tools end-to-end
+  ("create a folder, write a file into it, move it, list the directory") and
+  verify mutating ops prompt while read-only ops don't.
 
 ## Pending / next steps (ordered)
 
 ### Immediate — smoke test
-1. `npm run tauri:dev` (compiles the dev binary + links ~1-3 min, then opens the
-   window). Command: `npm run tauri:dev` from `D:\ai`.
-2. Smoke-test the full flow: load model → chat → agent task → verify plan tools
-   work end-to-end (model calls `create_plan` → `update_plan` → `execute_plan`).
+1. `npm run tauri:dev` from `D:\ai`; load model → chat → agent task.
+2. Verify BN-1 filesystem tools live (tool cards, permission prompts on
+   mutating ops only, Trash recovery after delete).
 3. `npm run tauri build` later for a production bundle (release build is slow;
    uses opt-level 3 + lto).
 
-### P1 — agent capabilities (next implementation target)
-4. **P1-7: Goals & todos** — `create_goal`/`update_goal`/`read_todos`/`update_todos`
-   for tracking progress across sessions; derives from the plan state.
-5. **P1-8: First-class subagents** — `task` tool with `subagent_type`
-   (`EXPLORE|BASH|DEBUG|CUSTOM`), per-child restricted `permission_mode`,
-   `subagent_await` for async spawn/await.
-6. **P1-9: `ask_question` / `send_to_user`** — async human interaction mid-task;
-   the agent pauses and waits for the user to answer a clarifying question.
-7. **P1-10: Git toolchain** — `blame`, `push`, `pull`, `create_branch`,
-   `create_pr`, `pr_status`, `ci_status`.
-8. **P1-11: File tool gaps** — `delete`; `read_lints`/`diagnostics` (tree-sitter
-   backed).
+### Bionic backlog (see "BIONIC GAP ANALYSIS" at top) + legacy P-items
+4. **BN-2 / P1-7** — todo-list tools (Bionic §3.2 PLANNING).
+5. **BN-3** — web_search / web_extract / download_file (public HTTP(S) only,
+   ≤100 MiB, new file in workspace, approval every call).
+6. **BN-4** — sandboxed run_python / run_javascript.
+7. **BN-5 / P1-8** — subagents + Coder/YOLO + LLM approval reviewer +
+   per-session path grants.
+8. **P1-9 / P1-10** — ask_question/send_to_user; git blame/push/pull/PR/CI.
+   (P1-11 file-delete done via BN-1; remaining: read_lints/diagnostics.)
+9. **BN-6…BN-12** — SKILL.md folders + global scope, MCP manager, HF model hub
+   + local OpenAI-compatible API server, RAG, voice, UI polish, updater/E2E/CI.
 
-### P2 — concurrency & UX
-9. **P2-12: Background work & multitasking** — `spawn_background_shell` /
-   `background_subagent` that survive turn end, pill/badge UI, `abort_background_work`.
-10. **P2-13: Session management UI** — `list_sessions`, `fork_session`, watch
+### Legacy P2/P3 (unchanged)
+10. **P2-12: Background work & multitasking** — `spawn_background_shell` /
+    `background_subagent` that survive turn end, pill/badge UI, `abort_background_work`.
+11. **P2-13: Session management UI** — `list_sessions`, `fork_session`, watch
     lifecycle, statuses `AWAITING_INPUT|ERROR|ABORTED`.
-11. **P2-14: Modes** — `ASK` (every tool prompts), `DEBUG`, `CUSTOM` (per-mode
+12. **P2-14: Modes** — `ASK` (every tool prompts), `DEBUG`, `CUSTOM` (per-mode
     system prompt + tool allowlist), `switch_mode`.
-
-### P3 — scale & polish
-12. **P3-15: Context compaction** — at ~80% context summarize older messages into
+13. **P3-15: Context compaction** — at ~80% context summarize older messages into
     a `ConversationSummaryArchive` instead of hard-evicting.
-13. **P3-16: Context usage tree + blob store** — per-component token contribution
+14. **P3-16: Context usage tree + blob store** — per-component token contribution
     + blob store for large context.
-14. **P3-17: Smart-mode classifier** — lightweight local risk classifier +
+15. **P3-17: Smart-mode classifier** — lightweight local risk classifier +
     natural-language `allow_instructions`/`block_instructions`.
 
 ## API notes (verified against llama-cpp-2 0.1.154 docs.rs)
@@ -927,7 +1244,7 @@ D:\ai
       └─ agent/
          ├─ mod.rs           (ToolCall enum, ToolState, PlanStepEvent, PermissionDecision)
          ├─ orchestrator.rs  (generate → parse → dispatch → feedback loop, plan/subtask/decompose)
-         ├─ tools.rs         (21 tool implementations + dispatch + audit)
+         ├─ tools.rs         (28 tool implementations + dispatch + audit)
          ├─ core.rs          (JSON schemas, <execute_tool> parser)
          ├─ policy.rs        (allow/ask/deny, red-zone, workspace scoping, decision memory)
          ├─ context.rs       (token tracking, 80% sliding-window eviction)

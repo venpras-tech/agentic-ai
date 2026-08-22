@@ -200,9 +200,15 @@ pub enum WorkerEvent {
     /// A completed orchestrator step (agentic tasks only).
     Step { session_id: u64, step: StepStat },
     /// A sub-task in a decomposed task changed state (agentic tasks only).
-    Subtask { session_id: u64, subtask: SubtaskStat },
+    Subtask {
+        session_id: u64,
+        subtask: SubtaskStat,
+    },
     /// Terminal success: generation statistics.
-    Done { session_id: u64, done: InferenceDone },
+    Done {
+        session_id: u64,
+        done: InferenceDone,
+    },
     /// Terminal failure: a typed string error.
     Error { session_id: u64, message: String },
 }
@@ -474,8 +480,7 @@ where
     }
 
     let backend = Arc::new(
-        LlamaBackend::init()
-            .map_err(|e| format!("Failed to initialize the llama backend: {e}"))?,
+        LlamaBackend::init().map_err(|e| format!("Failed to initialize the llama backend: {e}"))?,
     );
 
     let n_gpu_layers = params.n_gpu_layers.unwrap_or(0);
@@ -614,8 +619,11 @@ pub fn run_generation(
             break "stop-word";
         }
 
-        tx.send(WorkerEvent::Token { session_id, delta: piece })
-            .map_err(|e| format!("Token stream channel closed: {e}"))?;
+        tx.send(WorkerEvent::Token {
+            session_id,
+            delta: piece,
+        })
+        .map_err(|e| format!("Token stream channel closed: {e}"))?;
 
         batch.clear();
         batch
@@ -748,7 +756,9 @@ mod tests {
         let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
         let pool = EnginePool::spawn_with(
             || {
-                Ok(Box::new(FakeGen { tag: "worker".into() }) as Box<dyn TextGenerator>)
+                Ok(Box::new(FakeGen {
+                    tag: "worker".into(),
+                }) as Box<dyn TextGenerator>)
             },
             ev_tx.clone(),
             2,
@@ -779,8 +789,14 @@ mod tests {
         let h1 = std::thread::spawn(move || g1.generate(&req1, 1, &i1, &ev1));
         let h2 = std::thread::spawn(move || g2.generate(&req2, 2, &i2, &ev2));
 
-        let o1 = h1.join().expect("worker 1 thread").expect("generation 1 ok");
-        let o2 = h2.join().expect("worker 2 thread").expect("generation 2 ok");
+        let o1 = h1
+            .join()
+            .expect("worker 1 thread")
+            .expect("generation 1 ok");
+        let o2 = h2
+            .join()
+            .expect("worker 2 thread")
+            .expect("generation 2 ok");
         assert_eq!(o1.full_text, "worker");
         assert_eq!(o2.full_text, "worker");
         assert_eq!(o1.done.total_tokens, 8);
@@ -832,8 +848,12 @@ mod tests {
             }
         }
 
-        eprintln!("prompt_tokens={} total_tokens={} stop_reason={}",
-            request.prompt.split_whitespace().count(), outcome.done.total_tokens, outcome.done.stop_reason);
+        eprintln!(
+            "prompt_tokens={} total_tokens={} stop_reason={}",
+            request.prompt.split_whitespace().count(),
+            outcome.done.total_tokens,
+            outcome.done.stop_reason
+        );
         eprintln!("token_events={token_events}");
         eprintln!("FULL_TEXT:\n{}", outcome.full_text);
         eprintln!("STREAMED OUTPUT:\n{streamed}");
@@ -873,7 +893,10 @@ mod tests {
         };
         let big = run_generation(&mut engine, &big_request, 1, &interrupt, &tx)
             .expect("long-prompt generation must not fail");
-        eprintln!("long prompt OK ({} tokens, {})", big.done.total_tokens, big.done.stop_reason);
+        eprintln!(
+            "long prompt OK ({} tokens, {})",
+            big.done.total_tokens, big.done.stop_reason
+        );
         assert!(!big.full_text.trim().is_empty());
     }
 }

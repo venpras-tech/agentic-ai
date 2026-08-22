@@ -24,7 +24,9 @@ pub mod mcp;
 pub mod orchestrator;
 pub mod plan;
 pub mod policy;
+pub mod rag;
 pub mod skills;
+pub mod todo;
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
@@ -69,10 +71,7 @@ pub enum ToolCall {
         end_line: u64,
     },
     #[serde(rename_all = "camelCase")]
-    ApplyFileDiff {
-        path: String,
-        diff: String,
-    },
+    ApplyFileDiff { path: String, diff: String },
     #[serde(rename_all = "camelCase")]
     ExecuteTerminalCommand {
         command: String,
@@ -83,7 +82,12 @@ pub enum ToolCall {
     },
     #[serde(rename_all = "camelCase")]
     CallMcpTool {
-        server_bin: String,
+        /// Catalog name of a configured server (preferred).
+        #[serde(default)]
+        server: Option<String>,
+        /// Ad-hoc executable path (legacy/ad-hoc calls without a catalog entry).
+        #[serde(default)]
+        server_bin: Option<String>,
         #[serde(default)]
         server_args: Vec<String>,
         tool: String,
@@ -93,15 +97,38 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
+    ListMcpServers {},
+    #[serde(rename_all = "camelCase")]
+    AddMcpServer {
+        name: String,
+        bin: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    RemoveMcpServer { name: String },
+    #[serde(rename_all = "camelCase")]
+    AttachFile { path: String },
+    #[serde(rename_all = "camelCase")]
+    SearchAttachedFiles {
+        query: String,
+        #[serde(default)]
+        top_k: Option<usize>,
+    },
+    #[serde(rename_all = "camelCase")]
+    DetachFile { path: String },
+    #[serde(rename_all = "camelCase")]
+    TranscribeAudio {
+        path: String,
+        #[serde(default)]
+        language: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
     GitStatus {},
     #[serde(rename_all = "camelCase")]
-    GitDiff {
-        path: Option<String>,
-    },
+    GitDiff { path: Option<String> },
     #[serde(rename_all = "camelCase")]
-    GitCommit {
-        message: String,
-    },
+    GitCommit { message: String },
     #[serde(rename_all = "camelCase")]
     GitCheckpoint {
         #[serde(default)]
@@ -118,10 +145,7 @@ pub enum ToolCall {
         command: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
-    WriteFile {
-        path: String,
-        content: String,
-    },
+    WriteFile { path: String, content: String },
     #[serde(rename_all = "camelCase")]
     CreateSkill {
         name: String,
@@ -130,9 +154,7 @@ pub enum ToolCall {
         content: String,
     },
     #[serde(rename_all = "camelCase")]
-    ReadSkill {
-        name: String,
-    },
+    ReadSkill { name: String },
     #[serde(rename_all = "camelCase")]
     SemanticSearchCodebase {
         query: String,
@@ -164,6 +186,70 @@ pub enum ToolCall {
     },
     #[serde(rename_all = "camelCase")]
     ExecutePlan {},
+    #[serde(rename_all = "camelCase")]
+    ListDir {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ReadFileChars {
+        path: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CreateFolder { path: String },
+    #[serde(rename_all = "camelCase")]
+    CopyFileOrFolder {
+        src: String,
+        dst: String,
+        #[serde(default)]
+        can_overwrite: Option<bool>,
+    },
+    #[serde(rename_all = "camelCase")]
+    MoveFileOrFolder {
+        src: String,
+        dst: String,
+        #[serde(default)]
+        can_overwrite: Option<bool>,
+    },
+    #[serde(rename_all = "camelCase")]
+    DeleteFileOrFolder { path: String },
+    #[serde(rename_all = "camelCase")]
+    GetScratchpadFolder {},
+    #[serde(rename_all = "camelCase")]
+    SetTodoList { items: Vec<String> },
+    #[serde(rename_all = "camelCase")]
+    GetTodoList {},
+    #[serde(rename_all = "camelCase")]
+    MarkTodoItemDone {
+        /// 1-based todo index.
+        item: usize,
+    },
+    #[serde(rename_all = "camelCase")]
+    WebSearch {
+        query: String,
+        #[serde(default)]
+        max_results: Option<usize>,
+    },
+    #[serde(rename_all = "camelCase")]
+    WebExtract { url: String },
+    #[serde(rename_all = "camelCase")]
+    DownloadFile { url: String, path: String },
+    #[serde(rename_all = "camelCase")]
+    RunPython {
+        code: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    RunJavascript {
+        code: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 impl ToolCall {
@@ -190,6 +276,28 @@ impl ToolCall {
             ToolCall::ReadPlan { .. } => "read_plan",
             ToolCall::UpdatePlan { .. } => "update_plan",
             ToolCall::ExecutePlan { .. } => "execute_plan",
+            ToolCall::ListDir { .. } => "list_dir",
+            ToolCall::ReadFileChars { .. } => "read_file_chars",
+            ToolCall::CreateFolder { .. } => "create_folder",
+            ToolCall::CopyFileOrFolder { .. } => "copy_file_or_folder",
+            ToolCall::MoveFileOrFolder { .. } => "move_file_or_folder",
+            ToolCall::DeleteFileOrFolder { .. } => "delete_file_or_folder",
+            ToolCall::GetScratchpadFolder { .. } => "get_scratchpad_folder",
+            ToolCall::SetTodoList { .. } => "set_todo_list",
+            ToolCall::GetTodoList { .. } => "get_todo_list",
+            ToolCall::MarkTodoItemDone { .. } => "mark_todo_item_done",
+            ToolCall::WebSearch { .. } => "web_search",
+            ToolCall::WebExtract { .. } => "web_extract",
+            ToolCall::DownloadFile { .. } => "download_file",
+            ToolCall::RunPython { .. } => "run_python",
+            ToolCall::RunJavascript { .. } => "run_javascript",
+            ToolCall::ListMcpServers { .. } => "list_mcp_servers",
+            ToolCall::AddMcpServer { .. } => "add_mcp_server",
+            ToolCall::RemoveMcpServer { .. } => "remove_mcp_server",
+            ToolCall::AttachFile { .. } => "attach_file",
+            ToolCall::SearchAttachedFiles { .. } => "search_attached_files",
+            ToolCall::DetachFile { .. } => "detach_file",
+            ToolCall::TranscribeAudio { .. } => "transcribe_audio",
         }
     }
 
@@ -199,7 +307,9 @@ impl ToolCall {
             ToolCall::GlobSearchCodebase { pattern, .. } => {
                 format!("Scanning workspace for `{pattern}`…")
             }
-            ToolCall::SearchFileContents { pattern, include, .. } => match include {
+            ToolCall::SearchFileContents {
+                pattern, include, ..
+            } => match include {
                 Some(inc) if !inc.is_empty() => {
                     format!("Searching `{inc}` for `{pattern}`…")
                 }
@@ -208,8 +318,15 @@ impl ToolCall {
             ToolCall::ViewFileStructure { path, .. } => {
                 format!("Parsing AST of `{}`…", display_name(path))
             }
-            ToolCall::ReadFileRange { path, start_line, end_line } => {
-                format!("Reading `{}` lines {start_line}..={end_line}…", display_name(path))
+            ToolCall::ReadFileRange {
+                path,
+                start_line,
+                end_line,
+            } => {
+                format!(
+                    "Reading `{}` lines {start_line}..={end_line}…",
+                    display_name(path)
+                )
             }
             ToolCall::ApplyFileDiff { path, .. } => {
                 format!("Applying edit to `{}`…", display_name(path))
@@ -219,7 +336,9 @@ impl ToolCall {
             }
             ToolCall::CallMcpTool { tool, .. } => format!("Calling MCP tool `{tool}`…"),
             ToolCall::GitStatus { .. } => "Reading git status…".into(),
-            ToolCall::GitDiff { path: Some(path), .. } => {
+            ToolCall::GitDiff {
+                path: Some(path), ..
+            } => {
                 format!("Showing git diff for `{}`…", display_name(path))
             }
             ToolCall::GitDiff { path: None, .. } => "Showing git diff…".into(),
@@ -243,6 +362,67 @@ impl ToolCall {
                 format!("Updating plan item #{item} → {status}…")
             }
             ToolCall::ExecutePlan { .. } => "Executing the approved plan…".into(),
+            ToolCall::ListDir { path } => match path {
+                Some(p) => format!("Listing `{}`…", display_name(p)),
+                None => "Listing the workspace root…".into(),
+            },
+            ToolCall::ReadFileChars { path, offset, .. } => {
+                format!(
+                    "Reading `{}` from char {}…",
+                    display_name(path),
+                    offset.unwrap_or(0)
+                )
+            }
+            ToolCall::CreateFolder { path } => format!("Creating folder `{path}`…"),
+            ToolCall::CopyFileOrFolder { src, dst, .. } => {
+                format!("Copying `{}` → `{}`…", display_name(src), display_name(dst))
+            }
+            ToolCall::MoveFileOrFolder { src, dst, .. } => {
+                format!("Moving `{}` → `{}`…", display_name(src), display_name(dst))
+            }
+            ToolCall::DeleteFileOrFolder { path } => {
+                format!("Deleting `{}` (moves to the OS Trash)…", display_name(path))
+            }
+            ToolCall::GetScratchpadFolder { .. } => {
+                "Resolving the per-session scratchpad folder…".into()
+            }
+            ToolCall::SetTodoList { items } => {
+                format!("Setting the todo list ({} item(s))…", items.len())
+            }
+            ToolCall::GetTodoList { .. } => "Reading the todo list…".into(),
+            ToolCall::MarkTodoItemDone { item } => {
+                format!("Marking todo #{item} done…")
+            }
+            ToolCall::WebSearch { query, .. } => {
+                format!("Searching the web for `{query}`…")
+            }
+            ToolCall::WebExtract { url } => {
+                format!("Fetching `{url}`…")
+            }
+            ToolCall::DownloadFile { url, path } => {
+                format!("Downloading `{url}` → `{}`…", display_name(path))
+            }
+            ToolCall::RunPython { .. } => "Running sandboxed Python…".into(),
+            ToolCall::RunJavascript { .. } => "Running sandboxed JavaScript…".into(),
+            ToolCall::ListMcpServers { .. } => "Listing MCP servers…".into(),
+            ToolCall::AddMcpServer { name, .. } => {
+                format!("Adding MCP server `{name}`…")
+            }
+            ToolCall::RemoveMcpServer { name } => {
+                format!("Removing MCP server `{name}`…")
+            }
+            ToolCall::AttachFile { path } => {
+                format!("Indexing `{}`…", display_name(path))
+            }
+            ToolCall::SearchAttachedFiles { query, .. } => {
+                format!("Searching attachments for \"{query}\"…")
+            }
+            ToolCall::DetachFile { path } => {
+                format!("Detaching `{}`…", display_name(path))
+            }
+            ToolCall::TranscribeAudio { path, .. } => {
+                format!("Transcribing `{}`…", display_name(path))
+            }
         }
     }
 }
@@ -268,7 +448,12 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    pub fn ok(tool: &str, summary: String, stdout: Option<String>, stats: Option<serde_json::Value>) -> Self {
+    pub fn ok(
+        tool: &str,
+        summary: String,
+        stdout: Option<String>,
+        stats: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             success: true,
             tool: tool.to_string(),
@@ -316,6 +501,10 @@ pub struct PermissionRequestEvent {
     pub tool: String,
     pub summary: String,
     pub timestamp_ms: u64,
+    /// Independent LLM review of a shell command (Bionic §3.3 hardening):
+    /// a one-line second opinion rendered alongside the approval buttons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
 }
 
 /// Event telling the frontend a file was changed by the agent (for editor sync
@@ -347,6 +536,15 @@ pub struct PlanStepEvent {
     pub error: Option<String>,
 }
 
+/// Live todo-list snapshot emitted on `agent://todo-update` after every
+/// todo-tool mutation (Bionic §3.2 PLANNING).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoUpdateEvent {
+    pub items: Vec<todo::TodoItem>,
+    pub updated_at: u64,
+}
+
 /// How a human answered a policy-`ask` permission request. Carried over the
 /// permission response channel and serialized to the UI as the button choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,10 +561,26 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// Per-session grant for a path OUTSIDE the workspace (Bionic §3.3
+/// `{path, mode}`). Never persisted — grants die with the app session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathGrant {
+    pub path: PathBuf,
+    /// "read" — read-only tools may touch this path;
+    /// "write" — mutating file tools may touch it too.
+    pub mode: String,
+}
+
 /// Long-lived agent state managed by Tauri.
 pub struct ToolState {
     /// Current workspace root, shared with the workspace picker.
     pub workspace: Mutex<Option<PathBuf>>,
+    /// YOLO sub-mode (Bionic §3.3): auto-approve ROUTINE shell commands
+    /// (never red-zone). Toggled from the UI; session-only.
+    pub yolo: std::sync::atomic::AtomicBool,
+    /// Per-session path grants for paths outside the workspace.
+    pub path_grants: std::sync::Mutex<Vec<PathGrant>>,
     /// Cached MCP server connections, keyed by `bin + args`.
     pub mcp_servers: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<mcp::McpHandle>>>>,
     /// Monotonic event id counter.
@@ -383,6 +597,8 @@ pub struct ToolState {
     /// Skills & rules snapshot, shared with the `KnowledgeState` managed state
     /// so the `read_skill` tool can load any skill's full text on demand.
     pub knowledge: std::sync::Arc<skills::KnowledgeState>,
+    /// RAG attachment index (chunked + embedded attached files).
+    pub rag: std::sync::Mutex<rag::AttachmentIndex>,
     /// Active persisted plan for the workspace (`.ai/plan.json`), if any.
     pub plan: std::sync::Mutex<Option<plan::PlanState>>,
     /// Guards against nested `execute_plan` re-entry (a plan executing itself).
@@ -402,12 +618,15 @@ impl Default for ToolState {
     fn default() -> Self {
         Self {
             workspace: Mutex::new(None),
+            yolo: std::sync::atomic::AtomicBool::new(false),
+            path_grants: std::sync::Mutex::new(Vec::new()),
             mcp_servers: Mutex::new(HashMap::new()),
             id: AtomicU64::new(1),
             permission_requests: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
             session_allow: std::sync::Mutex::new(HashSet::new()),
             knowledge: std::sync::Arc::new(skills::KnowledgeState::default()),
+            rag: std::sync::Mutex::new(rag::AttachmentIndex::default()),
             plan: std::sync::Mutex::new(None),
             plan_executing: std::sync::Mutex::new(false),
             engine: tokio::sync::Mutex::new(None),
@@ -438,4 +657,18 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Root of all per-session scratchpad folders, deliberately OUTSIDE any
+/// workspace (Bionic §3.2 `get_scratchpad_folder`). File tools may read/write
+/// here without a workspace grant; everything else outside the workspace stays
+/// default-deny (see `policy::check`).
+pub fn scratchpad_root() -> PathBuf {
+    std::env::temp_dir().join("ai-editor-scratchpad")
+}
+
+/// Absolute scratchpad folder for one agent session (`session-<id>`), created
+/// on demand.
+pub fn session_scratchpad(session_id: u64) -> PathBuf {
+    scratchpad_root().join(format!("session-{session_id}"))
 }

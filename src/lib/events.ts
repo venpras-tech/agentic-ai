@@ -9,6 +9,7 @@ import type {
   PlanStepEvent,
   StepEvent,
   SubtaskEvent,
+  TodoUpdateEvent,
   ToolOutputEvent,
 } from "../types";
 
@@ -40,6 +41,7 @@ export interface ToolOutputHandlerEvent extends ToolOutputEvent {}
 export interface StepHandlerEvent extends StepEvent {}
 export interface SubtaskHandlerEvent extends SubtaskEvent {}
 export interface PlanStepHandlerEvent extends PlanStepEvent {}
+export interface TodoUpdateHandlerEvent extends TodoUpdateEvent {}
 
 export interface EngineHandlers {
   onToken: (e: TokenEvent) => void;
@@ -58,6 +60,7 @@ export interface EngineHandlers {
   onSubtask?: (e: SubtaskHandlerEvent) => void;
   onPlanStep?: (e: PlanStepHandlerEvent) => void;
   onSkillsChanged?: (e: { name: string; path: string }) => void;
+  onTodoUpdate?: (e: TodoUpdateHandlerEvent) => void;
 }
 
 export function parseEvent<T>(raw: unknown): T {

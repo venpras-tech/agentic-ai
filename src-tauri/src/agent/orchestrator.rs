@@ -29,8 +29,7 @@ use super::context::ContextMessage;
 use super::plan::{self, PlanState, PlanStatus};
 use super::{core::parse_tool_calls, tools, PlanStepEvent, ToolCall, ToolResult, ToolState};
 use crate::engine::{
-    EnginePool, InferenceDone, InferenceRequest, StepStat, SubtaskStat, TextGenerator,
-    WorkerEvent,
+    EnginePool, InferenceDone, InferenceRequest, StepStat, SubtaskStat, TextGenerator, WorkerEvent,
 };
 
 /// Default ceiling on tool-call feedback rounds per task.
@@ -45,6 +44,9 @@ const TOOL_FEEDBACK_LIMIT: usize = 2000;
 const MAX_CONSECUTIVE_FAILED_STEPS: usize = 3;
 /// How many self-healing critique injections are allowed per task.
 const MAX_SELF_HEAL_INJECTIONS: usize = 3;
+/// How many times the loop may bounce the model back for leaving todo items
+/// open (Bionic §3.2: a session cannot finish while items remain).
+const MAX_TODO_NUDGES: usize = 2;
 
 /// Frontend → orchestrator task request (camelCase over the wire).
 #[derive(Debug, Clone, Deserialize)]
@@ -141,7 +143,7 @@ pub fn parse_subtask_plan(text: &str) -> Vec<Subtask> {
         }
         let stripped = raw
             .trim_start_matches(|c: char| c.is_ascii_digit())
-            .trim_start_matches(|c: char| c == '.' || c == ')' || c == '-')
+            .trim_start_matches(['.', ')', '-'])
             .trim();
         if stripped.is_empty() {
             continue;
@@ -184,7 +186,7 @@ pub struct AgentOutcome {
 /// Aggregate stats for a completed (sub)task phase. `total_tokens` is the sum of
 /// generated (output) tokens across the phase's generations; the input/cache
 /// fields mirror `InferenceDone` so the whole task can report honest accounting.
-struct FocusOutcome {
+pub(crate) struct FocusOutcome {
     total_tokens: u64,
     input_tokens: u64,
     cache_read_tokens: u64,
@@ -212,6 +214,7 @@ struct SubResult {
 /// decomposed task with more than one subtask *and* more than one worker runs
 /// its subtasks concurrently — one per worker — which is the "parallel agent
 /// threads" feature. There is no `'static` transmute anywhere on this path.
+#[allow(clippy::too_many_arguments)] // loop config reads clearer as flat args
 pub fn run_agent_loop_pool(
     pool: &EnginePool,
     tool_state: &ToolState,
@@ -272,9 +275,7 @@ pub fn run_agent_loop_pool(
                     reasoning_tokens: 0,
                 },
             });
-            return finish_outcome(
-                started, 0, 0, 0, 0, 0, reply.len() as u64, "done".into(),
-            );
+            return finish_outcome(started, 0, 0, 0, 0, 0, reply.len() as u64, "done".into());
         }
     }
 
@@ -293,8 +294,19 @@ pub fn run_agent_loop_pool(
              approved before execution."
             .to_string();
         let outcome = run_focused_steps(
-            &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages,
-            request, Some(&plan_instruction), working_budget, 1, "Plan",
+            &mut primary,
+            tool_state,
+            app,
+            interrupt,
+            tx,
+            session_id,
+            &rt,
+            &mut messages,
+            request,
+            Some(&plan_instruction),
+            working_budget,
+            1,
+            "Plan",
         )?;
         total_tokens += outcome.total_tokens;
         input_tokens += outcome.input_tokens;
@@ -318,7 +330,13 @@ pub fn run_agent_loop_pool(
     // otherwise sequential (identical semantics to the single-gen loop).
     if request.decompose {
         if let Some(subtasks) = plan_subtasks(
-            &mut primary, interrupt, tx, session_id, &mut messages, request, working_budget,
+            &mut primary,
+            interrupt,
+            tx,
+            session_id,
+            &mut messages,
+            request,
+            working_budget,
         )? {
             if !subtasks.is_empty() {
                 let workers = pool.len();
@@ -330,7 +348,8 @@ pub fn run_agent_loop_pool(
                         let mut handles = Vec::with_capacity(subtasks.len());
                         for (i, sub) in subtasks.iter().enumerate() {
                             let mut gen = pool.handle(i);
-                            let group = format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title);
+                            let group =
+                                format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title);
                             let instruction = sub.instruction.clone();
                             let title = sub.title.clone();
                             let total = subtasks.len();
@@ -350,9 +369,19 @@ pub fn run_agent_loop_pool(
                                 });
                                 let mut sub_messages = messages_ref.to_vec();
                                 let r = run_focused_steps(
-                                    &mut gen, tool_state, app, interrupt, tx, session_id,
-                                    &sub_rt, &mut sub_messages, request, Some(&instruction),
-                                    working_budget, max_steps, &group,
+                                    &mut gen,
+                                    tool_state,
+                                    app,
+                                    interrupt,
+                                    tx,
+                                    session_id,
+                                    &sub_rt,
+                                    &mut sub_messages,
+                                    request,
+                                    Some(&instruction),
+                                    working_budget,
+                                    max_steps,
+                                    &group,
                                 );
                                 let (success, out, inp, cache_r, cache_w, reas, chars) = match r {
                                     Ok(o) if o.reason != "stuck" => (
@@ -399,7 +428,9 @@ pub fn run_agent_loop_pool(
                         }
                         let mut results = Vec::with_capacity(handles.len());
                         for h in handles {
-                            let r: SubResult = h.join().map_err(|_| "Subtask thread panicked".to_string())??;
+                            let r: SubResult = h
+                                .join()
+                                .map_err(|_| "Subtask thread panicked".to_string())??;
                             results.push(r);
                         }
                         Ok(results)
@@ -427,7 +458,12 @@ pub fn run_agent_loop_pool(
                         });
                     }
                     let summary = run_summary(
-                        &mut primary, interrupt, tx, session_id, &mut messages, request,
+                        &mut primary,
+                        interrupt,
+                        tx,
+                        session_id,
+                        &mut messages,
+                        request,
                         working_budget,
                     )?;
                     total_tokens += summary.total_tokens;
@@ -466,8 +502,18 @@ pub fn run_agent_loop_pool(
                         },
                     });
                     match run_focused_steps(
-                        &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages,
-                        request, Some(&sub.instruction), working_budget, max_steps,
+                        &mut primary,
+                        tool_state,
+                        app,
+                        interrupt,
+                        tx,
+                        session_id,
+                        &rt,
+                        &mut messages,
+                        request,
+                        Some(&sub.instruction),
+                        working_budget,
+                        max_steps,
                         &format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title),
                     ) {
                         Ok(outcome) => {
@@ -503,14 +549,23 @@ pub fn run_agent_loop_pool(
                             });
                             messages.push(ContextMessage {
                                 role: "system".into(),
-                                content: format!("Subtask {}/{} failed: {e}", i + 1, subtasks.len()),
+                                content: format!(
+                                    "Subtask {}/{} failed: {e}",
+                                    i + 1,
+                                    subtasks.len()
+                                ),
                                 pinned: false,
                             });
                         }
                     }
                 }
                 let summary = run_summary(
-                    &mut primary, interrupt, tx, session_id, &mut messages, request,
+                    &mut primary,
+                    interrupt,
+                    tx,
+                    session_id,
+                    &mut messages,
+                    request,
                     working_budget,
                 )?;
                 total_tokens += summary.total_tokens;
@@ -541,8 +596,19 @@ pub fn run_agent_loop_pool(
 
     // ---- Flat (default) mode: one continuous generate → act → feedback loop.
     let outcome = run_focused_steps(
-        &mut primary, tool_state, app, interrupt, tx, session_id, &rt, &mut messages, request,
-        None, working_budget, max_steps, "Execute",
+        &mut primary,
+        tool_state,
+        app,
+        interrupt,
+        tx,
+        session_id,
+        &rt,
+        &mut messages,
+        request,
+        None,
+        working_budget,
+        max_steps,
+        "Execute",
     )?;
     total_tokens += outcome.total_tokens;
     input_tokens += outcome.input_tokens;
@@ -562,6 +628,7 @@ pub fn run_agent_loop_pool(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_outcome(
     started: Instant,
     total_tokens: u64,
@@ -630,6 +697,7 @@ pub(crate) fn run_focused_steps(
     let mut final_reason = "done".to_string();
     let mut consecutive_failed_steps = 0usize;
     let mut self_heal_injections = 0usize;
+    let mut todo_nudges = 0usize;
 
     'steps: for step in 0..max_steps {
         if interrupt.is_cancelled() {
@@ -721,6 +789,28 @@ pub(crate) fn run_focused_steps(
         });
 
         if calls.is_empty() {
+            // ---- Bionic §3.2 PLANNING: the session cannot finish while todo
+            // items remain open. Bounce the model back with the open list a
+            // bounded number of times before letting it stop.
+            if todo_nudges < MAX_TODO_NUDGES {
+                let open = rt.block_on(async {
+                    super::tools::open_todo_count(tool_state).await.unwrap_or(0)
+                });
+                if open > 0 {
+                    todo_nudges += 1;
+                    messages.push(ContextMessage {
+                        role: "system".into(),
+                        content: format!(
+                            "TODO LIST INCOMPLETE: {open} item(s) are still open. Continue \
+                             working on them now, or call mark_todo_item_done for items you \
+                             actually completed / set_todo_list to revise the list. Do not \
+                             stop while items remain."
+                        ),
+                        pinned: false,
+                    });
+                    continue;
+                }
+            }
             break;
         }
 
@@ -730,10 +820,21 @@ pub(crate) fn run_focused_steps(
         // safely call `rt.block_on` themselves. The `ExecutePlan` call is then
         // dropped from the batch (the plan loop already performed the work).
         let mut plan_summary: Option<String> = None;
-        if calls.iter().any(|c| matches!(c, ToolCall::ExecutePlan { .. })) {
+        if calls
+            .iter()
+            .any(|c| matches!(c, ToolCall::ExecutePlan { .. }))
+        {
             match execute_plan(
-                app, tool_state, &mut *gen, interrupt, tx, session_id, rt, request,
-                working_budget, max_steps,
+                app,
+                tool_state,
+                &mut *gen,
+                interrupt,
+                tx,
+                session_id,
+                rt,
+                request,
+                working_budget,
+                max_steps,
             ) {
                 Ok(pr) => {
                     total_tokens += pr.outcome.total_tokens;
@@ -794,9 +895,8 @@ pub(crate) fn run_focused_steps(
                 final_reason = "cancelled".to_string();
                 break 'steps;
             }
-            let result = result.unwrap_or_else(|e| {
-                ToolResult::err(call.name(), "tool dispatch failed".into(), e)
-            });
+            let result = result
+                .unwrap_or_else(|e| ToolResult::err(call.name(), "tool dispatch failed".into(), e));
             if result.success && matches!(call.name(), "apply_file_diff" | "write_file") {
                 edited = true;
             }
@@ -826,11 +926,10 @@ pub(crate) fn run_focused_steps(
         if edited && request.verify {
             messages.push(ContextMessage {
                 role: "system".into(),
-                content:
-                    "You just modified files. Run the relevant tests / typecheck \
+                content: "You just modified files. Run the relevant tests / typecheck \
                      (run_tests or execute_terminal_command) to verify your changes \
                      before finishing."
-                        .into(),
+                    .into(),
                 pinned: false,
             });
         }
@@ -877,7 +976,16 @@ pub(crate) fn execute_plan(
         *guard = true;
     }
     let result = execute_plan_inner(
-        app, tool_state, gen, interrupt, tx, session_id, rt, request, working_budget, max_steps,
+        app,
+        tool_state,
+        gen,
+        interrupt,
+        tx,
+        session_id,
+        rt,
+        request,
+        working_budget,
+        max_steps,
     );
     *tool_state.plan_executing.lock().unwrap() = false;
     result
@@ -949,13 +1057,32 @@ fn execute_plan_inner(
             continue;
         }
         let idx = i + 1;
-        set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::InProgress, None)?;
-        emit_plan_step(app, session_id, &plan.id, idx, &item.title, "in_progress", None);
+        set_plan_status(
+            tool_state,
+            &workspace,
+            &plan.id,
+            idx,
+            PlanStatus::InProgress,
+            None,
+        )?;
+        emit_plan_step(
+            app,
+            session_id,
+            &plan.id,
+            idx,
+            &item.title,
+            "in_progress",
+            None,
+        );
 
         let focus = if item.details.trim().is_empty() {
             format!("Plan item {idx}/{total} — {}", item.title)
         } else {
-            format!("Plan item {idx}/{total} — {}\n{}", item.title, item.details.trim())
+            format!(
+                "Plan item {idx}/{total} — {}\n{}",
+                item.title,
+                item.details.trim()
+            )
         };
         let group = format!("Plan item {idx}/{total} · {}", item.title);
         let mut messages = vec![ContextMessage {
@@ -970,8 +1097,19 @@ fn execute_plan_inner(
         }];
 
         let outcome = run_focused_steps(
-            gen, tool_state, app, interrupt, tx, session_id, rt, &mut messages, request,
-            Some(&focus), working_budget, max_steps, &group,
+            gen,
+            tool_state,
+            app,
+            interrupt,
+            tx,
+            session_id,
+            rt,
+            &mut messages,
+            request,
+            Some(&focus),
+            working_budget,
+            max_steps,
+            &group,
         );
         let (ok, error) = match outcome {
             Ok(o) => {
@@ -982,7 +1120,10 @@ fn execute_plan_inner(
                 reasoning_tokens += o.reasoning_tokens;
                 generated_chars += o.generated_chars;
                 if o.reason == "stuck" {
-                    (false, Some("the step failed repeatedly and the loop gave up".to_string()))
+                    (
+                        false,
+                        Some("the step failed repeatedly and the loop gave up".to_string()),
+                    )
                 } else if o.reason == "cancelled" {
                     (false, Some("cancelled".to_string()))
                 } else {
@@ -994,21 +1135,49 @@ fn execute_plan_inner(
 
         if ok {
             completed += 1;
-            set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::Completed, None)?;
-            emit_plan_step(app, session_id, &plan.id, idx, &item.title, "completed", None);
+            set_plan_status(
+                tool_state,
+                &workspace,
+                &plan.id,
+                idx,
+                PlanStatus::Completed,
+                None,
+            )?;
+            emit_plan_step(
+                app,
+                session_id,
+                &plan.id,
+                idx,
+                &item.title,
+                "completed",
+                None,
+            );
         } else {
             failed += 1;
             let msg = error.unwrap_or_else(|| "failed".to_string());
-            set_plan_status(tool_state, &workspace, &plan.id, idx, PlanStatus::Terminal, Some(&msg))?;
-            emit_plan_step(app, session_id, &plan.id, idx, &item.title, "terminal", Some(&msg));
+            set_plan_status(
+                tool_state,
+                &workspace,
+                &plan.id,
+                idx,
+                PlanStatus::Terminal,
+                Some(&msg),
+            )?;
+            emit_plan_step(
+                app,
+                session_id,
+                &plan.id,
+                idx,
+                &item.title,
+                "terminal",
+                Some(&msg),
+            );
         }
     }
 
     let summary = format!(
         "{} items — {} completed, {} failed/terminated ({total} total).",
-        plan.title,
-        completed,
-        failed
+        plan.title, completed, failed
     );
     Ok(PlanRun {
         summary,
@@ -1110,7 +1279,7 @@ fn plan_subtasks(
     prompt.push('\n');
     let gen_request = InferenceRequest {
         prompt,
-        max_tokens: request.max_tokens.max(1).min(1024),
+        max_tokens: request.max_tokens.clamp(1, 1024),
         temperature: request.temperature,
         top_p: request.top_p,
         seed: request.seed,
@@ -1178,7 +1347,11 @@ fn run_summary(
 /// Cheap estimated token count (chars/4 heuristic, mirrors context.rs).
 fn est_tokens(text: &str) -> usize {
     let chars = text.chars().count();
-    if chars == 0 { 1 } else { chars.div_ceil(4) }
+    if chars == 0 {
+        1
+    } else {
+        chars.div_ceil(4)
+    }
 }
 
 /// Trim the working history so its estimated token count fits `budget`.
@@ -1244,7 +1417,11 @@ fn format_tool_feedback(call: &ToolCall, result: &ToolResult) -> String {
     let mut s = format!(
         "`{}` {} in {}ms: {}\n",
         call.name(),
-        if result.success { "succeeded" } else { "failed" },
+        if result.success {
+            "succeeded"
+        } else {
+            "failed"
+        },
         result.duration_ms,
         result.summary,
     );
@@ -1268,11 +1445,12 @@ fn truncate(text: &str, limit: usize) -> String {
 /// Returns `true` when `input` is a trivial greeting, thank-you, or farewell
 /// that should be answered conversationally without invoking the model.
 fn is_greeting(input: &str) -> bool {
-    let trimmed = input.trim().trim_end_matches(['!', '.', '?', ',', ';', ':']);
+    let trimmed = input
+        .trim()
+        .trim_end_matches(['!', '.', '?', ',', ';', ':']);
     matches!(
         trimmed.to_ascii_lowercase().as_str(),
-        "hi"
-            | "hello"
+        "hi" | "hello"
             | "hey"
             | "howdy"
             | "sup"
@@ -1301,16 +1479,24 @@ fn is_greeting(input: &str) -> bool {
 /// Pick a short, friendly reply for a detected greeting.
 fn greeting_reply(input: &str) -> String {
     let lower = input.trim().to_ascii_lowercase();
-    if lower.starts_with("bye") || lower == "goodbye" || lower == "see you" || lower == "see ya"
-        || lower == "good night" || lower == "gn"
+    if lower.starts_with("bye")
+        || lower == "goodbye"
+        || lower == "see you"
+        || lower == "see ya"
+        || lower == "good night"
+        || lower == "gn"
     {
         "Goodbye! Feel free to come back anytime.".to_string()
     } else if lower.starts_with("thank") || lower == "ty" || lower == "thx" || lower == "cheers" {
         "You're welcome! Let me know if you need anything else.".to_string()
-    } else if lower.starts_with("how are") || lower == "sup" || lower == "what's up"
-        || lower == "whats up" || lower == "wsg"
+    } else if lower.starts_with("how are")
+        || lower == "sup"
+        || lower == "what's up"
+        || lower == "whats up"
+        || lower == "wsg"
     {
-        "I'm doing great, thanks! Ready to help with your code. What would you like to work on?".to_string()
+        "I'm doing great, thanks! Ready to help with your code. What would you like to work on?"
+            .to_string()
     } else {
         "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
     }
@@ -1323,8 +1509,16 @@ mod tests {
     #[test]
     fn builds_plain_prompt_from_messages() {
         let msgs = vec![
-            ContextMessage { role: "system".into(), content: "You are a coder.".into(), pinned: true },
-            ContextMessage { role: "user".into(), content: "hello".into(), pinned: false },
+            ContextMessage {
+                role: "system".into(),
+                content: "You are a coder.".into(),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "hello".into(),
+                pinned: false,
+            },
         ];
         let prompt = build_prompt(&msgs, "hello");
         assert!(prompt.contains("## System instructions\nYou are a coder."));
@@ -1348,11 +1542,31 @@ mod tests {
     #[test]
     fn trims_oldest_unpinned_until_within_budget() {
         let mut msgs = vec![
-            ContextMessage { role: "system".into(), content: "SYS".repeat(10), pinned: true },
-            ContextMessage { role: "user".into(), content: "turn 1 ".repeat(100), pinned: false },
-            ContextMessage { role: "assistant".into(), content: "noise ".repeat(100), pinned: false },
-            ContextMessage { role: "tool".into(), content: "out ".repeat(100), pinned: false },
-            ContextMessage { role: "user".into(), content: "tail".into(), pinned: false },
+            ContextMessage {
+                role: "system".into(),
+                content: "SYS".repeat(10),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "turn 1 ".repeat(100),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "noise ".repeat(100),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "tool".into(),
+                content: "out ".repeat(100),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "tail".into(),
+                pinned: false,
+            },
         ];
         trim_working_history(&mut msgs, 30);
         // Pinned system prompt survives; the final message survives; the bulky

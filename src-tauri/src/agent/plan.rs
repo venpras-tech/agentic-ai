@@ -49,18 +49,6 @@ impl PlanStatus {
             _ => None,
         }
     }
-
-    /// Checkbox marker used in the rendered markdown (`[ ]` / `[~]` / `[x]` /
-    /// `[!]`). The markdown is a view, not the source of truth, so non-standard
-    /// markers are acceptable for readability.
-    fn marker(&self) -> &'static str {
-        match self {
-            PlanStatus::NotStarted => " ",
-            PlanStatus::InProgress => "~",
-            PlanStatus::Completed => "x",
-            PlanStatus::Terminal => "!",
-        }
-    }
 }
 
 /// One item of a plan.
@@ -114,7 +102,11 @@ impl PlanState {
         }
         out.push('\n');
         out.push_str("### Progress\n\n");
-        let done = self.items.iter().filter(|i| i.status == PlanStatus::Completed).count();
+        let done = self
+            .items
+            .iter()
+            .filter(|i| i.status == PlanStatus::Completed)
+            .count();
         out.push_str(&format!(
             "- Completed: {}/{} items\n",
             done,
@@ -134,7 +126,7 @@ impl PlanState {
             .map_err(|e| format!("Failed to serialize plan: {e}"))?;
         std::fs::write(dir.join("plan.json"), json_text)
             .map_err(|e| format!("Failed to write plan.json: {e}"))?;
-        std::fs::write(dir.join("plan.md"), self.render_markdown())
+        std::fs::write(workspace.join(PLAN_MD), self.render_markdown())
             .map_err(|e| format!("Failed to write plan.md: {e}"))?;
         Ok(())
     }
@@ -180,9 +172,15 @@ mod tests {
 
     #[test]
     fn parses_status_labels() {
-        assert_eq!(PlanStatus::from_label("in_progress"), Some(PlanStatus::InProgress));
+        assert_eq!(
+            PlanStatus::from_label("in_progress"),
+            Some(PlanStatus::InProgress)
+        );
         assert_eq!(PlanStatus::from_label("done"), Some(PlanStatus::Completed));
-        assert_eq!(PlanStatus::from_label("terminal"), Some(PlanStatus::Terminal));
+        assert_eq!(
+            PlanStatus::from_label("terminal"),
+            Some(PlanStatus::Terminal)
+        );
         assert_eq!(PlanStatus::from_label("nonsense"), None);
     }
 
@@ -193,7 +191,11 @@ mod tests {
         let p = new_plan(
             "Refactor auth",
             "Replace the hand-rolled login with a library.",
-            vec!["Inspect current auth".into(), "Pick a library".into(), "Migrate".into()],
+            vec![
+                "Inspect current auth".into(),
+                "Pick a library".into(),
+                "Migrate".into(),
+            ],
         );
         p.save(&dir).unwrap();
         let loaded = PlanState::load(&dir).unwrap();

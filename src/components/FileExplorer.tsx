@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../lib/ipc";
 import type { FileNode } from "../types";
@@ -9,10 +9,25 @@ interface FileExplorerProps {
   onOpenFile: (path: string) => void;
   onNewFile: () => void;
   onOpenSkills: () => void;
+  /** Bumped whenever the agent touches the filesystem; triggers a re-list. */
+  refreshSignal?: number;
+  /**
+   * When true, renders only the tree body (no <aside>/header) for embedding
+   * in the shared sidebar with the Chats/Files tab strip (BN-11).
+   */
+  chromeless?: boolean;
 }
 
 export default function FileExplorer(props: FileExplorerProps) {
-  const { workspaceRoot, onSelectWorkspace, onOpenFile, onNewFile, onOpenSkills } = props;
+  const {
+    workspaceRoot,
+    onSelectWorkspace,
+    onOpenFile,
+    onNewFile,
+    onOpenSkills,
+    refreshSignal = 0,
+    chromeless = false,
+  } = props;
   const [roots, setRoots] = useState<FileNode[]>([]);
   const [children, setChildren] = useState<Record<string, FileNode[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -32,6 +47,22 @@ export default function FileExplorer(props: FileExplorerProps) {
       .catch(() => setRoots([]))
       .finally(() => setLoading(false));
   }, [workspaceRoot]);
+
+  // Re-list the root (and any expanded folders) after agent-side edits so
+  // newly created/renamed files appear without a manual collapse/expand.
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  useEffect(() => {
+    if (!workspaceRoot || refreshSignal === 0) return;
+    api.listDirectory(workspaceRoot).then(setRoots).catch(() => {});
+    for (const dir of Array.from(expandedRef.current)) {
+      api
+        .listDirectory(workspaceRoot, dir)
+        .then((list) => setChildren((p) => ({ ...p, [dir]: list })))
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshSignal, workspaceRoot]);
 
   const onToggle = useCallback(
     async (node: FileNode) => {
@@ -85,6 +116,30 @@ export default function FileExplorer(props: FileExplorerProps) {
       );
     });
 
+  const body = (
+    <div className="min-h-0 flex-1 overflow-auto px-1.5 py-1.5">
+      {!workspaceRoot ? (
+        <div className="px-1 pt-3 text-center text-[11px] leading-relaxed text-zinc-400">
+          No workspace open.
+          <br />
+          <button
+            onClick={onSelectWorkspace}
+            className="mt-2 rounded border border-border px-2 py-1 text-[11px] text-zinc-700 hover:border-zinc-400"
+          >
+            Open folder
+          </button>
+        </div>
+      ) : loading ? (
+        <p className="px-1 text-[11px] text-zinc-400">Listing…</p>
+      ) : roots.length === 0 ? (
+        <p className="px-1 text-[11px] text-zinc-400">Empty folder</p>
+      ) : (
+        renderNodes(roots, 0)
+      )}
+    </div>
+  );
+  if (chromeless) return body;
+
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-panel">
       <div className="flex h-9 items-center justify-between border-b border-border px-2">
@@ -115,26 +170,7 @@ export default function FileExplorer(props: FileExplorerProps) {
           </button>
         </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-1.5 py-1.5">
-        {!workspaceRoot ? (
-          <div className="px-1 pt-3 text-center text-[11px] leading-relaxed text-zinc-400">
-            No workspace open.
-            <br />
-            <button
-              onClick={onSelectWorkspace}
-              className="mt-2 rounded border border-border px-2 py-1 text-[11px] text-zinc-700 hover:border-zinc-400"
-            >
-              Open folder
-            </button>
-          </div>
-        ) : loading ? (
-          <p className="px-1 text-[11px] text-zinc-400">Listing…</p>
-        ) : roots.length === 0 ? (
-          <p className="px-1 text-[11px] text-zinc-400">Empty folder</p>
-        ) : (
-          renderNodes(roots, 0)
-        )}
-      </div>
+      {body}
     </aside>
   );
 }

@@ -74,6 +74,19 @@ export default function PermissionModal({ request, policy, onRespond }: Permissi
           {request.summary}
         </p>
 
+        {request.review && (
+          <p
+            className={`rounded border px-3 py-1.5 font-mono text-[10px] leading-relaxed ${
+              request.review.toUpperCase().includes("UNSAFE")
+                ? "border-red-400/40 bg-red-500/10 text-red-600"
+                : "border-emerald-500/30 bg-emerald-500/10 text-emerald-700"
+            }`}
+            title="Second opinion from an independent LLM review pass"
+          >
+            <span className="font-semibold">Review:</span> {request.review}
+          </p>
+        )}
+
         {policy && (
           <p className="text-[10px] leading-snug text-zinc-500">
             Policy: {policy.default === "allow" ? "allowed by default" : "asks before mutating"} ·{" "}

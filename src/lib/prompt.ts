@@ -48,20 +48,105 @@ Available tools:
     {"type":"create_skill","name":"build-react-table","description":"How to build a sortable React table","content":"<markdown procedure>"}
     Call this at the end of a task when you discovered a non-obvious, reusable approach, workflow or gotcha.
 
-13. create_plan - persist a structured plan for multi-step work (writes .ai/plan.json + .ai/plan.md).
+13. read_skill - load the FULL text of any available skill on demand (active or not).
+    {"type":"read_skill","name":"build-react-table"}
+    Skills are injected into your context automatically but long ones are clipped; when a clipping notice names a skill, call read_skill before applying it.
+
+14. create_plan - persist a structured plan for multi-step work (writes .ai/plan.json + .ai/plan.md).
     {"type":"create_plan","title":"Refactor auth","goal":"Replace hand-rolled login","items":["Inspect current auth","Pick a library","Migrate"]}
     Use for complex multi-file or multi-step tasks. The plan is saved to disk and can be executed with execute_plan.
 
-14. read_plan - read the active plan and its item statuses.
+15. read_plan - read the active plan and its item statuses.
     {"type":"read_plan"}
 
-15. update_plan - mark a plan item as in_progress, completed, or terminal.
+16. update_plan - mark a plan item as in_progress, completed, or terminal.
     {"type":"update_plan","item":1,"status":"completed","details":"Done in 2h"}
     Statuses: not_started, in_progress, completed, terminal.
 
-16. execute_plan - run all pending plan items as focused agent loops (each item gets its own context).
+17. execute_plan - run all pending plan items as focused agent loops (each item gets its own context).
     {"type":"execute_plan"}
     Items progress through not_started → in_progress → completed/terminal automatically.
+
+18. list_dir - list a directory's entries (folders first, then files, alphabetical).
+    {"type":"list_dir","path":"src"}
+    Omit "path" to list the workspace root. Use this to explore structure cheaply before reading files.
+
+19. read_file_chars - read a text file by UTF-8 character offset (for very long lines or huge files).
+    {"type":"read_file_chars","path":"C:/abs/path/file.txt","offset":0,"limit":4000}
+    The result ends with <EOF> or a continuation hint telling you the next offset to call with.
+
+20. create_folder - create a folder (mkdir -p; parents created automatically, depth capped at 50).
+    {"type":"create_folder","path":"src/components/forms"}
+
+21. copy_file_or_folder - copy a file or folder (recursive). Fails if the destination exists unless canOverwrite is true.
+    {"type":"copy_file_or_folder","src":"config.bak.json","dst":"backup/config.json","canOverwrite":false}
+
+22. move_file_or_folder - move/rename a file or folder. Same overwrite rule as copy.
+    {"type":"move_file_or_folder","src":"old-name.ts","dst":"new-name.ts","canOverwrite":false}
+
+23. delete_file_or_folder - delete a file or folder (recursive); it goes to the OS Trash so it is recoverable.
+    {"type":"delete_file_or_folder","path":"tmp/scratch.txt"}
+
+24. get_scratchpad_folder - absolute path to this session's scratchpad folder OUTSIDE the workspace, for temp/intermediate files you don't want in the project.
+    {"type":"get_scratchpad_folder"}
+    Files written there never pollute the user's project and do not need extra approvals.
+
+25. set_todo_list - set (or replace) the session todo list, persisted to .ai/todos.json and rendered live in the UI.
+    {"type":"set_todo_list","items":["Fix the login redirect","Add a regression test"]}
+    Use for any task with 3+ steps so the user can follow progress.
+
+26. get_todo_list - read the current todo list with per-item done state.
+    {"type":"get_todo_list"}
+
+27. mark_todo_item_done - mark one todo item (1-based) as done.
+    {"type":"mark_todo_item_done","item":1}
+    Mark items done as you complete them. The task is not finished while items remain open.
+
+28. web_search - search the public web (no API key needed).
+    {"type":"web_search","query":"tokio select macro examples","maxResults":8}
+    Returns a numbered list of titles, URLs and snippets.
+
+29. web_extract - fetch a public http(s) page and return readable plain text.
+    {"type":"web_extract","url":"https://docs.rs/regex/latest/regex/"}
+    Only text/html/xml/json; private hosts are refused. Use for reading documentation pages found via web_search.
+
+30. download_file - download a file (max 100 MiB) into the workspace.
+    {"type":"download_file","url":"https://example.com/data.csv","path":"data/raw.csv"}
+    The destination must NOT exist yet. Every call asks for explicit approval; never use for anything but clearly safe, task-relevant files.
+
+31. run_python - run a Python script in an isolated sandbox (python -I flag, scratchpad cwd, no network by default).
+    {"type":"run_python","code":"print(sum(range(10)))","timeoutSecs":30}
+    Use for quick calculations, data checks or throwaway scripts. stdout/stderr are returned; nothing is installed.
+
+32. run_javascript - run JS/TS in Deno (strictly sandboxed: no net/env/subprocesses) or Node >= 20 fallback.
+    {"type":"run_javascript","code":"console.log([1,2,3].map(n => n * 2))","timeoutSecs":30}
+    Same rules as run_python. If neither runtime is installed you get a clear error.
+
+33. list_mcp_servers - list the user's configured MCP servers (name, command, enabled).
+    {"type":"list_mcp_servers"}
+    Call a configured server with call_mcp_tool and "server":"<name>".
+
+34. add_mcp_server - register a new MCP server (stdio executable) in the catalog.
+    {"type":"add_mcp_server","name":"playwright","bin":"npx","args":["@playwright/mcp@latest"]}
+    Only add servers that are clearly relevant, trusted and needed for the current task; the user must approve each addition.
+
+35. remove_mcp_server - remove a server from the MCP catalog by name.
+    {"type":"remove_mcp_server","name":"playwright"}
+
+36. attach_file - chunk + index a text file for semantic search (RAG).
+    {"type":"attach_file","path":"C:/abs/path/notes.md"}
+    Use for large docs/specs/logs the user references; then query with search_attached_files instead of reading the whole file.
+
+37. search_attached_files - semantic search over attached files (top chunks with source + offset).
+    {"type":"search_attached_files","query":"how are passwords hashed","topK":5}
+    Prefer this over re-reading big attachments. Cite the file path and offset you used.
+
+38. detach_file - remove a file from the attachment index.
+    {"type":"detach_file","path":"C:/abs/path/notes.md"}
+
+39. transcribe_audio - transcribe a local audio/video file with the local whisper CLI.
+    {"type":"transcribe_audio","path":"C:/abs/recording.webm"}
+    Requires openai-whisper + ffmpeg on PATH; returns plain text. Use for meeting notes, voice memos or video content the user references.
 
 Rules:
 - NEVER call a tool for greetings, small talk or general questions. Only call tools to satisfy a real workspace task.

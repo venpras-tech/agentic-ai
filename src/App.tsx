@@ -4,6 +4,7 @@ import TitleBar from "./components/TitleBar";
 import MenuBar from "./components/MenuBar";
 import ModelBar from "./components/ModelBar";
 import FileExplorer from "./components/FileExplorer";
+import ProjectsPanel from "./components/ProjectsPanel";
 import EditorPane from "./components/EditorPane";
 import ChatPanel from "./components/ChatPanel";
 import StatusBar from "./components/StatusBar";
@@ -35,6 +36,7 @@ import type {
   RemoteModelConfig,
   StepEvent,
   SubtaskEvent,
+  TodoUpdateEvent,
   ToolOutputEvent,
 } from "./types";
 
@@ -78,6 +80,11 @@ export default function App() {
     title: string;
   } | null>(null);
   const [verify, setVerify] = useState(true);
+  const [yolo, setYolo] = useState(false);
+  const [attachments, setAttachments] = useState<
+    { path: string; chunkCount: number }[]
+  >([]);
+  const [explorerRefresh, setExplorerRefresh] = useState(0);
   const [pendingPlan, setPendingPlan] = useState<{
     sessionId: number;
     planText: string;
@@ -89,6 +96,13 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showConsole, setShowConsole] = useState(false);
   const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([]);
+  const [todos, setTodos] = useState<TodoUpdateEvent | null>(null);
+  // BN-11 projects/chats sidebar: which left-rail view is active and which
+  // chat (per project) the composer writes into. null chat id = the default
+  // (legacy) chat log.
+  const [leftView, setLeftView] = useState<"files" | "chats">("files");
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [chatsRefresh, setChatsRefresh] = useState(0);
 
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
@@ -201,7 +215,8 @@ export default function App() {
           content: text,
           ts: Date.now(),
           done: e.done,
-        })
+        }, activeChatId)
+        .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
     },
     onError: (e) => {
@@ -318,6 +333,9 @@ export default function App() {
         }),
       );
     },
+    onTodoUpdate: (e: TodoUpdateEvent) => {
+      setTodos(e);
+    },
     onToolOutput: (e: ToolOutputEvent) => {
       setConsoleEntries((prev) => [
         ...prev,
@@ -350,6 +368,7 @@ export default function App() {
     },
     onFileChanged: (e: FileChangedEvent) => {
       syncAgentFile(e);
+      setExplorerRefresh((n) => n + 1);
       if (e.diff && activeSessionId != null) {
         const sid = activeSessionId;
         setMessages((prev) =>
@@ -673,23 +692,11 @@ export default function App() {
     if (path) openFile(path);
   }, [openFile]);
 
-  const selectWorkspace = useCallback(async () => {
-    const root = await api.pickWorkspaceFolder();
-    if (root) {
-      setWorkspaceRoot(root);
-      await api.agentSetWorkspace(root).catch(() => {});
-      refreshPolicy();
-      setCheckpoints([]);
+  /** Replay one project chat's JSONL log into the chat view + model context. */
+  const loadSessionIntoView = useCallback(
+    (project: string, chatId: string | null) => {
       api
-        .knowledgeReport()
-        .then(setKnowledge)
-        .catch(() => {});
-      api
-        .gitCheckpoints()
-        .then(setCheckpoints)
-        .catch(() => setCheckpoints([]));
-      api
-        .sessionLoad(root)
+        .sessionLoad(project, chatId)
         .then((records) => {
           const replay: ChatMessage[] = [];
           for (const r of records) {
@@ -709,8 +716,36 @@ export default function App() {
           }
         })
         .catch(() => {});
-    }
-  }, [refreshPolicy, setCheckpoints]);
+    },
+    [],
+  );
+
+  /** Make `root` the active workspace: sync the agent, refresh panels and
+   * open its default chat. Shared by the folder picker and the chats tree. */
+  const applyWorkspace = useCallback(
+    async (root: string) => {
+      setWorkspaceRoot(root);
+      setActiveChatId(null);
+      await api.agentSetWorkspace(root).catch(() => {});
+      refreshPolicy();
+      setCheckpoints([]);
+      api
+        .knowledgeReport()
+        .then(setKnowledge)
+        .catch(() => {});
+      api
+        .gitCheckpoints()
+        .then(setCheckpoints)
+        .catch(() => setCheckpoints([]));
+      loadSessionIntoView(root, null);
+    },
+    [refreshPolicy, loadSessionIntoView],
+  );
+
+  const selectWorkspace = useCallback(async () => {
+    const root = await api.pickWorkspaceFolder();
+    if (root) await applyWorkspace(root);
+  }, [applyWorkspace]);
 
   // ---- context: active-file buffer (debounced so typing doesn't spam IPC) ----
   useEffect(() => {
@@ -760,6 +795,20 @@ export default function App() {
       if (!trimmed || isStreaming) return;
       setPendingPlan(null);
       setCurrentSubtask(null);
+      // @-mentions activate the referenced skills for this turn (and beyond).
+      const mentions = [
+        ...new Set(
+          Array.from(trimmed.matchAll(/(?:^|\s)@([\w-]+)/g), (m) => m[1]),
+        ),
+      ];
+      for (const name of mentions) {
+        if (knowledge?.skills.some((s) => s.name === name && !s.active)) {
+          api
+            .skillSetActive(name, true)
+            .then(setKnowledge)
+            .catch(() => {});
+        }
+      }
       setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
       api
         .contextPushTurn("user", trimmed)
@@ -770,7 +819,7 @@ export default function App() {
           role: "user",
           content: trimmed,
           ts: Date.now(),
-        })
+        }, activeChatId)
         .catch(() => {});
       try {
         if (agentModeRef.current || opts?.planMode || opts?.decompose) {
@@ -788,7 +837,7 @@ export default function App() {
         setError(String(e));
       }
     },
-    [genParams, isStreaming, runAgentTask],
+    [activeChatId, genParams, isStreaming, runAgentTask, knowledge],
   );
 
   const approvePlan = useCallback(async () => {
@@ -818,7 +867,61 @@ export default function App() {
     setLastDone(null);
     setCurrentStep(null);
     setLedger([]);
+    setTodos(null);
   }, []);
+
+  // ---- BN-11: projects/chats sidebar ----
+  const newChat = useCallback(() => {
+    if (isStreaming) return;
+    clearChat();
+    setActiveChatId(`chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
+    setError(null);
+    setCurrentSubtask(null);
+  }, [clearChat, isStreaming]);
+
+  const switchChat = useCallback(
+    (project: string, chatId: string | null) => {
+      if (isStreaming) return;
+      if (project !== (workspaceRoot ?? "default")) {
+        // Opening a chat from another project switches the workspace too.
+        void applyWorkspace(project).then(() => {
+          if (chatId) {
+            clearChat();
+            setActiveChatId(chatId);
+            loadSessionIntoView(project, chatId);
+          }
+        });
+        return;
+      }
+      if (chatId === activeChatId) return;
+      clearChat();
+      setActiveChatId(chatId);
+      setError(null);
+      setCurrentSubtask(null);
+      loadSessionIntoView(workspaceRoot ?? "default", chatId);
+    },
+    [
+      activeChatId,
+      applyWorkspace,
+      clearChat,
+      isStreaming,
+      loadSessionIntoView,
+      workspaceRoot,
+    ],
+  );
+
+  const deleteChat = useCallback(
+    (project: string, chatId: string) => {
+      api.sessionDeleteChat(project, chatId).catch(() => {});
+      setChatsRefresh((n) => n + 1);
+      // If the open chat itself was removed, fall back to the default chat.
+      if (chatId === activeChatId && project === (workspaceRoot ?? "default")) {
+        clearChat();
+        setActiveChatId(null);
+      }
+    },
+    [activeChatId, clearChat, workspaceRoot],
+  );
 
   return (
     <div className="flex h-full w-full flex-col bg-editor text-ink">
@@ -845,13 +948,82 @@ export default function App() {
         onConnectRemote={connectRemote}
       />
       <div className="flex min-h-0 flex-1">
-        <FileExplorer
-          workspaceRoot={workspaceRoot}
-          onSelectWorkspace={selectWorkspace}
-          onOpenFile={openFile}
-          onNewFile={newFile}
-          onOpenSkills={() => setShowKnowledge(true)}
-        />
+        <div className="flex w-60 shrink-0 flex-col border-r border-border bg-panel">
+          <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-1.5">
+            {(
+              [
+                ["files", "Files"],
+                ["chats", "Chats"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => setLeftView(id)}
+                className={`rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wider transition-colors ${
+                  leftView === id
+                    ? "bg-accent/15 text-cyan-600"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+            <div className="flex-1" />
+            {leftView === "files" && (
+              <div className="flex items-center gap-0.5">
+                <button
+                  onClick={newFile}
+                  title="New file"
+                  className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
+                >
+                  +
+                </button>
+                <button
+                  onClick={() => setShowKnowledge(true)}
+                  title="Skills & rules"
+                  className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
+                >
+                  ✦
+                </button>
+                <button
+                  onClick={selectWorkspace}
+                  title="Open workspace"
+                  className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
+                >
+                  📁
+                </button>
+              </div>
+            )}
+          </div>
+          {/* Keep the explorer mounted (preserves expansion state) even when
+              the chats view is shown; `hidden` collapses it. */}
+          <div
+            className={
+              leftView === "files" ? "flex min-h-0 flex-1 flex-col" : "hidden"
+            }
+          >
+            <FileExplorer
+              chromeless
+              workspaceRoot={workspaceRoot}
+              onSelectWorkspace={selectWorkspace}
+              onOpenFile={openFile}
+              onNewFile={newFile}
+              onOpenSkills={() => setShowKnowledge(true)}
+              refreshSignal={explorerRefresh}
+            />
+          </div>
+          {leftView === "chats" && (
+            <ProjectsPanel
+              workspaceRoot={workspaceRoot}
+              activeChatId={activeChatId}
+              refreshSignal={chatsRefresh}
+              onSwitchChat={switchChat}
+              onNewChat={newChat}
+              onDeleteChat={deleteChat}
+              onOpenProject={(path) => void applyWorkspace(path)}
+            />
+          )}
+        </div>
         <div className="flex min-w-0 flex-1 flex-col">
           <Tabs
             files={files}
@@ -877,8 +1049,34 @@ export default function App() {
           onClear={clearChat}
           currentStep={currentStep}
           currentSubtask={currentSubtask}
+          todos={todos}
           verify={verify}
           onVerifyChange={setVerify}
+          yolo={yolo}
+          onYoloChange={(v) => {
+            setYolo(v);
+            api.agentSetYolo(v).catch(() => {});
+          }}
+          skills={(knowledge?.skills ?? []).map((s) => s.name)}
+          attachments={attachments}
+          onAttachClick={async () => {
+            try {
+              const picked = await api.pickTextFile();
+              if (!picked) return;
+              const info = await api.agentAttachFile(picked);
+              setAttachments((prev) =>
+                prev.some((a) => a.path === info.path)
+                  ? prev
+                  : [...prev, { path: info.path, chunkCount: info.chunkCount }],
+              );
+            } catch {
+              // picker cancelled / read failed — ignore silently
+            }
+          }}
+          onDetachFile={(path) => {
+            api.agentDetachFile(path).catch(() => {});
+            setAttachments((prev) => prev.filter((a) => a.path !== path));
+          }}
           pendingPlan={pendingPlan}
           onApprovePlan={approvePlan}
           onRejectPlan={rejectPlan}

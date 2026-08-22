@@ -12,6 +12,7 @@ export default function KnowledgePanel({ open, onClose }: KnowledgePanelProps) {
   const [report, setReport] = useState<KnowledgeReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [installGlobal, setInstallGlobal] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -61,6 +62,34 @@ export default function KnowledgePanel({ open, onClose }: KnowledgePanelProps) {
     }
   };
 
+  const pickAndInstall = async (folder: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const src = folder ? await api.pickWorkspaceFolder() : await api.pickTextFile();
+      if (!src) return;
+      const next = await api.skillInstall(src, installGlobal);
+      setReport(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uninstall = async (name: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await api.skillUninstall(name);
+      setReport(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const rulesEmpty = !report || report.rules.trim() === "";
 
   return (
@@ -71,16 +100,45 @@ export default function KnowledgePanel({ open, onClose }: KnowledgePanelProps) {
       aria-label="Project skills and rules"
     >
       <div className="flex max-h-[80vh] w-[40rem] max-w-[94vw] flex-col gap-3 rounded-lg border border-border bg-panel-2 p-4 shadow-2xl">
-        <div className="flex items-center justify-between">
-          <span className="text-[13px] font-semibold text-ink">Skills &amp; Rules</span>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={rescan}
-              disabled={busy}
-              className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40"
-            >
-              {busy ? "…" : "↻ Rescan"}
-            </button>
+          <div className="flex items-center justify-between">
+            <span className="text-[13px] font-semibold text-ink">Skills &amp; Rules</span>
+            <div className="flex items-center gap-2">
+              <label
+                className="flex cursor-pointer items-center gap-1 text-[10px] text-zinc-500"
+                title="Install into the user-global skills folder instead of the workspace"
+              >
+                <input
+                  type="checkbox"
+                  checked={installGlobal}
+                  onChange={(e) => setInstallGlobal(e.target.checked)}
+                  disabled={busy}
+                  className="accent-cyan-400"
+                />
+                global
+              </label>
+              <button
+                onClick={() => void pickAndInstall(false)}
+                disabled={busy}
+                title="Install a skill from a .md file"
+                className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40"
+              >
+                + .md
+              </button>
+              <button
+                onClick={() => void pickAndInstall(true)}
+                disabled={busy}
+                title="Install a folder-format skill (a directory containing SKILL.md; scripts/data ride along)"
+                className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40"
+              >
+                + Folder
+              </button>
+              <button
+                onClick={rescan}
+                disabled={busy}
+                className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40"
+              >
+                {busy ? "…" : "↻ Rescan"}
+              </button>
             <button
               onClick={onClose}
               aria-label="Close"
@@ -140,20 +198,23 @@ export default function KnowledgePanel({ open, onClose }: KnowledgePanelProps) {
               <p className="rounded border border-border bg-panel px-3 py-2 text-[10px] text-zinc-500">
                 No skills found. Drop Markdown files with a{" "}
                 <span className="font-mono">name</span>/<span className="font-mono">description</span>{" "}
-                frontmatter into <span className="font-mono">.ai/skills/</span> and press ↻ Rescan.
+                frontmatter — or whole folders containing a{" "}
+                <span className="font-mono">SKILL.md</span> — into{" "}
+                <span className="font-mono">.ai/skills/</span>, or use + .md / + Folder above.
               </p>
             ) : (
               <div className="flex flex-col gap-1.5">
                 {report.skills.map((s) => (
-                  <label
+                  <div
                     key={s.name}
-                    className="flex cursor-pointer items-start gap-2.5 rounded border border-border bg-panel px-3 py-2 hover:border-zinc-400"
+                    className="flex items-start gap-2.5 rounded border border-border bg-panel px-3 py-2 hover:border-zinc-400"
                   >
                     <input
                       type="checkbox"
                       checked={s.active}
                       disabled={busy}
                       onChange={(e) => void toggle(s.name, e.target.checked)}
+                      title="Include this skill in the model context"
                       className="mt-0.5 accent-cyan-400"
                     />
                     <span className="min-w-0 flex-1">
@@ -165,7 +226,18 @@ export default function KnowledgePanel({ open, onClose }: KnowledgePanelProps) {
                         <span className="block text-[10px] text-zinc-500">{s.description}</span>
                       )}
                     </span>
-                  </label>
+                    <button
+                      onClick={() => void uninstall(s.name)}
+                      disabled={busy}
+                      title={`Delete ${s.name} from disk`}
+                      aria-label={`Uninstall skill ${s.name}`}
+                      className="mt-0.5 rounded p-0.5 text-zinc-400 hover:bg-red-500/10 hover:text-red-500 disabled:opacity-40"
+                    >
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+                        <path d="M18 6 6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
                 ))}
               </div>
             )}

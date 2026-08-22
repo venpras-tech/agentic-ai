@@ -33,6 +33,7 @@ export function useEngineEvents(handlers: EngineHandlers) {
       onSubtask: (e) => ref.current.onSubtask?.(e),
       onPlanStep: (e) => ref.current.onPlanStep?.(e),
       onSkillsChanged: (e) => ref.current.onSkillsChanged?.(e),
+      onTodoUpdate: (e) => ref.current.onTodoUpdate?.(e),
     }).then((un) => {
       if (disposed) un();
       else unlisten = un;

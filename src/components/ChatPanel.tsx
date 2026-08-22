@@ -5,8 +5,10 @@ import type {
   ChatMessage,
   InferenceDone,
   StepTimelineStep,
+  TodoUpdateEvent,
 } from "../types";
 import DiffView from "./DiffView";
+import { api } from "../lib/ipc";
 
 export interface SendOptions {
   planMode?: boolean;
@@ -30,10 +32,20 @@ interface ChatPanelProps {
   currentSubtask: { index: number; total: number; title: string } | null;
   verify: boolean;
   onVerifyChange: (v: boolean) => void;
+  /** YOLO sub-mode (Bionic §3.3): ROUTINE shell commands skip approval. */
+  yolo?: boolean;
+  onYoloChange?: (v: boolean) => void;
+  /** Available skill names for @-mention autocomplete. */
+  skills?: string[];
+  /** Files attached to this session's RAG index. */
+  attachments?: { path: string; chunkCount: number }[];
+  onAttachClick?: () => void;
+  onDetachFile?: (path: string) => void;
   pendingPlan: { sessionId: number; planText: string } | null;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
   onOpenSkills: () => void;
+  todos: TodoUpdateEvent | null;
 }
 
 const SLASH_HINTS: { cmd: string; hint: string }[] = [
@@ -188,6 +200,35 @@ function ToolCard({ event }: { event: AgentToolEvent }) {
   );
 }
 
+/** Live todo checklist card, updated whenever the agent calls set_todo_list
+ *  or mark_todo_item_done. Shows open/total progress and per-item state. */
+function TodoCard({ todos }: { todos: TodoUpdateEvent }) {
+  const done = todos.items.filter((t) => t.done).length;
+  const total = todos.items.length;
+  return (
+    <div className="rounded-md border border-border bg-panel-2/70 px-2 py-1.5">
+      <div className="flex items-center gap-1.5 text-[10.5px]">
+        <span className="font-medium text-zinc-700">Todo list</span>
+        <span className="ml-auto shrink-0 text-zinc-400">
+          {done}/{total} done
+        </span>
+      </div>
+      <ul className="mt-1 space-y-0.5">
+        {todos.items.map((t) => (
+          <li key={t.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
+            <span className={`shrink-0 ${t.done ? "text-emerald-500" : "text-zinc-400"}`}>
+              {t.done ? "☑" : "☐"}
+            </span>
+            <span className={t.done ? "text-zinc-400 line-through" : "text-zinc-700"}>
+              {t.title}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export default function ChatPanel(props: ChatPanelProps) {
   const {
     messages,
@@ -205,10 +246,17 @@ export default function ChatPanel(props: ChatPanelProps) {
     currentSubtask,
     verify,
     onVerifyChange,
+    yolo = false,
+    onYoloChange,
+    skills = [],
+    attachments = [],
+    onAttachClick,
+    onDetachFile,
     pendingPlan,
     onApprovePlan,
     onRejectPlan,
     onOpenSkills,
+    todos,
   } = props;
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -280,6 +328,68 @@ export default function ChatPanel(props: ChatPanelProps) {
 
   const showingHints = !isStreaming && input.trim().startsWith("/");
 
+  // @-mention autocomplete: a trailing "@token" while typing filters skills.
+  const mentionMatch = isStreaming ? null : input.match(/(?:^|\s)@([\w-]*)$/);
+  const mentionHits = mentionMatch
+    ? skills
+        .filter((n) =>
+          n.toLowerCase().includes(mentionMatch[1].toLowerCase()),
+        )
+        .slice(0, 6)
+    : [];
+
+  const insertMention = (name: string) => {
+    setInput((prev) =>
+      prev.replace(/(?:^|\s)@[\w-]*$/, (lead) => `${lead}@${name} `),
+    );
+  };
+
+  // --- voice dictation (MediaRecorder → whisper) ---
+  const [recording, setRecording] = useState(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const [transcribing, setTranscribing] = useState(false);
+
+  const toggleDictation = async () => {
+    if (recording) {
+      recorderRef.current?.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const chunks: Blob[] = [];
+      const recorder = new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setRecording(false);
+        setTranscribing(true);
+        const blob = new Blob(chunks, { type: recorder.mimeType });
+        blob
+          .arrayBuffer()
+          .then((buf) =>
+            api.voiceTranscribeData(
+              Array.from(new Uint8Array(buf)),
+              "webm",
+            ),
+          )
+          .then((text) => {
+            if (text.trim()) {
+              setInput((prev) => (prev ? `${prev} ${text.trim()}` : text.trim()));
+            }
+          })
+          .catch(() => {})
+          .finally(() => setTranscribing(false));
+      };
+      recorder.start();
+      setRecording(true);
+    } catch {
+      // mic permission denied / unsupported — stay silent
+    }
+  };
+
   return (
     <aside className="flex w-96 min-w-80 shrink-0 flex-col border-l border-border bg-panel">
       <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
@@ -298,6 +408,19 @@ export default function ChatPanel(props: ChatPanelProps) {
               }`}
             >
               Verify
+            </button>
+          )}
+          {agentMode && onYoloChange && (
+            <button
+              onClick={() => onYoloChange(!yolo)}
+              title="YOLO: auto-approve routine shell commands (tests/builds/inspects). Red-zone stays blocked."
+              className={`rounded px-1.5 py-0.5 text-[10px] font-bold transition-colors ${
+                yolo
+                  ? "bg-amber-500/25 text-amber-600"
+                  : "border border-border text-zinc-500 hover:text-zinc-700"
+              }`}
+            >
+              YOLO
             </button>
           )}
           <button
@@ -405,7 +528,51 @@ export default function ChatPanel(props: ChatPanelProps) {
         )}
       </div>
 
+      {todos && todos.items.length > 0 && (
+        <div className="shrink-0 border-t border-border px-3 py-2">
+          <TodoCard todos={todos} />
+        </div>
+      )}
+
       <footer className="shrink-0 border-t border-border p-2">
+        {attachments.length > 0 && (
+          <div className="mb-1.5 flex flex-wrap gap-1">
+            {attachments.map((a) => {
+              const name = a.path.split(/[\\/]/).pop() ?? a.path;
+              return (
+                <span
+                  key={a.path}
+                  className="flex max-w-full items-center gap-1 rounded border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] text-cyan-700"
+                  title={`${a.path} — ${a.chunkCount} chunk(s) indexed`}
+                >
+                  <button
+                    onClick={() => onDetachFile?.(a.path)}
+                    aria-label={`Detach ${name}`}
+                    className="font-mono text-cyan-700 hover:text-red-500"
+                  >
+                    {name} ✕
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
+        {mentionHits.length > 0 && (
+          <div className="mb-1.5 flex flex-col rounded-md border border-border bg-panel-2 p-1 shadow-lg">
+            <span className="px-1.5 pb-0.5 text-[9px] font-semibold uppercase tracking-wide text-zinc-400">
+              Skills — @mention to activate
+            </span>
+            {mentionHits.map((n) => (
+              <button
+                key={n}
+                onClick={() => insertMention(n)}
+                className="rounded px-1.5 py-1 text-left text-[11.5px] text-zinc-700 hover:bg-accent/10 hover:text-accent"
+              >
+                <span className="font-mono">@{n}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {showingHints && (
           <div className="mb-1.5 flex flex-wrap gap-1">
             {SLASH_HINTS.map((s) => (
@@ -441,6 +608,33 @@ export default function ChatPanel(props: ChatPanelProps) {
           className="w-full resize-none rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[12.5px] text-ink outline-none placeholder:text-zinc-500 focus:border-accent/60 disabled:opacity-50"
         />
         <div className="mt-2 flex items-center justify-between">
+          {onAttachClick && (
+            <button
+              onClick={onAttachClick}
+              title="Attach a text file for semantic search (RAG)"
+              className="mr-1 rounded border border-border px-1.5 py-0.5 text-[11px] text-zinc-500 hover:border-accent/50 hover:text-accent"
+            >
+              📎
+            </button>
+          )}
+          <button
+            onClick={() => void toggleDictation()}
+            disabled={transcribing}
+            title={
+              transcribing
+                ? "Transcribing…"
+                : recording
+                  ? "Stop recording and transcribe"
+                  : "Dictate (requires local whisper + ffmpeg)"
+            }
+            className={`mr-1 rounded border px-1.5 py-0.5 text-[11px] transition-colors ${
+              recording
+                ? "border-red-400 bg-red-500/15 text-red-600"
+                : "border-border text-zinc-500 hover:border-accent/50 hover:text-accent"
+            } disabled:opacity-50`}
+          >
+            {recording ? "■" : transcribing ? "…" : "🎤"}
+          </button>
           {isStreaming ? (
             <button
               onClick={onCancel}

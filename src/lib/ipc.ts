@@ -3,14 +3,20 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type {
+  ApiServerStatus,
+  AttachedFileInfo,
   AuditEntry,
   ContextUsage,
+  DownloadedModel,
   GenParams,
   FileNode,
+  HfModel,
   KnowledgeReport,
+  McpServerConfig,
   ModelInfo,
   PolicySnapshot,
   RemoteModelConfig,
+  SessionProjectInfo,
   CheckpointInfo,
   ToolResultInfo,
 } from "../types";
@@ -84,6 +90,7 @@ const onStepEvent = "agent-step";
 const onSubtaskEvent = "agent-subtask";
 const onSkillsChangedEvent = "agent://skills-changed";
 const onPlanStepEvent = "agent://plan-step";
+const onTodoUpdateEvent = "agent://todo-update";
 
 export const api = {
   // ---- window chrome ----
@@ -145,6 +152,11 @@ export const api = {
   agentRespondPermission: (requestId: string, decision: string) =>
     tauriInvoke<void>("agent_respond_permission", { requestId, decision }),
   agentPolicySnapshot: () => tauriInvoke<PolicySnapshot>("agent_policy_snapshot"),
+  agentSetYolo: (on: boolean) => tauriInvoke<void>("agent_set_yolo", { on }),
+  agentGrantPath: (path: string, mode: "read" | "write") =>
+    tauriInvoke<void>("agent_grant_path", { path, mode }),
+  agentRevokePath: (path: string) =>
+    tauriInvoke<void>("agent_revoke_path", { path }),
 
   // ---- audit trail ----
   agentAuditLog: (limit?: number) =>
@@ -163,15 +175,66 @@ export const api = {
   knowledgeReport: () => tauriInvoke<KnowledgeReport>("knowledge_report_cmd"),
   skillSetActive: (name: string, active: boolean) =>
     tauriInvoke<KnowledgeReport>("skill_set_active", { name, active }),
+  skillInstall: (source: string, global: boolean) =>
+    tauriInvoke<KnowledgeReport>("skill_install", { source, global }),
+  skillUninstall: (name: string) =>
+    tauriInvoke<KnowledgeReport>("skill_uninstall", { name }),
+
+  // ---- MCP server catalog ----
+  mcpCatalogLoad: () =>
+    tauriInvoke<McpServerConfig[]>("mcp_catalog_load"),
+  mcpCatalogSave: (servers: McpServerConfig[]) =>
+    tauriInvoke<void>("mcp_catalog_save", { servers }),
+
+  // ---- Hugging Face hub ----
+  hfSearch: (query: string, limit = 20) =>
+    tauriInvoke<HfModel[]>("hf_search", { query, limit }),
+  hfDownloadModel: (repoId: string, fileName: string) =>
+    tauriInvoke<void>("hf_download_model", { repoId, fileName }),
+  hfCancelDownload: (repoId: string, fileName: string) =>
+    tauriInvoke<void>("hf_cancel_download", { repoId, fileName }),
+  listDownloadedModels: () =>
+    tauriInvoke<DownloadedModel[]>("list_downloaded_models"),
+  loadModelFromPath: (path: string) =>
+    tauriInvoke<ModelInfo>("load_model_from_path", { path }),
+
+  // ---- local OpenAI-compatible API server ----
+  apiServerStart: (port?: number) =>
+    tauriInvoke<ApiServerStatus>("api_server_start", { port }),
+  apiServerStop: () => tauriInvoke<ApiServerStatus>("api_server_stop"),
+  apiServerStatus: () => tauriInvoke<ApiServerStatus>("api_server_status"),
+
+  // ---- RAG attachments ----
+  agentAttachFile: (path: string) =>
+    tauriInvoke<AttachedFileInfo>("agent_attach_file", { path }),
+  agentDetachFile: (path: string) =>
+    tauriInvoke<void>("agent_detach_file", { path }),
+  agentListAttachments: () =>
+    tauriInvoke<AttachedFileInfo[]>("agent_list_attachments"),
+
+  // ---- voice dictation ----
+  voiceTranscribeData: (data: number[], ext?: string) =>
+    tauriInvoke<string>("voice_transcribe_data", { data, ext }),
 
   // ---- settings / session persistence ----
   settingsLoad: () => tauriInvoke<Record<string, unknown>>("settings_load"),
   settingsSave: (settings: Record<string, unknown>) =>
     tauriInvoke<void>("settings_save", { settings }),
-  sessionAppend: (project: string, record: Record<string, unknown>) =>
-    tauriInvoke<void>("session_append", { project, record }),
-  sessionLoad: (project: string) =>
-    tauriInvoke<Record<string, unknown>[]>("session_load", { project }),
+  sessionAppend: (
+    project: string,
+    record: Record<string, unknown>,
+    chatId?: string | null,
+  ) => tauriInvoke<void>("session_append", { project, record, chatId }),
+  sessionLoad: (project: string, chatId?: string | null) =>
+    tauriInvoke<Record<string, unknown>[]>("session_load", { project, chatId }),
+  sessionProjects: () =>
+    tauriInvoke<SessionProjectInfo[]>("session_projects"),
+  sessionDeleteChat: (project: string, chatId: string) =>
+    tauriInvoke<void>("session_delete_chat", { project, chatId }),
+
+  // ---- headless boot smoke (CI) ----
+  smokeActive: () => tauriInvoke<boolean>("smoke_active"),
+  smokeBootOk: () => tauriInvoke<void>("smoke_boot_ok"),
 
   // ---- engine events ----
   subscribeEngineEvents: async (handlers: EngineHandlers) => {
@@ -217,6 +280,9 @@ export const api = {
         : []),
       ...(handlers.onPlanStep
         ? [listen(onPlanStepEvent, (e) => handlers.onPlanStep!(parseEvent(e.payload)))]
+        : []),
+      ...(handlers.onTodoUpdate
+        ? [listen(onTodoUpdateEvent, (e) => handlers.onTodoUpdate!(parseEvent(e.payload)))]
         : []),
     ]);
     return () => {

@@ -151,24 +151,13 @@ const STALL_TIMEOUT_SECS: u64 = 90;
 const MAX_RETRIES: u32 = 2;
 
 /// Provider-reported (or estimated) token usage for one remote generation.
+#[derive(Default)]
 struct RemoteUsage {
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning_tokens: u64,
-}
-
-impl Default for RemoteUsage {
-    fn default() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
-        }
-    }
 }
 
 /// Exponential backoff for retry `attempt` (1st retry = 1s, 2nd = 2s).
@@ -187,9 +176,7 @@ fn retriable(status: reqwest::StatusCode) -> bool {
 /// Send a (already built, cloneable) request with bounded retries and backoff.
 /// Non-retriable failures still run through [`check_response`] for a readable
 /// error body.
-async fn send_with_retry(
-    builder: RequestBuilder,
-) -> Result<reqwest::Response, String> {
+async fn send_with_retry(builder: RequestBuilder) -> Result<reqwest::Response, String> {
     let mut attempt = 0u32;
     loop {
         let req = builder
@@ -449,7 +436,8 @@ impl TextGenerator for RemoteGenerator {
                     self.stream_chat(request, session_id, interrupt, tx).await
                 }
                 GenerationStyle::AnthropicMessages => {
-                    self.stream_anthropic(request, session_id, interrupt, tx).await
+                    self.stream_anthropic(request, session_id, interrupt, tx)
+                        .await
                 }
             }
         })?;
@@ -567,8 +555,8 @@ impl RemoteGenerator {
                 if data == "[DONE]" {
                     return Ok((full, usage, stop_reason));
                 }
-                let v: Value = serde_json::from_str(data)
-                    .map_err(|e| format!("Bad SSE payload: {e}"))?;
+                let v: Value =
+                    serde_json::from_str(data).map_err(|e| format!("Bad SSE payload: {e}"))?;
 
                 if v.get("usage").is_some() {
                     usage = usage_from_chat(&v, est_input, counted_output);
@@ -583,8 +571,11 @@ impl RemoteGenerator {
                 }
                 counted_output += 1;
                 full.push_str(delta);
-                tx.send(WorkerEvent::Token { session_id, delta: delta.to_string() })
-                    .map_err(|e| format!("Token stream channel closed: {e}"))?;
+                tx.send(WorkerEvent::Token {
+                    session_id,
+                    delta: delta.to_string(),
+                })
+                .map_err(|e| format!("Token stream channel closed: {e}"))?;
             }
         }
 
@@ -671,8 +662,8 @@ impl RemoteGenerator {
                 if data == "[DONE]" {
                     return Ok((full, usage, stop_reason));
                 }
-                let v: Value = serde_json::from_str(data)
-                    .map_err(|e| format!("Bad SSE payload: {e}"))?;
+                let v: Value =
+                    serde_json::from_str(data).map_err(|e| format!("Bad SSE payload: {e}"))?;
 
                 // Anthropic reports usage in two places: `message_start` carries
                 // input/cache tokens, `message_delta` carries the running output
@@ -693,8 +684,11 @@ impl RemoteGenerator {
                 }
                 counted_output += 1;
                 full.push_str(delta);
-                tx.send(WorkerEvent::Token { session_id, delta: delta.to_string() })
-                    .map_err(|e| format!("Token stream channel closed: {e}"))?;
+                tx.send(WorkerEvent::Token {
+                    session_id,
+                    delta: delta.to_string(),
+                })
+                .map_err(|e| format!("Token stream channel closed: {e}"))?;
             }
         }
 
