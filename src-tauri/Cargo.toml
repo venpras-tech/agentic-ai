@@ -41,6 +41,8 @@ tree-sitter = "0.24"
 tree-sitter-typescript = "0.23"
 similar = { version = "2.5", features = ["inline"] }
 regex = "1.11"
+# Local-time log timestamps (already in the dependency tree via tauri).
+chrono = "0.4"
 # OS Trash for `delete_file_or_folder` (Bionic §3.2): deletes are recoverable.
 trash = "5"
 # Pinned exactly: llama-cpp-2 explicitly does not follow semver, so a lockstep
@@ -50,6 +52,9 @@ trash = "5"
 # against the host toolchain; they must be enabled explicitly because they
 # change the compiled artifact and require a CUDA toolkit / Metal SDK.
 llama-cpp-2 = { version = "=0.1.154", default-features = false, features = ["common", "sampler"] }
+# Direct handle on the raw bindings so we can install our own llama.cpp log
+# callback (the wrapper only offers tracing, which this app does not run).
+llama-cpp-sys-2 = "=0.1.154"
 # macOS ships a Metal runtime on every supported machine, so wire the llama.cpp
 # Metal backend in automatically for Apple targets (feature list is repeated so
 # the platform override is self-contained either way).

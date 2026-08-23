@@ -5,6 +5,7 @@ mod agent;
 mod api_server;
 mod engine;
 mod hub;
+mod logging;
 mod remote;
 
 use std::collections::HashMap;
@@ -35,6 +36,9 @@ use tokio_util::sync::CancellationToken;
 struct InferenceState {
     pool: Mutex<Option<Arc<EnginePool>>>,
     info: Mutex<Option<ModelInfo>>,
+    /// Absolute path of the GGUF currently loaded (shown next to the
+    /// Load/Unload button); `None` when nothing is loaded.
+    loaded_path: Mutex<Option<String>>,
     worker_tx: Mutex<Option<crossbeam_channel::Sender<WorkerEvent>>>,
 }
 
@@ -43,6 +47,7 @@ impl Default for InferenceState {
         Self {
             pool: Mutex::new(None),
             info: Mutex::new(None),
+            loaded_path: Mutex::new(None),
             worker_tx: Mutex::new(None),
         }
     }
@@ -94,22 +99,49 @@ impl Default for ApiServerState {
 /// Frontend -> worker bridge. This channel is *bounded*: llama.cpp decode
 /// pauses when the webview cannot keep up, which is exactly the backpressure
 /// we want. The receiving loop forwards every event to the emitter task.
+///
+/// This loop is also the console-log observer: it mirrors every lifecycle
+/// event (first token, throttled streaming progress, steps, subtasks, tool
+/// results, completion stats, errors) to stderr so `tauri dev` / a terminal
+/// launch shows live LLM progress without touching the engine or UI code.
 fn spawn_emitter(app: AppHandle) -> crossbeam_channel::Sender<WorkerEvent> {
     let (tx, rx) = bounded::<WorkerEvent>(256);
     let app_sink = app.clone();
     std::thread::spawn(move || {
+        let mut streams: HashMap<u64, logging::StreamProgress> = HashMap::new();
         while let Ok(event) = rx.recv() {
             match event {
                 WorkerEvent::Token { session_id, delta } => {
+                    let chars = delta.chars().count() as u64;
+                    let progress = streams.entry(session_id).or_default();
+                    if let Some(line) = progress.record(chars) {
+                        logging::info(Some(session_id), "llm.stream", &line);
+                    }
                     let _ = app_sink.emit("inference-token", TokenEvent { session_id, delta });
                 }
                 WorkerEvent::Step { session_id, step } => {
+                    logging::info(
+                        Some(session_id),
+                        "llm.step",
+                        &format!(
+                            "step {} · {} · {} tok · {} ms · {} tool call(s)",
+                            step.step, step.group, step.tokens, step.elapsed_ms, step.tool_calls
+                        ),
+                    );
                     let _ = app_sink.emit("agent-step", StepEvent { session_id, step });
                 }
                 WorkerEvent::Subtask {
                     session_id,
                     subtask,
                 } => {
+                    logging::info(
+                        Some(session_id),
+                        "llm.subtask",
+                        &format!(
+                            "subtask {}/{} `{}` {}",
+                            subtask.index, subtask.total, subtask.title, subtask.status
+                        ),
+                    );
                     let _ = app_sink.emit(
                         "agent-subtask",
                         SubtaskEvent {
@@ -119,12 +151,34 @@ fn spawn_emitter(app: AppHandle) -> crossbeam_channel::Sender<WorkerEvent> {
                     );
                 }
                 WorkerEvent::Done { session_id, done } => {
+                    streams.remove(&session_id);
+                    logging::info(
+                        Some(session_id),
+                        "llm.done",
+                        &format!(
+                            "{} in {:.1} s — out={} tok ({:.1} tok/s) in={} cache_r={} cache_w={} reasoning={}",
+                            done.outcome,
+                            done.elapsed_ms as f64 / 1000.0,
+                            done.output_tokens,
+                            done.tokens_per_sec,
+                            done.input_tokens,
+                            done.cache_read_tokens,
+                            done.cache_write_tokens,
+                            done.reasoning_tokens
+                        ),
+                    );
                     let _ = app_sink.emit("inference-done", DoneEvent { session_id, done });
                 }
                 WorkerEvent::Error {
                     session_id,
                     message,
                 } => {
+                    streams.remove(&session_id);
+                    logging::error(
+                        Some(session_id),
+                        "llm.error",
+                        &logging::preview(&message, 300),
+                    );
                     let _ = app_sink.emit(
                         "inference-error",
                         ErrorEvent {
@@ -239,8 +293,11 @@ async fn install_local_model(
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
 
+    let load_started = std::time::Instant::now();
+    logging::info(None, "model", &format!("loading {} …", path.display()));
     let app_for_load = app.clone();
     let path_for_event = path.clone();
+    let path_for_state = path.display().to_string();
     let pool = tokio::task::spawn_blocking(move || {
         build_local_pool(&path, &params, event_tx, &app_for_load)
     })
@@ -258,6 +315,16 @@ async fn install_local_model(
     })?;
 
     let info = pool.info();
+    logging::info(
+        None,
+        "model",
+        &format!(
+            "loaded {} in {:.1}s",
+            info.name,
+            load_started.elapsed().as_secs_f32()
+        ),
+    );
+    *inference.loaded_path.lock().await = Some(path_for_state);
     let mut pool_guard = inference.pool.lock().await;
     let mut info_guard = inference.info.lock().await;
     *pool_guard = Some(Arc::new(pool));
@@ -288,6 +355,7 @@ async fn install_local_model(
     );
     let _ = app.emit("model-loaded", &info);
     let _ = app.emit("model-path", &path_for_event);
+    persist_model_path(&app, &path_for_event);
     Ok(info)
 }
 
@@ -414,6 +482,7 @@ async fn unload_model(
     api_state: State<'_, ApiServerState>,
 ) -> Result<(), String> {
     interrupt_state.trigger();
+    logging::info(None, "model", "unloading model …");
     let mut pool_guard = state.pool.lock().await;
     let mut info_guard = state.info.lock().await;
     *pool_guard = None;
@@ -421,6 +490,8 @@ async fn unload_model(
     drop(info_guard);
     drop(pool_guard);
     api_state.engine.set(None);
+    *state.loaded_path.lock().await = None;
+    logging::info(None, "model", "model unloaded");
     Ok(())
 }
 
@@ -429,6 +500,12 @@ async fn unload_model(
 async fn model_status(state: State<'_, InferenceState>) -> Result<Option<ModelInfo>, String> {
     let info_guard = state.info.lock().await;
     Ok(info_guard.clone())
+}
+
+/// Absolute GGUF path currently loaded, for display next to Load/Unload.
+#[tauri::command]
+async fn loaded_model_path(state: State<'_, InferenceState>) -> Result<Option<String>, String> {
+    Ok(state.loaded_path.lock().await.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +599,101 @@ async fn hf_cancel_download(
 #[tauri::command]
 async fn list_downloaded_models(app: AppHandle) -> Result<Vec<hub::DownloadedModel>, String> {
     Ok(hub::list_downloaded(&app_data_dir(&app).join("models")))
+}
+
+/// Replay the recent log lines so the webview Console window shows history
+/// captured before its listeners attached (startup, model auto-load, …).
+#[tauri::command]
+async fn console_history() -> Result<Vec<String>, String> {
+    Ok(logging::recent_lines())
+}
+
+/// Remember the last successfully loaded GGUF so future launches can restore
+/// it without re-picking (read-modify-write of `settings.json`; best-effort —
+/// a failure must never fail the model load itself).
+fn persist_model_path(app: &AppHandle, path: &Path) {
+    let dir = app_data_dir(app);
+    let file = dir.join("settings.json");
+    let mut settings: Value = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    let as_str = path.display().to_string();
+    if settings.get("modelPath").and_then(Value::as_str) == Some(as_str.as_str()) {
+        return;
+    }
+    settings["modelPath"] = json!(as_str);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        if let Ok(text) = serde_json::to_string_pretty(&settings) {
+            if std::fs::write(&file, text).is_ok() {
+                logging::info(None, "model", "saved default model path");
+            }
+        }
+    }
+}
+
+/// Startup convenience: load a model without user interaction.
+///
+/// Resolution order:
+///   1. `modelPath` persisted in `settings.json` (last successful load),
+///   2. any `*.gguf` previously downloaded through the HF browser,
+///   3. any `*.gguf` directly inside a `models/` folder next to the working
+///      directory (the dev-checkout layout, e.g. `D:\ai\models`).
+///
+/// Returns `Ok(None)` when nothing suitable exists — that is not an error,
+/// just a first-run state where the user still picks a model manually.
+#[tauri::command]
+async fn auto_load_model(
+    app: AppHandle,
+    state: State<'_, InferenceState>,
+    context_state: State<'_, ContextState>,
+    api_state: State<'_, ApiServerState>,
+) -> Result<Option<ModelInfo>, String> {
+    if state.pool.lock().await.is_some() {
+        return Ok(state.info.lock().await.clone());
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let saved: Option<String> = {
+        let file = app_data_dir(&app).join("settings.json");
+        std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| v.get("modelPath").and_then(Value::as_str).map(String::from))
+    };
+    if let Some(p) = saved {
+        candidates.push(PathBuf::from(p));
+    }
+    for m in hub::list_downloaded(&app_data_dir(&app).join("models")) {
+        candidates.push(PathBuf::from(m.path));
+    }
+    if let Ok(entries) = std::fs::read_dir(Path::new("models")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                candidates.push(p);
+            }
+        }
+    }
+
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        logging::info(None, "model", &format!("auto-loading {}", path.display()));
+        return install_local_model(
+            app,
+            &state,
+            &context_state,
+            Some(&api_state),
+            path,
+            ModelInitParams::default(),
+        )
+        .await
+        .map(Some);
+    }
+    logging::warn(None, "model", "no local GGUF found to auto-load");
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +852,22 @@ async fn stream_inference(
     let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
     let _ = app.emit("inference-started", StartedEvent { session_id });
+    logging::info(
+        Some(session_id),
+        "llm.request",
+        &format!(
+            "chat request · {} chars · max_tokens={} temp={:.2} top_p={:.2}{}",
+            request.prompt.chars().count(),
+            request.max_tokens,
+            request.temperature.unwrap_or(0.0),
+            request.top_p.unwrap_or(0.0),
+            if logging::prompt_preview_enabled() {
+                format!(" · prompt: {}", logging::preview(&request.prompt, 80))
+            } else {
+                String::new()
+            }
+        ),
+    );
 
     let tx = state
         .worker_tx
@@ -691,69 +879,23 @@ async fn stream_inference(
     let mut gen = pool.handle(0);
     let tx_clone = tx.clone();
 
-    // ---- Greeting shortcut for plain chat (non-agent) mode.
-    // Tiny models hallucinate random content for greetings.  Return a canned
-    // reply so the user gets something sensible without burning tokens.
-    {
-        let prompt_lower = request.prompt.trim().to_ascii_lowercase();
-        let bare = prompt_lower.trim_end_matches(['!', '.', '?', ',', ';', ':']);
-        let is_greet = matches!(
-            bare,
-            "hi" | "hello"
-                | "hey"
-                | "howdy"
-                | "sup"
-                | "yo"
-                | "hiya"
-                | "thanks"
-                | "thank you"
-                | "ty"
-                | "thx"
-                | "cheers"
-                | "bye"
-                | "goodbye"
-                | "see you"
-                | "see ya"
-        ) || (bare.split_whitespace().count() <= 2 && bare.len() <= 20);
-        if is_greet {
-            let reply = if bare.starts_with("bye")
-                || bare == "goodbye"
-                || bare == "see you"
-                || bare == "see ya"
-            {
-                "Goodbye! Feel free to come back anytime.".to_string()
-            } else if bare.starts_with("thank") || bare == "ty" || bare == "thx" || bare == "cheers"
-            {
-                "You're welcome! Let me know if you need anything else.".to_string()
-            } else {
-                "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
-            };
-            let _ = tx_clone.send(WorkerEvent::Token {
-                session_id,
-                delta: reply.clone(),
-            });
-            let _ = tx_clone.send(WorkerEvent::Done {
-                session_id,
-                done: engine::InferenceDone {
-                    total_tokens: 0,
-                    generated_chars: reply.len() as u64,
-                    tokens_per_sec: 0.0,
-                    elapsed_ms: 0,
-                    stop_reason: "done".into(),
-                    outcome: "completed".into(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    reasoning_tokens: 0,
-                },
-            });
-            return Ok(session_id);
-        }
-    }
-
     std::thread::spawn(move || {
         let result = gen.generate(&request, session_id, &interrupt, &tx_clone);
+        // Guard against silent empty generations: a completed run with zero
+        // output would leave the chat bubble empty and look like a hang.
+        if let Ok(outcome) = &result {
+            if outcome.done.generated_chars == 0 && outcome.done.stop_reason == "done" {
+                logging::warn(
+                    Some(session_id),
+                    "llm.request",
+                    "model returned an empty response",
+                );
+                let _ = tx_clone.send(WorkerEvent::Token {
+                    session_id,
+                    delta: "(the model returned an empty response — try rephrasing or loading a larger model)".to_string(),
+                });
+            }
+        }
         let _ = tx_clone.send(match result {
             Ok(outcome) => WorkerEvent::Done {
                 session_id,
@@ -788,6 +930,23 @@ async fn agent_run_task(
     let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
     let _ = app.emit("inference-started", StartedEvent { session_id });
+    logging::info(
+        Some(session_id),
+        "llm.request",
+        &format!(
+            "agent task · {} chars · max_steps={} plan_mode={} decompose={} verify={}{}",
+            request.prompt.chars().count(),
+            request.max_steps.unwrap_or(6),
+            request.plan_mode,
+            request.decompose,
+            request.verify,
+            if logging::prompt_preview_enabled() {
+                format!(" · prompt: {}", logging::preview(&request.prompt, 80))
+            } else {
+                String::new()
+            }
+        ),
+    );
 
     let tx = state
         .worker_tx
@@ -1908,6 +2067,20 @@ pub fn run() {
         .manage(ContextState::default())
         .manage(knowledge)
         .setup(|app| {
+            // Route every [BE]/[LLM] log line into (a) the rolling file
+            // appender under the app-data `logs/` dir and (b) the in-app
+            // Console window via a `console-log` event to the webview.
+            let handle = app.handle().clone();
+            let log_dir = app_data_dir(&handle).join("logs");
+            logging::init(
+                log_dir,
+                Box::new(move |line| {
+                    let _ = handle.emit("console-log", line.to_string());
+                }),
+            );
+            // Forward native llama.cpp/ggml logs (model load, KV cache,
+            // backend init) into the same pipeline.
+            engine::install_native_model_logs();
             build_tray(app)?;
             if smoke_enabled() {
                 // Watchdog: if the webview never reports a successful boot
@@ -1929,6 +2102,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pick_and_load_model,
             load_model_from_path,
+            auto_load_model,
+            console_history,
+            loaded_model_path,
             hf_search,
             hf_download_model,
             hf_cancel_download,

@@ -250,6 +250,10 @@ pub enum ToolCall {
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
+    /// Deterministic arithmetic evaluation — no subprocess, no approval.
+    /// Lets small models answer math reliably instead of guessing.
+    #[serde(rename_all = "camelCase")]
+    Calculate { expression: String },
 }
 
 impl ToolCall {
@@ -291,6 +295,7 @@ impl ToolCall {
             ToolCall::DownloadFile { .. } => "download_file",
             ToolCall::RunPython { .. } => "run_python",
             ToolCall::RunJavascript { .. } => "run_javascript",
+            ToolCall::Calculate { .. } => "calculate",
             ToolCall::ListMcpServers { .. } => "list_mcp_servers",
             ToolCall::AddMcpServer { .. } => "add_mcp_server",
             ToolCall::RemoveMcpServer { .. } => "remove_mcp_server",
@@ -404,6 +409,7 @@ impl ToolCall {
             }
             ToolCall::RunPython { .. } => "Running sandboxed Python…".into(),
             ToolCall::RunJavascript { .. } => "Running sandboxed JavaScript…".into(),
+            ToolCall::Calculate { expression } => format!("Calculating `{expression}`…"),
             ToolCall::ListMcpServers { .. } => "Listing MCP servers…".into(),
             ToolCall::AddMcpServer { name, .. } => {
                 format!("Adding MCP server `{name}`…")

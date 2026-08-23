@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
 import TitleBar from "./components/TitleBar";
 import MenuBar from "./components/MenuBar";
@@ -14,10 +14,22 @@ import PermissionModal from "./components/PermissionModal";
 import KnowledgePanel from "./components/KnowledgePanel";
 import SettingsModal from "./components/SettingsModal";
 import ConsolePanel from "./components/ConsolePanel";
+import ResizeHandle from "./components/ResizeHandle";
 import type { ConsoleEntry } from "./components/ConsolePanel";
 
 import { useEngineEvents } from "./hooks/useEngineEvents";
 import { useTokenStream } from "./hooks/useTokenStream";
+import { uiLog } from "./lib/uiLog";
+import {
+  parseBackendLine,
+  pushConsole,
+  subscribeConsole,
+} from "./lib/consoleBus";
+import { listen } from "@tauri-apps/api/event";
+import {
+  initialChatStatus,
+  reduceChatStatus,
+} from "./lib/chatStatus";
 import { api, isTauriRuntime } from "./lib/ipc";
 import { AGENT_SYSTEM_PROMPT } from "./lib/prompt";
 import type {
@@ -55,6 +67,10 @@ export default function App() {
   streamsRef.current = streams;
 
   const [model, setModel] = useState<ModelInfo | null>(null);
+  // GGUF path currently loaded (shown next to the Load/Unload button), plus
+  // the most recent local path so it stays visible while no model is loaded.
+  const [modelPath, setModelPath] = useState<string | null>(null);
+  const [lastLocalPath, setLastLocalPath] = useState<string | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState<number | null>(null);
   const [workspaceRoot, setWorkspaceRoot] = useState<string | null>(null);
@@ -95,6 +111,12 @@ export default function App() {
   >([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showConsole, setShowConsole] = useState(false);
+  // Adjustable pane sizes (drag the separator strips). Defaults mirror the
+  // old fixed classes: sidebar w-60, chat w-96, console h-48.
+  const [sidebarW, setSidebarW] = useState(240);
+  const [chatW, setChatW] = useState(384);
+  const [consoleH, setConsoleH] = useState(192);
+  const paneStarts = useRef({ sidebar: 240, chat: 384, console: 192 });
   const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([]);
   const [todos, setTodos] = useState<TodoUpdateEvent | null>(null);
   // BN-11 projects/chats sidebar: which left-rail view is active and which
@@ -103,6 +125,11 @@ export default function App() {
   const [leftView, setLeftView] = useState<"files" | "chats">("files");
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [chatsRefresh, setChatsRefresh] = useState(0);
+  // Chat turn lifecycle for the animated status line (lib/chatStatus.ts).
+  const [chatStatus, dispatchChatStatus] = useReducer(
+    reduceChatStatus,
+    initialChatStatus,
+  );
 
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
@@ -155,13 +182,22 @@ export default function App() {
   );
 
   useEngineEvents({
-    onToken: (e) => append(e.sessionId, e.delta),
+    onToken: (e) => {
+      append(e.sessionId, e.delta);
+      dispatchChatStatus({
+        type: "token",
+        sessionId: e.sessionId,
+        len: e.delta.length,
+        at: performance.now(),
+      });
+    },
     onStarted: (e) => {
       setActiveSessionId(e.sessionId);
       setIsStreaming(true);
       setError(null);
       setCurrentStep(null);
       sessionStartRef.current.set(e.sessionId, performance.now());
+      dispatchChatStatus({ type: "started", sessionId: e.sessionId, at: performance.now() });
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: "", sessionId: e.sessionId },
@@ -218,6 +254,7 @@ export default function App() {
         }, activeChatId)
         .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
+      dispatchChatStatus({ type: "done", sessionId: e.sessionId, at: performance.now() });
     },
     onError: (e) => {
       const text = streamsRef.current.get(e.sessionId) ?? "";
@@ -232,8 +269,16 @@ export default function App() {
       setActiveSessionId(null);
       setIsStreaming(false);
       setError(e.message);
+      dispatchChatStatus({ type: "error", message: e.message, at: performance.now() });
     },
     onTool: (e) => {
+      dispatchChatStatus({
+        type: "tool",
+        tool: e.tool,
+        status: e.status,
+        summary: e.summary,
+        at: performance.now(),
+      });
       if (activeSessionId == null) return;
       const sid = activeSessionId;
       setLedger((prev) => {
@@ -267,6 +312,13 @@ export default function App() {
     onStep: (e: StepEvent) => {
       setCurrentStep(e.step.step);
       sessionHasStepsRef.current.set(e.sessionId, true);
+      dispatchChatStatus({
+        type: "step",
+        sessionId: e.sessionId,
+        step: e.step.step,
+        group: e.step.group,
+        at: performance.now(),
+      });
       setMessages((prev) =>
         prev.map((m) =>
           m.sessionId === e.sessionId
@@ -302,6 +354,14 @@ export default function App() {
       });
     },
     onSubtask: (e: SubtaskEvent) => {
+      dispatchChatStatus({
+        type: "subtask",
+        index: e.subtask.index,
+        total: e.subtask.total,
+        title: e.subtask.title,
+        status: e.subtask.status,
+        at: performance.now(),
+      });
       if (e.subtask.status === "running") {
         setCurrentSubtask({
           index: e.subtask.index,
@@ -386,8 +446,14 @@ export default function App() {
         .then((k) => setKnowledge(k))
         .catch(() => {});
     },
-    onAborted: (e) => setError(e.message),
-    onPermission: setPermissionReq,
+    onAborted: (e) => {
+      setError(e.message);
+      dispatchChatStatus({ type: "error", message: e.message, at: performance.now() });
+    },
+    onPermission: (e) => {
+      setPermissionReq(e);
+      dispatchChatStatus({ type: "permission", tool: e.tool, at: performance.now() });
+    },
     onKnowledge: setKnowledge,
     onModelLoaded: setModel,
     onLoadProgress: (e) => {
@@ -403,6 +469,45 @@ export default function App() {
     },
   });
 
+  // Mirror backend/LLM console lines into the in-app Console window, and
+  // feed every console line (BE/LLM/UI) into the ConsolePanel entries.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let alive = true;
+    // Replay history first (startup banners, model auto-load), then attach
+    // the live listener — new lines after this point stream in real time.
+    api
+      .consoleHistory()
+      .then((lines) => {
+        if (!alive) return;
+        lines.forEach((l) => pushConsole(parseBackendLine(l)));
+        uiLog("console bridge ready — live log streaming active");
+      })
+      .catch(() => {});
+    const unlisten = listen<string>("console-log", (e) =>
+      pushConsole(parseBackendLine(e.payload)),
+    ).catch(() => () => {});
+    const unsubscribe = subscribeConsole((line) => {
+      setConsoleEntries((prev) => {
+        // Cap the ring so long agent runs can't grow memory unbounded.
+        const next: ConsoleEntry[] = [
+          ...prev,
+          {
+            tool: line.tool,
+            chunk: line.chunk,
+            ts: line.ts,
+          },
+        ];
+        return next.length > 800 ? next.slice(next.length - 800) : next;
+      });
+    });
+    return () => {
+      alive = false;
+      unlisten.then((fn) => fn());
+      unsubscribe();
+    };
+  }, []);
+
   useEffect(() => {
     if (!isTauriRuntime()) {
       setError(
@@ -411,7 +516,31 @@ export default function App() {
     }
     api
       .modelStatus()
-      .then((m) => setModel(m))
+      .then(async (m) => {
+        setModel(m);
+        // Root-cause fix for "chat does nothing": restore the last model (or
+        // auto-detect one in ./models) instead of erroring on every prompt
+        // with "No model loaded" until the user re-picks a file by hand.
+        if (!m) {
+          const info = await api.autoLoadModel().catch((e: unknown) => {
+            uiLog("auto-load failed:", e);
+            return null;
+          });
+          if (info) {
+            setModel(info);
+            api
+              .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+              .then(setUsage)
+              .catch(() => {});
+            refreshUsage();
+          }
+        } else {
+          api
+            .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+            .then(setUsage)
+            .catch(() => {});
+        }
+      })
       .catch(() => {});
     api
       .settingsLoad()
@@ -466,12 +595,25 @@ export default function App() {
     try {
       await api.unloadModel();
       setModel(null);
+      setModelPath(null);
       setMessages([]);
       setLastDone(null);
     } catch (e) {
       setError(String(e));
     }
   }, []);
+
+  // Keep the displayed GGUF path in sync with the backend's load state.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    api
+      .loadedModelPath()
+      .then((p) => {
+        setModelPath(p);
+        if (p) setLastLocalPath(p);
+      })
+      .catch(() => {});
+  }, [model]);
 
   const connectRemote = useCallback(async (config: RemoteModelConfig) => {
     try {
@@ -793,6 +935,7 @@ export default function App() {
     ) => {
       const trimmed = text.trim();
       if (!trimmed || isStreaming) return;
+      dispatchChatStatus({ type: "submit", at: performance.now() });
       setPendingPlan(null);
       setCurrentSubtask(null);
       // @-mentions activate the referenced skills for this turn (and beyond).
@@ -834,7 +977,9 @@ export default function App() {
           });
         }
       } catch (e) {
-        setError(String(e));
+        const message = String(e);
+        setError(message);
+        dispatchChatStatus({ type: "error", message, at: performance.now() });
       }
     },
     [activeChatId, genParams, isStreaming, runAgentTask, knowledge],
@@ -868,6 +1013,7 @@ export default function App() {
     setCurrentStep(null);
     setLedger([]);
     setTodos(null);
+    dispatchChatStatus({ type: "reset", at: performance.now() });
   }, []);
 
   // ---- BN-11: projects/chats sidebar ----
@@ -936,6 +1082,8 @@ export default function App() {
       />
       <ModelBar
         model={model}
+        path={modelPath}
+        lastPath={lastLocalPath}
         loading={modelLoading}
         progress={loadProgress}
         isStreaming={isStreaming}
@@ -948,7 +1096,10 @@ export default function App() {
         onConnectRemote={connectRemote}
       />
       <div className="flex min-h-0 flex-1">
-        <div className="flex w-60 shrink-0 flex-col border-r border-border bg-panel">
+        <div
+          className="flex shrink-0 flex-col border-r border-border bg-panel"
+          style={{ width: sidebarW, minWidth: 160, maxWidth: 520 }}
+        >
           <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-1.5">
             {(
               [
@@ -1024,6 +1175,13 @@ export default function App() {
             />
           )}
         </div>
+        <ResizeHandle
+          axis="x"
+          onDragStart={() => (paneStarts.current.sidebar = sidebarW)}
+          onDelta={(d) =>
+            setSidebarW(Math.min(520, Math.max(160, paneStarts.current.sidebar + d)))
+          }
+        />
         <div className="flex min-w-0 flex-1 flex-col">
           <Tabs
             files={files}
@@ -1035,11 +1193,20 @@ export default function App() {
             <EditorPane file={activeFile} onContentChange={updateContent} />
           </div>
         </div>
+        <ResizeHandle
+          axis="x"
+          onDragStart={() => (paneStarts.current.chat = chatW)}
+          onDelta={(d) =>
+            setChatW(Math.min(720, Math.max(300, paneStarts.current.chat - d)))
+          }
+        />
         <ChatPanel
+          width={chatW}
           messages={messages}
           streams={streams}
           activeSessionId={activeSessionId}
           isStreaming={isStreaming}
+          status={chatStatus}
           lastDone={lastDone}
           modelName={model?.name ?? null}
           agentMode={agentMode}
@@ -1083,9 +1250,19 @@ export default function App() {
           onOpenSkills={() => setShowKnowledge(true)}
         />
       </div>
+      {showConsole && (
+        <ResizeHandle
+          axis="y"
+          onDragStart={() => (paneStarts.current.console = consoleH)}
+          onDelta={(d) =>
+            setConsoleH(Math.min(520, Math.max(96, paneStarts.current.console - d)))
+          }
+        />
+      )}
       <ConsolePanel
         entries={consoleEntries}
         visible={showConsole}
+        height={consoleH}
         onClear={() => setConsoleEntries([])}
       />
       <StatusBar

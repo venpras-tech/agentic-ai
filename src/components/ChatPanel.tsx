@@ -8,7 +8,9 @@ import type {
   TodoUpdateEvent,
 } from "../types";
 import DiffView from "./DiffView";
+import StatusIndicator from "./StatusIndicator";
 import { api } from "../lib/ipc";
+import type { ChatStatus } from "../lib/chatStatus";
 
 export interface SendOptions {
   planMode?: boolean;
@@ -18,9 +20,13 @@ export interface SendOptions {
 
 interface ChatPanelProps {
   messages: ChatMessage[];
+  /** Draggable pane width in px; falls back to the old fixed w-96. */
+  width?: number;
   streams: ReadonlyMap<number, string>;
   activeSessionId: number | null;
   isStreaming: boolean;
+  /** Animated turn-lifecycle state (see lib/chatStatus.ts). */
+  status: ChatStatus;
   lastDone: InferenceDone | null;
   modelName: string | null;
   agentMode: boolean;
@@ -235,6 +241,7 @@ export default function ChatPanel(props: ChatPanelProps) {
     streams,
     activeSessionId,
     isStreaming,
+    status,
     lastDone,
     modelName,
     agentMode,
@@ -256,6 +263,7 @@ export default function ChatPanel(props: ChatPanelProps) {
     onApprovePlan,
     onRejectPlan,
     onOpenSkills,
+    width,
     todos,
   } = props;
   const [input, setInput] = useState("");
@@ -391,7 +399,10 @@ export default function ChatPanel(props: ChatPanelProps) {
   };
 
   return (
-    <aside className="flex w-96 min-w-80 shrink-0 flex-col border-l border-border bg-panel">
+    <aside
+      className="flex min-w-0 shrink-0 flex-col border-l border-border bg-panel"
+      style={width != null ? { width, minWidth: 300, maxWidth: 720 } : undefined}
+    >
       <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           Assistant
@@ -533,6 +544,8 @@ export default function ChatPanel(props: ChatPanelProps) {
           <TodoCard todos={todos} />
         </div>
       )}
+
+      <StatusIndicator status={status} />
 
       <footer className="shrink-0 border-t border-border p-2">
         {attachments.length > 0 && (

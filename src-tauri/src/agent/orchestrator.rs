@@ -247,38 +247,6 @@ pub fn run_agent_loop_pool(
 
     let started = Instant::now();
 
-    // ---- Greeting / small-talk interceptor.
-    // Tiny models (0.5 B) often hallucinate random content when the system
-    // prompt is long.  Detect trivial greetings and return a canned reply so
-    // the user gets a sensible response without burning tokens.
-    if let Some(last_user) = messages.last() {
-        if last_user.role == "user" && is_greeting(&last_user.content) {
-            let reply = greeting_reply(&last_user.content);
-            let elapsed = started.elapsed().as_millis() as u64;
-            let _ = tx.send(WorkerEvent::Token {
-                session_id,
-                delta: reply.clone(),
-            });
-            let _ = tx.send(WorkerEvent::Done {
-                session_id,
-                done: InferenceDone {
-                    total_tokens: 0,
-                    generated_chars: reply.len() as u64,
-                    tokens_per_sec: 0.0,
-                    elapsed_ms: elapsed,
-                    stop_reason: "done".into(),
-                    outcome: "completed".into(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    reasoning_tokens: 0,
-                },
-            });
-            return finish_outcome(started, 0, 0, 0, 0, 0, reply.len() as u64, "done".into());
-        }
-    }
-
     let mut total_tokens = 0u64;
     let mut input_tokens = 0u64;
     let mut cache_read_tokens = 0u64;
@@ -1440,66 +1408,6 @@ fn truncate(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     text.chars().take(limit).collect()
-}
-
-/// Returns `true` when `input` is a trivial greeting, thank-you, or farewell
-/// that should be answered conversationally without invoking the model.
-fn is_greeting(input: &str) -> bool {
-    let trimmed = input
-        .trim()
-        .trim_end_matches(['!', '.', '?', ',', ';', ':']);
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "hi" | "hello"
-            | "hey"
-            | "howdy"
-            | "sup"
-            | "yo"
-            | "hiya"
-            | "greetings"
-            | "thanks"
-            | "thank you"
-            | "ty"
-            | "thx"
-            | "cheers"
-            | "bye"
-            | "goodbye"
-            | "see you"
-            | "see ya"
-            | "good night"
-            | "gn"
-            | "how are you"
-            | "how r u"
-            | "what's up"
-            | "whats up"
-            | "wsg"
-    ) || trimmed.split_whitespace().count() <= 2 && trimmed.len() <= 20
-}
-
-/// Pick a short, friendly reply for a detected greeting.
-fn greeting_reply(input: &str) -> String {
-    let lower = input.trim().to_ascii_lowercase();
-    if lower.starts_with("bye")
-        || lower == "goodbye"
-        || lower == "see you"
-        || lower == "see ya"
-        || lower == "good night"
-        || lower == "gn"
-    {
-        "Goodbye! Feel free to come back anytime.".to_string()
-    } else if lower.starts_with("thank") || lower == "ty" || lower == "thx" || lower == "cheers" {
-        "You're welcome! Let me know if you need anything else.".to_string()
-    } else if lower.starts_with("how are")
-        || lower == "sup"
-        || lower == "what's up"
-        || lower == "whats up"
-        || lower == "wsg"
-    {
-        "I'm doing great, thanks! Ready to help with your code. What would you like to work on?"
-            .to_string()
-    } else {
-        "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
-    }
 }
 
 #[cfg(test)]

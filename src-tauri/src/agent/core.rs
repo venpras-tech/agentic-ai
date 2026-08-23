@@ -177,6 +177,14 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     );
     m.insert("list_mcp_servers", json_schema(vec![]));
     m.insert(
+        "calculate",
+        json_schema(vec![prop(
+            "expression",
+            "string",
+            "Arithmetic expression to evaluate: numbers, + - * / % ^, parentheses. Example: \"(2+3)*4\".",
+        )]),
+    );
+    m.insert(
         "add_mcp_server",
         json_schema(vec![
             prop(

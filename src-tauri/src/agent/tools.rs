@@ -335,6 +335,15 @@ pub async fn dispatch(
         ToolCall::RunJavascript { code, timeout_secs } => {
             run_javascript(state, &interrupt, code, *timeout_secs).await
         }
+        ToolCall::Calculate { expression } => match eval_arithmetic(expression) {
+            Ok(value) => Ok(ToolResult::ok(
+                "calculate",
+                format!("{expression} = {value}"),
+                Some(value.to_string()),
+                None,
+            )),
+            Err(e) => Err(format!("calculate: {e}")),
+        },
         ToolCall::ListMcpServers {} => list_mcp_servers(app).await,
         ToolCall::AddMcpServer { name, bin, args } => add_mcp_server(app, name, bin, args).await,
         ToolCall::RemoveMcpServer { name } => remove_mcp_server(app, state, name).await,
@@ -463,6 +472,11 @@ async fn ask_approval(
         let mut reqs = state.permission_requests.lock().await;
         reqs.insert(request_id.to_string(), tx);
     }
+    crate::logging::warn(
+        None,
+        "tool.permission",
+        &format!("waiting for approval — {tool}: {summary}"),
+    );
     let _ = app.emit(
         "agent://permission-request",
         PermissionRequestEvent {
@@ -488,12 +502,30 @@ async fn ask_approval(
     reqs.remove(request_id);
 
     match rcvd {
-        Rcvd::Decision(PermissionDecision::AllowOnce) => AskOutcome::GrantedOnce,
-        Rcvd::Decision(PermissionDecision::AllowSession) => AskOutcome::GrantedSession,
-        Rcvd::Decision(PermissionDecision::AlwaysAllow) => AskOutcome::GrantedAlways,
-        Rcvd::Decision(PermissionDecision::Deny) => AskOutcome::Declined,
-        Rcvd::TimedOut => AskOutcome::TimedOut,
-        Rcvd::Aborted => AskOutcome::Aborted,
+        Rcvd::Decision(PermissionDecision::AllowOnce) => {
+            crate::logging::info(None, "tool.permission", "allowed (once)");
+            AskOutcome::GrantedOnce
+        }
+        Rcvd::Decision(PermissionDecision::AllowSession) => {
+            crate::logging::info(None, "tool.permission", "allowed (session)");
+            AskOutcome::GrantedSession
+        }
+        Rcvd::Decision(PermissionDecision::AlwaysAllow) => {
+            crate::logging::info(None, "tool.permission", "allowed (always)");
+            AskOutcome::GrantedAlways
+        }
+        Rcvd::Decision(PermissionDecision::Deny) => {
+            crate::logging::warn(None, "tool.permission", "denied by user");
+            AskOutcome::Declined
+        }
+        Rcvd::TimedOut => {
+            crate::logging::warn(None, "tool.permission", "timed out");
+            AskOutcome::TimedOut
+        }
+        Rcvd::Aborted => {
+            crate::logging::warn(None, "tool.permission", "aborted");
+            AskOutcome::Aborted
+        }
     }
 }
 
@@ -594,6 +626,30 @@ fn emit_file_changed(app: &AppHandle, path: &str, kind: &str, before: &str, afte
 
 fn emit(app: &AppHandle, event: &AgentToolEvent) {
     let _ = app.emit("agent://tool-event", event);
+    // Console mirror of the tool lifecycle (see `logging`): one line per
+    // state transition so background agent work is visible in the terminal.
+    match event.status.as_str() {
+        "running" => crate::logging::info(
+            None,
+            "tool",
+            &format!("▶ {} — {}", event.tool, event.summary),
+        ),
+        "done" => crate::logging::info(
+            None,
+            "tool",
+            &format!("✓ {} ({} ms)", event.tool, event.duration_ms.unwrap_or(0)),
+        ),
+        _ => crate::logging::warn(
+            None,
+            "tool",
+            &format!(
+                "✖ {} ({}) {}",
+                event.tool,
+                event.status,
+                event.detail.as_deref().unwrap_or("failed")
+            ),
+        ),
+    }
 }
 
 async fn resolve_root(state: &ToolState, root: Option<&str>) -> Result<PathBuf, String> {
@@ -4211,9 +4267,223 @@ async fn run_javascript(
     ))
 }
 
+/// Deterministic arithmetic evaluator for the `calculate` tool: a tiny
+/// recursive-descent parser over `+ - * / % ^`, parentheses, unary minus and
+/// f64 literals. No subprocess, no approval gate — safe for ROUTINE policy.
+pub(crate) fn eval_arithmetic(expr: &str) -> Result<f64, String> {
+    #[derive(Clone, Copy)]
+    enum Tok<'a> {
+        Num(f64),
+        Op(char),
+        LParen,
+        RParen,
+        Ident(&'a str),
+    }
+
+    fn tokenize(src: &str) -> Result<Vec<Tok<'_>>, String> {
+        let b: Vec<char> = src.chars().collect();
+        let mut toks = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                c if c.is_whitespace() => i += 1,
+                '+' | '-' | '*' | '/' | '%' | '^' => {
+                    toks.push(Tok::Op(b[i]));
+                    i += 1;
+                }
+                '(' => {
+                    toks.push(Tok::LParen);
+                    i += 1;
+                }
+                ')' => {
+                    toks.push(Tok::RParen);
+                    i += 1;
+                }
+                c if c.is_ascii_digit() || c == '.' => {
+                    let start = i;
+                    while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
+                        i += 1;
+                    }
+                    let text: String = b[start..i].iter().collect();
+                    let n = text
+                        .parse::<f64>()
+                        .map_err(|_| format!("invalid number `{text}`"))?;
+                    toks.push(Tok::Num(n));
+                }
+                c if c.is_alphabetic() => {
+                    // Constants only; anything else is rejected so the model
+                    // cannot smuggle code into an arithmetic-only tool.
+                    let start = i;
+                    while i < b.len() && b[i].is_alphanumeric() {
+                        i += 1;
+                    }
+                    toks.push(Tok::Ident(&src[start..i]));
+                }
+                other => return Err(format!("unexpected character `{other}`")),
+            }
+        }
+        Ok(toks)
+    }
+
+    fn ident_value(name: &str) -> Option<f64> {
+        match name.to_ascii_lowercase().as_str() {
+            "pi" => Some(std::f64::consts::PI),
+            "e" => Some(std::f64::consts::E),
+            _ => None,
+        }
+    }
+
+    struct Parser<'a> {
+        toks: &'a [Tok<'a>],
+        pos: usize,
+    }
+
+    impl Parser<'_> {
+        fn peek(&self) -> Option<&Tok<'_>> {
+            self.toks.get(self.pos)
+        }
+        fn next(&mut self) -> Option<&Tok<'_>> {
+            let t = self.toks.get(self.pos);
+            if t.is_some() {
+                self.pos += 1;
+            }
+            t
+        }
+
+        // expr := term (('+'|'-') term)*
+        fn expr(&mut self) -> Result<f64, String> {
+            let mut v = self.term()?;
+            loop {
+                match self.peek() {
+                    Some(Tok::Op('+')) => {
+                        self.next();
+                        v += self.term()?;
+                    }
+                    Some(Tok::Op('-')) => {
+                        self.next();
+                        v -= self.term()?;
+                    }
+                    _ => return Ok(v),
+                }
+            }
+        }
+
+        // term := unary (('*'|'/'|'%') unary)*
+        fn term(&mut self) -> Result<f64, String> {
+            let mut v = self.unary()?;
+            loop {
+                match self.peek() {
+                    Some(Tok::Op('*')) => {
+                        self.next();
+                        v *= self.unary()?;
+                    }
+                    Some(Tok::Op('/')) => {
+                        self.next();
+                        let d = self.unary()?;
+                        if d == 0.0 {
+                            return Err("division by zero".into());
+                        }
+                        v /= d;
+                    }
+                    Some(Tok::Op('%')) => {
+                        self.next();
+                        let d = self.unary()?;
+                        if d == 0.0 {
+                            return Err("modulo by zero".into());
+                        }
+                        v %= d;
+                    }
+                    _ => return Ok(v),
+                }
+            }
+        }
+
+        // unary := ('-'|'+')* power
+        fn unary(&mut self) -> Result<f64, String> {
+            if matches!(self.peek(), Some(Tok::Op('-'))) {
+                self.next();
+                return Ok(-self.unary()?);
+            }
+            if matches!(self.peek(), Some(Tok::Op('+'))) {
+                self.next();
+                return self.unary();
+            }
+            self.power()
+        }
+
+        // power := atom ('^' unary)?   (right-associative)
+        fn power(&mut self) -> Result<f64, String> {
+            let base = self.atom()?;
+            if matches!(self.peek(), Some(Tok::Op('^'))) {
+                self.next();
+                return Ok(base.powf(self.unary()?));
+            }
+            Ok(base)
+        }
+
+        fn atom(&mut self) -> Result<f64, String> {
+            match self.next() {
+                Some(Tok::Num(n)) => Ok(*n),
+                Some(Tok::Ident(name)) => {
+                    ident_value(name).ok_or_else(|| format!("unknown constant `{name}`"))
+                }
+                Some(Tok::LParen) => {
+                    let v = self.expr()?;
+                    match self.next() {
+                        Some(Tok::RParen) => Ok(v),
+                        _ => Err("missing closing parenthesis".into()),
+                    }
+                }
+                _ => Err("expected a number or `(`".into()),
+            }
+        }
+    }
+
+    let toks = tokenize(expr)?;
+    if toks.is_empty() {
+        return Err("empty expression".into());
+    }
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+    };
+    let value = p.expr()?;
+    if p.pos != toks.len() {
+        return Err(format!(
+            "trailing input at token {} of {}",
+            p.pos + 1,
+            toks.len()
+        ));
+    }
+    if !value.is_finite() {
+        return Err("result is not finite".into());
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arithmetic_evaluates_with_precedence() {
+        assert_eq!(eval_arithmetic("2+3"), Ok(5.0));
+        assert_eq!(eval_arithmetic("2 + 3 * 4"), Ok(14.0));
+        assert_eq!(eval_arithmetic("(2+3)*4"), Ok(20.0));
+        assert_eq!(eval_arithmetic("2^3^2"), Ok(512.0)); // right-assoc
+        assert_eq!(eval_arithmetic("-5+10"), Ok(5.0));
+        assert_eq!(eval_arithmetic("10 % 3"), Ok(1.0));
+        assert_eq!(eval_arithmetic("pi"), Ok(std::f64::consts::PI));
+    }
+
+    #[test]
+    fn arithmetic_rejects_garbage() {
+        assert!(eval_arithmetic("").is_err());
+        assert!(eval_arithmetic("1/0").is_err());
+        assert!(eval_arithmetic("(1+2").is_err());
+        assert!(eval_arithmetic("std::env").is_err());
+        assert!(eval_arithmetic("__import__").is_err());
+    }
 
     #[test]
     fn sem_tokens_splits_identifiers_and_drops_stopwords() {

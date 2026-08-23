@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::logging;
 use crossbeam_channel::Sender;
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -27,6 +28,41 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+/// C callback that forwards native llama.cpp / ggml log output into our
+/// logging pipeline so model loads surface in the Console window and the
+/// rolling `.log` file instead of vanishing into raw stderr.
+extern "C" fn native_model_log(
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::os::raw::c_char,
+    _user: *mut std::ffi::c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    let chunk = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    for line in chunk.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        match level {
+            llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => logging::error(None, "model", line),
+            llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => logging::warn(None, "model", line),
+            _ => logging::info(None, "model", line),
+        }
+    }
+}
+
+/// Route all native llama.cpp and ggml logs through [`logging`]. Call once at
+/// startup, before any model load; nothing else ever overwrites the hook.
+pub fn install_native_model_logs() {
+    unsafe {
+        llama_cpp_sys_2::llama_log_set(Some(native_model_log), std::ptr::null_mut());
+        // GGML must be set after llama: setting llama resets ggml too.
+        llama_cpp_sys_2::ggml_log_set(Some(native_model_log), std::ptr::null_mut());
+    }
+}
 
 /// A loaded GGUF model, its context and the owned llama backend.
 ///

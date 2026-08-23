@@ -117,6 +117,7 @@ export const api = {
   }) => tauriInvoke<string[]>("list_remote_models", { config }),
   unloadModel: () => tauriInvoke<void>("unload_model"),
   modelStatus: () => tauriInvoke<ModelInfo | null>("model_status"),
+  loadedModelPath: () => tauriInvoke<string | null>("loaded_model_path"),
   streamInference: (request: StreamInferenceRequest) =>
     tauriInvoke<number>("stream_inference", { request }),
   cancelInference: () => tauriInvoke<void>("cancel_inference"),
@@ -197,6 +198,9 @@ export const api = {
     tauriInvoke<DownloadedModel[]>("list_downloaded_models"),
   loadModelFromPath: (path: string) =>
     tauriInvoke<ModelInfo>("load_model_from_path", { path }),
+  autoLoadModel: () =>
+    tauriInvoke<ModelInfo | null>("auto_load_model"),
+  consoleHistory: () => tauriInvoke<string[]>("console_history"),
 
   // ---- local OpenAI-compatible API server ----
   apiServerStart: (port?: number) =>

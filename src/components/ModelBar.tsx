@@ -10,6 +10,10 @@ import type {
 
 interface ModelBarProps {
   model: ModelInfo | null;
+  /** Absolute path of the currently loaded GGUF (local models only). */
+  path?: string | null;
+  /** Most recent local GGUF path — stays visible while nothing is loaded. */
+  lastPath?: string | null;
   loading: boolean;
   progress: number | null;
   isStreaming: boolean;
@@ -133,7 +137,9 @@ function formatBytes(n: number): string {
 }
 
 export default function ModelBar(props: ModelBarProps) {
-  const { model, loading, progress, isStreaming, params, initialRemote, onParamsChange, onLoad, onUnload, onCancel, onConnectRemote } = props;
+  const { model, path, lastPath, loading, progress, isStreaming, params, initialRemote, onParamsChange, onLoad, onUnload, onCancel, onConnectRemote } = props;
+
+  const fileName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? p;
   const [showRemote, setShowRemote] = useState(false);
   const [providerId, setProviderId] = useState(
     initialRemote?.provider ?? DEFAULT_PROVIDER.id,
@@ -258,6 +264,14 @@ export default function ModelBar(props: ModelBarProps) {
           >
             Unload
           </button>
+          {path && (
+            <span
+              title={path}
+              className="max-w-72 truncate rounded bg-zinc-500/10 px-2 py-0.5 text-[10px] text-zinc-500"
+            >
+              {path}
+            </span>
+          )}
           <div className="mx-1 h-6 w-px bg-border" />
         </>
       ) : (
@@ -269,6 +283,14 @@ export default function ModelBar(props: ModelBarProps) {
           >
             {loading ? "Loading model…" : "Load GGUF Model"}
           </button>
+          {!loading && lastPath && (
+            <span
+              title={lastPath}
+              className="max-w-72 truncate rounded bg-zinc-500/10 px-2 py-0.5 text-[10px] text-zinc-500"
+            >
+              last: {fileName(lastPath)}
+            </span>
+          )}
           <button
             onClick={() => setShowRemote((v) => !v)}
             className="rounded border border-border px-3 py-1.5 text-[12px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"

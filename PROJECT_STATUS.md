@@ -1,9 +1,160 @@
 # Project Status — AI Editor
 
-_Last updated: 2026-08-22 (**boot-smoke root cause fixed**: `custom-protocol`
-feature; smoke + live-GGUF verified end-to-end). This file is the source of
-truth for the session's progress. Read it at session start; update it whenever
-milestones change. Strategic plan: see `ROADMAP.md`._
+_Last updated: 2026-08-23 (**agentic chat fixes shipped** — model auto-load on
+startup, small-talk hijack fix, `calculate` tool, UI/BE/LLM console tags; all
+gates green). This file is the source of truth for the session's progress.
+Read it at session start; update it whenever milestones change. Strategic
+plan: see `ROADMAP.md`._
+
+---
+
+## ✅ SHIPPED — Unified console pipeline: in-app Console window + rolling file appender
+
+- `logging.rs`: `init(dir, sink)` called from the Tauri setup hook. Every
+  `[BE]`/`[LLM]` line now goes to **stderr + rolling file + webview**.
+  File format: `{app-data}/logs/ai_editor_{ddMMyyyy}_{HHmmssSSS}.{ZZZZ}.log`
+  with a 100 MB size-based roller (`.0001` → `.0002` …); unwritable dir falls
+  back to stderr-only.
+- Webview mirror: each line is emitted as a `console-log` Tauri event;
+  new `src/lib/consoleBus.ts` funnels backend lines (`parseBackendLine`) and
+  frontend lines (`uiLog` now publishes too) into App state rendered by the
+  existing ConsolePanel (800-entry ring cap). Filter box matches on tag/phase.
+
+### Verification
+- clippy zero warnings · cargo test 76 passed · fmt ✓ · tsc ✓ · build ✓ ·
+  14 vitest ✓
+
+---
+
+## ✅ SHIPPED — Agentic chat diagnosis + fixes (greeting path, auto-load, calculate tool)
+
+### Diagnosis
+1. **Root cause of "chat does nothing, even to Hello":** no model was loaded
+   at startup and nothing restored one. Every prompt hit the
+   `ok_or("No model loaded")` guard before any event reached the UI.
+2. **Small-talk interceptors were too greedy:** both `main.rs` (plain chat)
+   and `agent/orchestrator.rs` (agent loop) matched ANY ≤ 2-word prompt under
+   ~20 chars, so real queries like `2+3` or `Calculate 5+7` got a canned
+   "Hi there!" instead of model/tool execution.
+
+### Fixes (2026-08-23)
+- **Model auto-load:** new `auto_load_model` command (`main.rs`) resolves a
+  model without user interaction: saved `settings.json:modelPath` → HF-
+  downloaded models → `./models/*.gguf` next to the working dir. Successful
+  loads persist their path via `persist_model_path` inside
+  `install_local_model`. Frontend calls it once when `model_status` is empty
+  (`App.tsx`), then pushes `AGENT_SYSTEM_PROMPT`.
+- **Shared small-talk module** `src-tauri/src/agent/smalltalk.rs`: vocabulary-
+  gated detection (lead word must be hi/hello/hey/thanks/bye/… or exact
+  phrase) with length caps; both call sites now delegate to it; duplicate
+  logic removed from orchestrator.
+- **`calculate` tool** for deterministic math ("What is 2+3?"): new
+  `ToolCall::Calculate` variant + pure recursive-descent evaluator
+  (`eval_arithmetic`: + - * / % ^ parens unary-minus pi/e; rejects division
+  by zero / unknown identifiers), schema registered in `core.rs`; policy
+  allows it as a non-path ROUTINE tool by default.
+- **Console source tags:** Rust log lines now carry `[LLM]` / `[BE]` tags
+  (`logging.rs`); webview logs emit `[UI]` via new dev-only `src/lib/uiLog.ts`,
+  wired into StatusIndicator phase transitions.
+
+### Changed files
+- NEW `src-tauri/src/agent/smalltalk.rs`, NEW `src/lib/uiLog.ts`
+- `src-tauri/src/main.rs` · `src-tauri/src/logging.rs` ·
+  `src-tauri/src/agent/{mod,orchestrator,tools,core}.rs`
+- `src/App.tsx` · `src/lib/ipc.ts` · `src/components/StatusIndicator.tsx`
+
+### Verification
+- `cargo fmt --check` ✓ · clippy zero warnings ✓ · **76 tests passed**
+  (incl. smalltalk negatives "Calculate 5+7"/"2+3", arithmetic precedence,
+  serde-tagged dispatch) · `npx tsc --noEmit` ✓ · `npm run build` ✓ ·
+  14 vitest tests ✓
+- Manual: `npm run tauri:dev` → model auto-loads → "Hello" gets canned reply
+  instantly → agent-mode "Calculate 5+7" runs the real loop → terminal shows
+  interleaved `[UI] [BE] [LLM]` lines.
+
+---
+
+## ✅ SHIPPED — LLM lifecycle console logs + animated chat status indicator
+
+### What changed this pass (2026-08-23)
+
+**1. Backend console logging (`src-tauri/src/logging.rs`, new)**
+- Timestamped structured logger to stderr: `[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL]
+  [sess N] [  phase] message` (UTC, Hinnant civil-from-days; no new deps).
+- Phases: `llm.request` (command entry: char counts + gen params, opt-in
+  80-char prompt preview), `llm.stream` (first-token latency then ≥2 s /
+  ≥512-char throttled progress via `StreamProgress`), `llm.step`,
+  `llm.subtask`, `llm.done` (outcome, elapsed, all token counters),
+  `llm.error`; tool lifecycle mirrored from `tools.rs::emit` (`▶ / ✓ / ✖`)
+  plus `tool.permission` request/decision lines in `ask_approval`.
+- Privacy: prompts are never logged unless `AI_EDITOR_LOG_PROMPTS=1`;
+  errors truncated to 300 chars. 6 unit tests.
+
+**2. Wiring (`main.rs`)**
+- `spawn_emitter` now owns a per-session `HashMap<u64, StreamProgress>` and
+  logs every `WorkerEvent` variant as it forwards to the webview.
+- Entry-point logs added to `stream_inference` (+ greeting-shortcut note)
+  and `agent_run_task`.
+
+**3. Frontend status machine (`src/lib/chatStatus.ts`, new)**
+- Pure reducer over the turn lifecycle:
+  `idle → sending → thinking → streaming ⇄ working → complete | error`
+  driven by a typed `ChatStatusEvent` union; stale hints (>45 s quiet,
+  >10 s unacked submit) surface "still running — see Console".
+- `StatusIndicator.tsx` (new): accessible (`role="status"`,
+  `aria-live="polite"`, sr-only announcement) animated line between the
+  timeline and composer — spinner while thinking/working, bouncing dots
+  while streaming, green ✓ auto-hides after ~3.5 s, red ✕ on error.
+- Wired in `App.tsx` (`useReducer` + dispatches from every engine event
+  handler, submit/catch/reset) and rendered by `ChatPanel.tsx`
+  (new required prop `status`).
+
+**4. Tests**
+- `src/lib/chatStatus.test.ts`: 14 vitest tests covering the transition
+  graph, stale thresholds, session-id guards, and view derivation.
+- `package.json`: `vitest` devDep + `"test": "vitest run"` script.
+
+### Changed files (this pass)
+- NEW `src-tauri/src/logging.rs` · NEW `src/lib/chatStatus.ts` ·
+  NEW `src/components/StatusIndicator.tsx` · NEW `src/lib/chatStatus.test.ts`
+- `src-tauri/src/main.rs` · `src-tauri/src/agent/tools.rs` ·
+  `src/App.tsx` · `src/components/ChatPanel.tsx` · `package.json`
+
+### Verification (this pass)
+- `cargo fmt --check` clean · `cargo check` clean · `cargo clippy
+  --all-targets` zero warnings · `cargo test` 70 passed / 1 ignored
+- `npx tsc --noEmit` exit 0 · `npm run build` green · `npm test` 14 passed
+
+---
+
+## ✅ SHIPPED — Lekshan removal + stale-artifact purge, builds green
+
+### What changed this pass (2026-08-23)
+
+**1. Lekshan secondary-window feature fully excised**
+- Audit found the source tree already clean (`MenuBar.tsx` menu item +
+  `open_lekshan` invoke, `main.rs` command, `vite.config.ts` /
+  `tsconfig.json` entries, `lekshan.html`, `src-tauri/capabilities/lekshan.json`
+  all previously removed; `src-lekshan/` gone).
+- `PROJECT_STATUS.md`: dropped the stale `src-lekshan/*` changed-files
+  references from the boot-smoke pass log below.
+- Stale artifact purge: `dist/` regenerated via a fresh production build
+  (the previous `dist/assets/main-DJoGCe1M.js` bundle still embedded the
+  "Open Lekshan…" menu entry); `src-tauri/gen/schemas/capabilities.json`
+  confirmed to contain only the `default` capability.
+- Remaining `target/` mentions are inert build-cache leftovers (old `.d` dep
+  files / superseded build-dir `capabilities.json`) that cargo regenerates on
+  rebuild and never reads from old hash dirs.
+
+### Changed files (this pass)
+- `PROJECT_STATUS.md` — this log + `src-lekshan` references scrubbed
+- `dist/` — rebuilt from clean sources
+
+### Verification (this pass)
+- `npm run build` green (tsc exit 0 · vite build ✓)
+- `cargo check` clean
+- Grep sweep: no `lekshan` matches in `src/`, `src-tauri/src`,
+  `src-tauri/gen`, `src-tauri/capabilities`, `dist/`, or root docs
 
 ---
 
@@ -32,9 +183,6 @@ milestones change. Strategic plan: see `ROADMAP.md`._
 - `.github/workflows/ci.yml` — boot-smoke builds with the feature
 - `src-tauri/src/main.rs` — `smoke_fail` command (registered)
 - `index.html` / `src/main.tsx` — boot-failure reporters
-- `src-lekshan/components/PermissionSheet.tsx` (new),
-  `src-lekshan/components/Transcript.tsx` (TodoCard, OutcomeBadge, DoneMeta),
-  `src-lekshan/App.tsx` (permission/todo wiring)
 - Docs: `PROJECT_STATUS.md` / `ROADMAP.md`
 
 ### Verification (this pass)
