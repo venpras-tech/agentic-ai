@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Per-session streaming text buffers.
@@ -12,6 +12,14 @@ export function useTokenStream() {
   const pending = useRef(new Map<number, string>());
   const committed = useRef(new Map<number, string>());
   const scheduled = useRef(false);
+  const rafId = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (rafId.current != null) cancelAnimationFrame(rafId.current);
+    },
+    [],
+  );
 
   const flush = useCallback(() => {
     scheduled.current = false;
@@ -29,7 +37,7 @@ export function useTokenStream() {
       pending.current.set(sessionId, current + delta);
       if (!scheduled.current) {
         scheduled.current = true;
-        requestAnimationFrame(flush);
+        rafId.current = requestAnimationFrame(flush);
       }
     },
     [flush],

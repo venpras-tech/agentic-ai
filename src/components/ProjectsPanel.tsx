@@ -50,6 +50,7 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
   const [projects, setProjects] = useState<SessionProjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState("");
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -105,8 +106,16 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
     [onDeleteChat],
   );
 
-  const renderChats = (p: SessionProjectInfo) =>
-    p.chats.map((chat) => {
+  const renderChats = (p: SessionProjectInfo) => {
+    const q = search.toLowerCase();
+    const filtered = q
+      ? p.chats.filter(
+          (c) =>
+            c.title.toLowerCase().includes(q) ||
+            (c.id && c.id.toLowerCase().includes(q)),
+        )
+      : p.chats;
+    return filtered.map((chat) => {
       const isActive =
         p.name === (workspaceRoot ?? "default") &&
         (chat.id || null) === activeChatId;
@@ -152,6 +161,7 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
         </div>
       );
     });
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -167,6 +177,14 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
         >
           + New chat
         </button>
+      </div>
+      <div className="shrink-0 border-b border-border px-2 py-1">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search chats…"
+          className="w-full rounded border border-border bg-panel-2 px-2 py-0.5 text-[11px] text-ink outline-none placeholder:text-zinc-400 focus:border-accent/60"
+        />
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-1.5 py-1.5">
         {loading ? (

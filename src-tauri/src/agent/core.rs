@@ -500,6 +500,165 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
             prop_opt("timeout_secs", "integer", "Execution timeout in seconds (default 30, max 120)."),
         ]),
     );
+    m.insert(
+        "task",
+        json_schema(vec![
+            prop_opt(
+                "subagent_type",
+                "string",
+                "Specialist profile: `explore` (read-only codebase recon), `implement` (one focused change + verify) or `review` (adversarial read-only review). Defaults to `explore`.",
+            ),
+            prop(
+                "task",
+                "string",
+                "Single self-contained instruction for the subagent. It cannot see your conversation — include every file path, symbol and detail it needs. Finish yourself with a plain-text summary of its report; do not echo it verbatim.",
+            ),
+            prop_opt(
+                "model_override",
+                "string",
+                "Optional model override for this subagent: a GGUF file path (local model) or `remote` (use the current remote provider). Enables architect mode — route planning to a large model and implementation to a smaller one.",
+            ),
+        ]),
+    );
+    m.insert(
+        "git_blame",
+        json_schema(vec![
+            prop(
+                "path",
+                "string",
+                "File to blame (relative to the workspace root).",
+            ),
+            prop_opt(
+                "start_line",
+                "integer",
+                "First 1-based line of the range to blame.",
+            ),
+            prop_opt(
+                "end_line",
+                "integer",
+                "Last 1-based line of the range to blame.",
+            ),
+        ]),
+    );
+    m.insert(
+        "git_push",
+        json_schema(vec![
+            prop_opt("remote", "string", "Remote name (default `origin`)."),
+            prop_opt(
+                "branch",
+                "string",
+                "Branch to push (default: current branch).",
+            ),
+            prop_opt(
+                "set_upstream",
+                "boolean",
+                "Push with `-u` to set upstream tracking — use for the first push of a new branch.",
+            ),
+        ]),
+    );
+    m.insert("git_pull", json_schema(vec![]));
+    m.insert(
+        "git_create_branch",
+        json_schema(vec![prop(
+            "name",
+            "string",
+            "New branch name; creates it AND switches to it (`git switch -c`). Refuses if it already exists.",
+        )]),
+    );
+    m.insert("git_pr_status", json_schema(vec![]));
+    m.insert("git_ci_status", json_schema(vec![]));
+    m.insert(
+        "create_pr",
+        json_schema(vec![
+            prop("title", "string", "Pull-request title."),
+            prop_opt("body", "string", "Pull-request description (Markdown)."),
+        ]),
+    );
+    m.insert(
+        "summarize_changes",
+        json_schema(vec![]),
+    );
+    m.insert(
+        "read_lints",
+        json_schema(vec![prop(
+            "path",
+            "string",
+            "File to lint (relative or absolute). Reports syntax errors for JS/TS/JSX/TSX, TODO/FIXME/HACK/XXX comment markers for any text file, empty catch blocks and stray `debugger` statements.",
+        )]),
+    );
+    m.insert(
+        "view_repo_map",
+        json_schema(vec![
+            prop_opt(
+                "top_n",
+                "integer",
+                "Number of most-relevant symbols/files to return (default 60, max 300).",
+            ),
+            prop_opt(
+                "root",
+                "string",
+                "Optional directory to scope the map to (defaults to the workspace root).",
+            ),
+        ]),
+    );
+    m.insert(
+        "suggest_skills",
+        json_schema(vec![
+            prop(
+                "prompt",
+                "string",
+                "The task description to match skills against (e.g. the user's request).",
+            ),
+            prop_opt(
+                "path",
+                "string",
+                "Optional active file path; skills whose globs match it rank first.",
+            ),
+        ]),
+    );
+    m.insert(
+        "ask_question",
+        json_schema(vec![
+            prop(
+                "question",
+                "string",
+                "The question to ask the user. Be specific; include context so they can answer without scrolling back.",
+            ),
+            prop_opt(
+                "choices",
+                "array",
+                "2-4 preset short answers shown as buttons. The user can always type a custom answer instead.",
+            ),
+        ]),
+    );
+    m.insert(
+        "send_to_user",
+        json_schema(vec![prop(
+            "message",
+            "string",
+            "A short message meant for the human user (status notes, decisions taken, heads-ups). Not a substitute for your final report.",
+        )]),
+    );
+    m.insert(
+        "tree_sitter_query",
+        json_schema(vec![
+            prop(
+                "path",
+                "string",
+                "Absolute path to the source file to query (JS/TS/TSX/JSX supported).",
+            ),
+            prop(
+                "query",
+                "string",
+                "A tree-sitter S-expression query pattern. Use @name captures to extract specific nodes. Example: `(function_declaration name: (identifier) @fn_name)`. Use `_.field` for field access, `(node_type)` for type matching, and alternatives like `(a|b)` for union patterns.",
+            ),
+            prop_opt(
+                "max_results",
+                "integer",
+                "Maximum number of matches to return (default 50, max 200).",
+            ),
+        ]),
+    );
     m
 }
 
@@ -568,5 +727,130 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name(), "execute_terminal_command");
         assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn parses_task_call_with_and_without_profile() {
+        let md = "<execute_tool>{\"type\":\"task\",\"subagentType\":\"review\",\"task\":\"Review src/main.rs for bugs\"}</execute_tool>";
+        let calls = parse_tool_calls(md, &mut |_| {});
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            ToolCall::Task {
+                subagent_type,
+                task,
+                ..
+            } => {
+                assert_eq!(subagent_type.as_deref(), Some("review"));
+                assert_eq!(task, "Review src/main.rs for bugs");
+            }
+            other => panic!("expected Task, got {}", other.name()),
+        }
+
+        // Profile omitted → None (defaults to explore at dispatch).
+        let calls = parse_tool_calls(
+            "<execute_tool>{\"type\":\"task\",\"task\":\"Map the repo\"}</execute_tool>",
+            &mut |_| {},
+        );
+        match &calls[0] {
+            ToolCall::Task { subagent_type, .. } => assert_eq!(*subagent_type, None),
+            other => panic!("expected Task, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn task_schema_lists_only_task_props() {
+        let schema = tool_schemas().get("task").cloned().unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "task");
+        assert!(schema["properties"]["subagent_type"].is_object());
+    }
+
+    #[test]
+    fn parses_ask_question_with_and_without_choices() {
+        let calls = parse_tool_calls(
+            "<execute_tool>{\"type\":\"ask_question\",\"question\":\"Postgres or SQLite?\",\"choices\":[\"Postgres\",\"SQLite\"]}</execute_tool>",
+            &mut |_| {},
+        );
+        match &calls[0] {
+            ToolCall::AskQuestion { question, choices } => {
+                assert_eq!(question, "Postgres or SQLite?");
+                assert_eq!(
+                    choices.as_deref(),
+                    Some(&["Postgres".to_string(), "SQLite".to_string()][..])
+                );
+            }
+            other => panic!("expected AskQuestion, got {}", other.name()),
+        }
+        let calls = parse_tool_calls(
+            "<execute_tool>{\"type\":\"ask_question\",\"question\":\"Proceed?\"}</execute_tool>",
+            &mut |_| {},
+        );
+        match &calls[0] {
+            ToolCall::AskQuestion { choices, .. } => assert_eq!(*choices, None),
+            other => panic!("expected AskQuestion, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn parses_new_git_and_lint_calls() {
+        let cases = [
+            (
+                "{\"type\":\"git_blame\",\"path\":\"src/lib.ts\",\"startLine\":10,\"endLine\":40}",
+                "git_blame",
+            ),
+            ("{\"type\":\"git_push\",\"branch\":\"feat/x\"}", "git_push"),
+            ("{\"type\":\"git_pull\"}", "git_pull"),
+            (
+                "{\"type\":\"git_create_branch\",\"name\":\"feat/y\"}",
+                "git_create_branch",
+            ),
+            ("{\"type\":\"git_pr_status\"}", "git_pr_status"),
+            ("{\"type\":\"git_ci_status\"}", "git_ci_status"),
+            (
+                "{\"type\":\"create_pr\",\"title\":\"T\",\"body\":\"B\"}",
+                "create_pr",
+            ),
+            (
+                "{\"type\":\"read_lints\",\"path\":\"a/b.rs\"}",
+                "read_lints",
+            ),
+            (
+                "{\"type\":\"send_to_user\",\"message\":\"hi\"}",
+                "send_to_user",
+            ),
+        ];
+        for (payload, expected) in cases {
+            let md = format!("<execute_tool>{payload}</execute_tool>");
+            let calls = parse_tool_calls(&md, &mut |_| {});
+            assert_eq!(calls.len(), 1, "case {expected}");
+            assert_eq!(calls[0].name(), expected);
+        }
+    }
+
+    #[test]
+    fn new_tool_schemas_registered() {
+        let schemas = tool_schemas();
+        for name in [
+            "git_blame",
+            "git_push",
+            "git_pull",
+            "git_create_branch",
+            "git_pr_status",
+            "git_ci_status",
+            "create_pr",
+            "read_lints",
+            "ask_question",
+            "send_to_user",
+        ] {
+            assert!(schemas.contains_key(name), "missing schema for {name}");
+        }
+        // ask_question requires only `question`; git_blame only `path`.
+        let aq = schemas.get("ask_question").cloned().unwrap();
+        assert_eq!(aq["required"].as_array().unwrap().len(), 1);
+        assert_eq!(aq["required"][0], "question");
+        assert!(aq["properties"]["choices"].is_object());
+        let blame = schemas.get("git_blame").cloned().unwrap();
+        assert_eq!(blame["required"][0], "path");
     }
 }

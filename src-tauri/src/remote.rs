@@ -12,12 +12,13 @@
 //! The API key lives in memory only — it is never written to disk. Streaming
 //! races the circuit breaker; an abort drops the HTTP connection immediately.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -694,5 +695,462 @@ impl RemoteGenerator {
 
         usage.output_tokens = usage.output_tokens.max(counted_output);
         Ok((full, usage, stop_reason))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider registry & role-based routing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderRole {
+    Planner,
+    Editor,
+    Autocomplete,
+    Embed,
+}
+
+impl ProviderRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Planner => "planner",
+            Self::Editor => "editor",
+            Self::Autocomplete => "autocomplete",
+            Self::Embed => "embed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "editor" => Self::Editor,
+            "autocomplete" => Self::Autocomplete,
+            "embed" => Self::Embed,
+            _ => Self::Planner,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    Local,
+    OpenAI,
+    Ollama,
+    OpenRouter,
+    Anthropic,
+    Google,
+    LmStudio,
+    DeepSeek,
+    Xai,
+    Groq,
+    Mistral,
+    Custom,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::OpenAI => "openai",
+            Self::Ollama => "ollama",
+            Self::OpenRouter => "openrouter",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::LmStudio => "lmstudio",
+            Self::DeepSeek => "deepseek",
+            Self::Xai => "xai",
+            Self::Groq => "groq",
+            Self::Mistral => "mistral",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "local" => Self::Local,
+            "openai" => Self::OpenAI,
+            "ollama" => Self::Ollama,
+            "openrouter" => Self::OpenRouter,
+            "anthropic" => Self::Anthropic,
+            "google" => Self::Google,
+            "lmstudio" => Self::LmStudio,
+            "deepseek" => Self::DeepSeek,
+            "xai" => Self::Xai,
+            "groq" => Self::Groq,
+            "mistral" => Self::Mistral,
+            _ => Self::Custom,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Local => "Local (GGUF)",
+            Self::OpenAI => "OpenAI",
+            Self::Ollama => "Ollama",
+            Self::OpenRouter => "OpenRouter",
+            Self::Anthropic => "Anthropic (Claude)",
+            Self::Google => "Google Gemini",
+            Self::LmStudio => "LM Studio",
+            Self::DeepSeek => "DeepSeek",
+            Self::Xai => "xAI (Grok)",
+            Self::Groq => "Groq",
+            Self::Mistral => "Mistral",
+            Self::Custom => "Custom (OpenAI-compatible)",
+        }
+    }
+
+    pub fn requires_api_key(&self) -> bool {
+        !matches!(self, Self::Local | Self::Ollama | Self::LmStudio)
+    }
+
+    pub fn generation_style(&self) -> GenerationStyle {
+        match self {
+            Self::Anthropic => GenerationStyle::AnthropicMessages,
+            _ => GenerationStyle::ChatCompletions,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A single provider entry in the registry: identity, connection details, and
+/// which roles it serves. `Local` providers need no base_url/api_key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub kind: ProviderKind,
+    /// `None` for Local providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// `None` for providers that don't need a key (Local, Ollama, LmStudio).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Model identifier, e.g. `gpt-4o-mini`, `qwen3:8b`.
+    pub model: String,
+    #[serde(default)]
+    pub roles: Vec<ProviderRole>,
+    /// Assumed context size for eviction; defaults to 128k when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<u32>,
+}
+
+impl ProviderConfig {
+    pub fn local(model: impl Into<String>) -> Self {
+        Self {
+            id: "local".into(),
+            name: "Local GGUF".into(),
+            kind: ProviderKind::Local,
+            base_url: None,
+            api_key: None,
+            model: model.into(),
+            roles: vec![ProviderRole::Planner, ProviderRole::Editor],
+            context_size: None,
+        }
+    }
+
+    pub fn remote(
+        kind: ProviderKind,
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: kind.as_str().into(),
+            name: name.into(),
+            kind,
+            base_url: Some(base_url.into()),
+            api_key: Some(api_key.into()),
+            model: model.into(),
+            roles: Vec::new(),
+            context_size: None,
+        }
+    }
+
+    /// Build a [`RemoteModelConfig`] suitable for passing to
+    /// [`RemoteGenerator::new`]. Returns `Err` for Local providers.
+    pub fn to_remote_model_config(&self) -> Result<RemoteModelConfig, String> {
+        if self.kind == ProviderKind::Local {
+            return Err("Local providers cannot produce a RemoteModelConfig".into());
+        }
+        let base_url = self
+            .base_url
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        if base_url.is_empty() {
+            return Err(format!("Provider '{}' has no base_url", self.id));
+        }
+        Ok(RemoteModelConfig {
+            provider: self.kind.as_str().into(),
+            base_url,
+            api_key: self.api_key.clone().unwrap_or_default(),
+            model: self.model.clone(),
+            context_size: self.context_size,
+        })
+    }
+}
+
+/// A registry of known providers and a role → provider mapping.
+///
+/// Default construction mirrors today's single-local + optional-remote setup so
+/// `main.rs` can adopt the registry incrementally without breaking.
+pub struct ProviderRegistry {
+    providers: Vec<ProviderConfig>,
+    role_map: HashMap<ProviderRole, String>,
+}
+
+impl ProviderRegistry {
+    /// Empty registry (no providers).
+    pub fn new() -> Self {
+        Self {
+            providers: Vec::new(),
+            role_map: HashMap::new(),
+        }
+    }
+
+    /// Create a registry from a single local + optional remote, matching the
+    /// current single-provider behaviour exactly.
+    pub fn with_defaults(
+        local_model: &str,
+        remote: Option<RemoteModelConfig>,
+    ) -> Self {
+        let mut reg = Self::new();
+        let mut local = ProviderConfig::local(local_model);
+        local.roles = vec![ProviderRole::Planner, ProviderRole::Editor];
+        reg.add_provider(local);
+        if let Some(rc) = remote {
+            let kind = ProviderKind::from_str(&rc.provider);
+            let remote_cfg = ProviderConfig::remote(
+                kind,
+                kind.label(),
+                &rc.base_url,
+                &rc.api_key,
+                &rc.model,
+            );
+            reg.add_provider(remote_cfg);
+        }
+        reg
+    }
+
+    pub fn add_provider(&mut self, config: ProviderConfig) {
+        if let Some(existing) = self.providers.iter_mut().find(|p| p.id == config.id) {
+            existing.roles = config.roles.clone();
+            existing.base_url = config.base_url.clone();
+            existing.api_key = config.api_key.clone();
+            existing.model = config.model.clone();
+            existing.name = config.name.clone();
+            existing.kind = config.kind;
+            existing.context_size = config.context_size;
+        } else {
+            self.providers.push(config);
+        }
+    }
+
+    pub fn remove_provider(&mut self, id: &str) -> bool {
+        let before = self.providers.len();
+        self.providers.retain(|p| p.id != id);
+        if self.providers.len() < before {
+            self.role_map.retain(|_, pid| pid != id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_role_provider(&mut self, role: ProviderRole, provider_id: impl Into<String>) {
+        self.role_map.insert(role, provider_id.into());
+    }
+
+    pub fn clear_role(&mut self, role: ProviderRole) {
+        self.role_map.remove(&role);
+    }
+
+    pub fn providers(&self) -> &[ProviderConfig] {
+        &self.providers
+    }
+
+    pub fn get_provider(&self, id: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Return the provider assigned to `role`. Falls back in order:
+    /// 1. Explicit role → provider mapping
+    /// 2. First provider that lists `role` in its `roles` vec
+    /// 3. First provider in the list (convention: local)
+    pub fn route(&self, role: ProviderRole) -> Option<&ProviderConfig> {
+        if let Some(pid) = self.role_map.get(&role) {
+            if let Some(p) = self.providers.iter().find(|p| &p.id == pid) {
+                return Some(p);
+            }
+        }
+        if let Some(p) = self.providers.iter().find(|p| p.roles.contains(&role)) {
+            return Some(p);
+        }
+        self.providers.first()
+    }
+}
+
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn default_route_falls_back_to_first_provider() {
+        let reg = ProviderRegistry::with_defaults("qwen-0.5b", None);
+        let p = reg.route(ProviderRole::Planner).expect("should route");
+        assert_eq!(p.kind, ProviderKind::Local);
+        assert_eq!(p.model, "qwen-0.5b");
+    }
+
+    #[test]
+    fn explicit_role_mapping_takes_priority() {
+        let mut reg = ProviderRegistry::with_defaults("qwen-0.5b", None);
+        let remote = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-4o-mini",
+        );
+        let remote_id = remote.id.clone();
+        reg.add_provider(remote);
+        reg.set_role_provider(ProviderRole::Editor, &remote_id);
+
+        let editor = reg.route(ProviderRole::Editor).expect("editor routed");
+        assert_eq!(editor.kind, ProviderKind::OpenAI);
+        assert_eq!(editor.model, "gpt-4o-mini");
+
+        let planner = reg.route(ProviderRole::Planner).expect("planner routed");
+        assert_eq!(planner.kind, ProviderKind::Local);
+    }
+
+    #[test]
+    fn role_in_config_roles_is_used_when_no_explicit_mapping() {
+        let mut reg = ProviderRegistry::new();
+        let mut local = ProviderConfig::local("mymodel");
+        local.roles = vec![ProviderRole::Planner];
+        reg.add_provider(local);
+
+        let mut remote = ProviderConfig::remote(
+            ProviderKind::OpenRouter,
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            "sk-or-xxx",
+            "anthropic/claude-sonnet",
+        );
+        remote.roles = vec![ProviderRole::Editor, ProviderRole::Autocomplete];
+        reg.add_provider(remote);
+
+        let planner = reg.route(ProviderRole::Planner).expect("planner");
+        assert_eq!(planner.id, "local");
+
+        let editor = reg.route(ProviderRole::Editor).expect("editor");
+        assert_eq!(editor.id, "openrouter");
+
+        let autocomplete = reg.route(ProviderRole::Autocomplete).expect("ac");
+        assert_eq!(autocomplete.id, "openrouter");
+
+        let embed = reg.route(ProviderRole::Embed).expect("embed fallback");
+        assert_eq!(embed.id, "local");
+    }
+
+    #[test]
+    fn add_and_remove_provider() {
+        let mut reg = ProviderRegistry::with_defaults("qwen", None);
+        assert_eq!(reg.providers().len(), 1);
+
+        let remote = ProviderConfig::remote(
+            ProviderKind::Ollama,
+            "Ollama",
+            "http://localhost:11434/v1",
+            "",
+            "llama3:8b",
+        );
+        reg.add_provider(remote);
+        assert_eq!(reg.providers().len(), 2);
+
+        assert!(reg.remove_provider("ollama"));
+        assert_eq!(reg.providers().len(), 1);
+        assert!(!reg.remove_provider("nonexistent"));
+    }
+
+    #[test]
+    fn to_remote_model_config_round_trips_correctly() {
+        let cfg = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "sk-abc",
+            "gpt-4o",
+        );
+        let rmc = cfg.to_remote_model_config().expect("conversion");
+        assert_eq!(rmc.base_url, "https://api.openai.com/v1");
+        assert_eq!(rmc.api_key, "sk-abc");
+        assert_eq!(rmc.model, "gpt-4o");
+        assert_eq!(rmc.provider, "openai");
+    }
+
+    #[test]
+    fn local_provider_cannot_become_remote_model_config() {
+        let cfg = ProviderConfig::local("model.gguf");
+        assert!(cfg.to_remote_model_config().is_err());
+    }
+
+    #[test]
+    fn empty_registry_returns_none() {
+        let reg = ProviderRegistry::new();
+        assert!(reg.route(ProviderRole::Planner).is_none());
+    }
+
+    #[test]
+    fn provider_kind_from_str_and_as_str_roundtrip() {
+        for kind in [
+            ProviderKind::Local,
+            ProviderKind::OpenAI,
+            ProviderKind::Ollama,
+            ProviderKind::OpenRouter,
+            ProviderKind::Anthropic,
+            ProviderKind::Google,
+            ProviderKind::LmStudio,
+            ProviderKind::DeepSeek,
+            ProviderKind::Xai,
+            ProviderKind::Groq,
+            ProviderKind::Mistral,
+            ProviderKind::Custom,
+        ] {
+            assert_eq!(ProviderKind::from_str(kind.as_str()), kind);
+        }
+    }
+
+    #[test]
+    fn provider_role_from_str_and_as_str_roundtrip() {
+        for role in [
+            ProviderRole::Planner,
+            ProviderRole::Editor,
+            ProviderRole::Autocomplete,
+            ProviderRole::Embed,
+        ] {
+            assert_eq!(ProviderRole::from_str(role.as_str()), role);
+        }
     }
 }

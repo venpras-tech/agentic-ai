@@ -16,6 +16,8 @@ export interface GenParams {
   nGpuLayers: number;
   temperature: number;
   topP: number;
+  /** Repetition penalty (1 = off); suppresses degenerate token loops. */
+  repeatPenalty: number;
   maxTokens: number;
 }
 
@@ -24,6 +26,37 @@ export interface RemoteModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+}
+
+export type ProviderRole =
+  | "planner"
+  | "editor"
+  | "autocomplete"
+  | "embed";
+
+export type ProviderKind =
+  | "local"
+  | "openai"
+  | "ollama"
+  | "openrouter"
+  | "anthropic"
+  | "google"
+  | "lmstudio"
+  | "deepseek"
+  | "xai"
+  | "groq"
+  | "mistral"
+  | "custom";
+
+export interface ProviderConfig {
+  id: string;
+  name: string;
+  kind: ProviderKind;
+  baseUrl?: string;
+  apiKey?: string;
+  model: string;
+  roles: ProviderRole[];
+  contextSize?: number;
 }
 
 export interface RemoteProviderPreset {
@@ -40,6 +73,8 @@ export interface ChatMessage {
   role: "user" | "assistant" | "error";
   content: string;
   sessionId?: number;
+  /** Wall-clock completion time (ms epoch); persisted for exports. */
+  ts?: number;
   tools?: AgentToolEvent[];
   /** Per-step telemetry for this turn (plan / subtask / execute phases). */
   steps?: StepTimelineStep[];
@@ -57,13 +92,24 @@ export interface AgentToolEvent {
   startedAt: number;
   durationMs?: number;
   detail?: string;
+  /** @deprecated not emitted by the backend; kept for legacy hydration. */
   output?: string;
+  /** Owning agent session (from the backend) — pins the event to its turn. */
+  sessionId: number;
+  /**
+   * Client-side anchor: character offset into the turn's streamed text at
+   * which this call fired. Used to interleave tool cards INLINE between
+   * paragraphs instead of stacking them after the finished text.
+   */
+  atChar?: number;
 }
 
 export interface FileChangedEvent {
   path: string;
   kind: "write" | "diff";
   diff?: string;
+  /** Pre-change file content (for undo/revert). */
+  before?: string;
 }
 
 export interface ToolOutputEvent {
@@ -121,7 +167,7 @@ export interface InferenceDone {
   elapsedMs: number;
   stopReason: string;
   /** Turn lifecycle outcome: "completed" | "failed" | "interrupted" | "error". */
-  outcome: string;
+  outcome: "completed" | "failed" | "interrupted" | "error";
   /** Prompt tokens sent to the model this turn. */
   inputTokens: number;
   /** Tokens generated this turn. */
@@ -142,7 +188,15 @@ export interface AuditEntry {
   summary: string;
   /** "allow" | "deny" | "granted" | "granted-session" | "granted-always" |
    *  "declined" | "timed-out" | "aborted". */
-  decision: string;
+  decision:
+    | "allow"
+    | "deny"
+    | "granted"
+    | "granted-session"
+    | "granted-always"
+    | "declined"
+    | "timed-out"
+    | "aborted";
   startedAt?: number;
   latencyMs: number;
   success: boolean | null;
@@ -206,6 +260,15 @@ export interface PermissionRequest {
   timestampMs: number;
   /** Independent LLM shell-approval review (Bionic §3.3), when available. */
   review?: string;
+}
+
+/** Blocking question from the agent (`ask_question`, P1-9). */
+export interface QuestionRequest {
+  requestId: string;
+  question: string;
+  /** Preset answer buttons; may be empty (free-text only). */
+  choices: string[];
+  timestampMs: number;
 }
 
 export interface Skill {
@@ -334,4 +397,25 @@ export interface TodoItem {
 export interface TodoUpdateEvent {
   items: TodoItem[];
   updatedAt: number;
+}
+
+/** Info about a background task (P2-12). */
+export interface BackgroundTaskInfo {
+  id: string;
+  sessionId: number;
+  label: string;
+  /** "running" | "completed" | "error" | "aborted". */
+  status: "running" | "completed" | "error" | "aborted";
+  startedAt: number;
+  durationMs?: number;
+}
+
+/** Background task lifecycle event (agent://bg-task-event). */
+export interface BackgroundTaskEvent {
+  taskId: string;
+  sessionId: number;
+  label: string;
+  /** "started" | "completed" | "error" | "aborted". */
+  status: "started" | "completed" | "error" | "aborted";
+  detail?: string;
 }

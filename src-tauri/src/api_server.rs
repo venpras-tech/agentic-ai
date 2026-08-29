@@ -186,11 +186,14 @@ fn complete(
     let max_tokens = pool.info().context_size.clamp(64, 2048);
     let request = crate::engine::InferenceRequest {
         prompt: prompt.to_string(),
+        messages: None,
         max_tokens,
         temperature: None,
         top_p: None,
+        repeat_penalty: None,
         seed: None,
         stop_words: None,
+        cached_prefix_tokens: None,
     };
     let interrupt = CancellationToken::new();
     // Session id 0: API completions must not render into any UI chat stream.

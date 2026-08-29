@@ -24,10 +24,15 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+#[allow(unused_imports)]
+pub use crate::remote::{
+    ProviderConfig, ProviderKind, ProviderRegistry, ProviderRole, RemoteModelConfig,
+};
 
 /// C callback that forwards native llama.cpp / ggml log output into our
 /// logging pipeline so model loads surface in the Console window and the
@@ -130,17 +135,50 @@ pub struct ModelInitParams {
     pub n_workers: Option<u32>,
 }
 
+/// One structured conversation turn used to render the prompt through the
+/// model's own chat template (see [`InferenceRequest::messages`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
 /// A single streaming inference request (camelCase over the wire).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceRequest {
+    /// Flat fallback prompt. Used verbatim when [`Self::messages`] is absent
+    /// or the model ships no chat template.
     pub prompt: String,
+    /// Structured conversation turns. When present AND the loaded GGUF embeds
+    /// a chat template, they are rendered through it (`add_ass = true`) so the
+    /// model receives the exact instruction format it was tuned with — this is
+    /// what keeps the app "in sync" across ChatML / Llama-3 / Mistral / …
+    /// models. Roles other than `user`/`assistant` are passed as `system`.
+    #[serde(default)]
+    pub messages: Option<Vec<ChatTurn>>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// Repetition-penalty multiplier applied over the last few tokens.
+    /// `None` / <=1.0 disables it; values >1.0 suppress tokens that already
+    /// appeared recently, which stops small models from degenerately looping
+    /// (echoing prompt fragments forever). Defaults to [`REPEAT_PENALTY_DEFAULT`].
+    pub repeat_penalty: Option<f32>,
     pub seed: Option<u32>,
     pub stop_words: Option<Vec<String>>,
+    /// Number of prompt tokens already present in the KV cache from a previous
+    /// generation call on the same worker. When set, the engine skips clearing
+    /// the cache and only processes tokens from this offset onward, saving
+    /// prompt re-evaluation cost on multi-step agent loops.
+    #[serde(default)]
+    pub cached_prefix_tokens: Option<usize>,
 }
+
+/// Default repetition penalty when a request does not specify one.
+pub const REPEAT_PENALTY_DEFAULT: f32 = 1.15;
+/// How many recent tokens the repetition penalty looks back at.
+const REPEAT_LAST_N: i32 = 64;
 
 /// Snapshot of model metadata surfaced to the frontend (camelCase).
 #[derive(Debug, Clone, Serialize)]
@@ -541,6 +579,41 @@ where
     })
 }
 
+/// Render the request's structured messages through the model's own baked-in
+/// chat template. Returns `None` when the request carries no messages, the
+/// model has no template metadata (e.g. base models), or template application
+/// fails — in every fallback case the flat `prompt` string is used as-is.
+fn render_chat_template(engine: &StandaloneEngine, request: &InferenceRequest) -> Option<String> {
+    let msgs = request.messages.as_ref()?;
+    if msgs.is_empty() {
+        return None;
+    }
+    let template = engine.model.chat_template(None).ok()?;
+    // Chat templates only understand system / user / assistant roles; our
+    // extra roles (context, rules, skill, plan, tool …) carry their section
+    // headers inside the content, so they map safely onto `system`.
+    let chat: Vec<LlamaChatMessage> = msgs
+        .iter()
+        .filter(|t| !t.content.trim().is_empty())
+        .filter_map(|t| {
+            let role = match t.role.as_str() {
+                "user" => "user",
+                "assistant" => "assistant",
+                _ => "system",
+            };
+            LlamaChatMessage::new(role.to_string(), t.content.clone()).ok()
+        })
+        .collect();
+    if chat.is_empty() {
+        return None;
+    }
+    // add_ass = true leaves the assistant tag open so completion continues it.
+    engine
+        .model
+        .apply_chat_template(&template, &chat, true)
+        .ok()
+}
+
 /// The generation loop. Runs on the dedicated worker thread.
 ///
 /// `interrupt` is the circuit breaker's [`CancellationToken`]; it is polled
@@ -558,9 +631,14 @@ pub fn run_generation(
     let n_ctx = engine.context.n_ctx() as i32;
     let max_tokens = request.max_tokens.max(1) as i32;
 
+    // Prefer the model's own chat template when structured messages were
+    // supplied; otherwise complete the flat prompt verbatim.
+    let effective_prompt =
+        render_chat_template(engine, request).unwrap_or_else(|| request.prompt.clone());
+
     let prompt_tokens = engine
         .model
-        .str_to_token(&request.prompt, AddBos::Always)
+        .str_to_token(&effective_prompt, AddBos::Always)
         .map_err(|e| format!("Failed to tokenize prompt: {e}"))?;
     let prompt_len = prompt_tokens.len() as i32;
     if prompt_len >= n_ctx {
@@ -571,7 +649,11 @@ pub fn run_generation(
 
     // Clear any KV state left over from a previous session so positions start
     // from zero and cross-request caches never bleed into one another.
-    engine.context.clear_kv_cache();
+    // When cached_prefix_tokens is set, preserve the cache for prefix reuse.
+    let prefix_len = request.cached_prefix_tokens.unwrap_or(0);
+    if prefix_len == 0 {
+        engine.context.clear_kv_cache();
+    }
     engine.context.reset_timings();
 
     let mut sampler = build_sampler(request);
@@ -580,9 +662,11 @@ pub fn run_generation(
     // 512). Chunk it so every `decode` call stays within the batch capacity;
     // logits are only requested on the final prompt token so generation starts
     // from the correct KV position.
+    // When prefix_len > 0, skip re-encoding tokens already in the KV cache.
     const PROMPT_BATCH: usize = 512;
     let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
-    let mut pos = 0usize;
+    let start = prefix_len.min(prompt_tokens.len());
+    let mut pos = start;
     while pos < prompt_tokens.len() {
         let end = (pos + PROMPT_BATCH).min(prompt_tokens.len());
         batch.clear();
@@ -679,9 +763,9 @@ pub fn run_generation(
         0.0
     };
 
-    // Local llama.cpp clears the KV cache before every run, so the prompt was
-    // fully written into cache (write = input) and nothing was served from a
-    // previous run's cache (read = 0). No reasoning tokens are reported.
+    // Report actual cache statistics: prefix tokens served from cache, rest written.
+    let cache_reads = prefix_len as u64;
+    let cache_writes = (prompt_len as u64).saturating_sub(cache_reads);
     Ok(GenerationOutcome {
         done: InferenceDone {
             total_tokens,
@@ -696,8 +780,8 @@ pub fn run_generation(
             },
             input_tokens: prompt_len as u64,
             output_tokens: total_tokens,
-            cache_read_tokens: 0,
-            cache_write_tokens: prompt_len as u64,
+            cache_read_tokens: cache_reads,
+            cache_write_tokens: cache_writes,
             reasoning_tokens: 0,
         },
         full_text,
@@ -705,13 +789,26 @@ pub fn run_generation(
 }
 
 /// Build the sampler chain. Must end with a token-selecting sampler
-/// (`greedy` or `dist`); temperature/`top_p` are applied beforehand.
+/// (`greedy` or `dist`); penalties/temperature/`top_p` are applied beforehand,
+/// mirroring llama.cpp's own default chain order.
 fn build_sampler(request: &InferenceRequest) -> LlamaSampler {
     let temperature = request.temperature.unwrap_or(0.8).clamp(0.0, 4.0);
     let top_p = request.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
+    let repeat_penalty = request
+        .repeat_penalty
+        .unwrap_or(REPEAT_PENALTY_DEFAULT)
+        .clamp(1.0, 2.0);
     let seed = request.seed.unwrap_or(u32::MAX);
 
-    let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(3);
+    let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(4);
+    if repeat_penalty > 1.0 {
+        samplers.push(LlamaSampler::penalties(
+            REPEAT_LAST_N,
+            repeat_penalty,
+            0.0,
+            0.0,
+        ));
+    }
     if temperature > 0.0 {
         samplers.push(LlamaSampler::temp(temperature));
     }
@@ -736,6 +833,24 @@ fn has_stop_suffix(text: &str, stop_words: &[String]) -> bool {
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+
+    /// The frontend sends camelCase JSON; `messages` must deserialize when
+    /// present AND default to `None` when absent (older callers).
+    #[test]
+    fn inference_request_messages_wire_compat() {
+        let with: InferenceRequest = serde_json::from_str(
+            r#"{"prompt":"p","messages":[{"role":"user","content":"hi"}],"maxTokens":8}"#,
+        )
+        .expect("parse with messages");
+        let msgs = with.messages.expect("messages present");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "hi");
+
+        let without: InferenceRequest =
+            serde_json::from_str(r#"{"prompt":"p","maxTokens":8}"#).expect("parse without");
+        assert!(without.messages.is_none());
+    }
 
     /// Deterministic fake generator so the pool can be tested without a model.
     struct FakeGen {
@@ -805,11 +920,14 @@ mod tests {
 
         let request = InferenceRequest {
             prompt: "p".into(),
+            messages: None,
             max_tokens: 8,
             temperature: None,
             top_p: None,
+            repeat_penalty: None,
             seed: None,
             stop_words: None,
+            cached_prefix_tokens: None,
         };
         let interrupt = CancellationToken::new();
 
@@ -866,11 +984,14 @@ mod tests {
         let interrupt = CancellationToken::new();
         let request = InferenceRequest {
             prompt: "hi".to_string(),
+            messages: None,
             max_tokens: 48,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            repeat_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
         };
         let outcome = run_generation(&mut engine, &request, 1, &interrupt, &tx)
             .expect("generation must not fail");
@@ -902,11 +1023,14 @@ mod tests {
         // A second turn over the same context must also work (no KV bleed).
         let request2 = InferenceRequest {
             prompt: "what is 2+2?".to_string(),
+            messages: None,
             max_tokens: 32,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            repeat_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
         };
         let _ = run_generation(&mut engine, &request2, 1, &interrupt, &tx)
             .expect("second generation must not fail");
@@ -921,11 +1045,14 @@ mod tests {
         );
         let big_request = InferenceRequest {
             prompt: big_prompt,
+            messages: None,
             max_tokens: 24,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            repeat_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
         };
         let big = run_generation(&mut engine, &big_request, 1, &interrupt, &tx)
             .expect("long-prompt generation must not fail");

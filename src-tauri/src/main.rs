@@ -7,6 +7,7 @@ mod engine;
 mod hub;
 mod logging;
 mod remote;
+mod watcher;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,10 @@ use engine::{
     EnginePool, InferenceDone, InferenceRequest, LoadProgressEvent, LocalGenerator, ModelInfo,
     ModelInitParams, TextGenerator, WorkerEvent,
 };
-use remote::{RemoteGenerator, RemoteModelConfig};
+use remote::{
+    ProviderConfig, ProviderKind, ProviderRegistry, ProviderRole, RemoteGenerator,
+    RemoteModelConfig,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -50,6 +54,55 @@ impl Default for InferenceState {
             loaded_path: Mutex::new(None),
             worker_tx: Mutex::new(None),
         }
+    }
+}
+
+/// Managed handle to the multi-provider [registry](ProviderRegistry). Backed
+/// by a `tokio::Mutex` so both the frontend commands and the remote-load path
+/// can share one registry across tasks. Starts empty, so every existing
+/// single-provider code path is unaffected until a provider is registered.
+struct ProviderRegistryState(tokio::sync::Mutex<ProviderRegistry>);
+
+impl Default for ProviderRegistryState {
+    fn default() -> Self {
+        Self(tokio::sync::Mutex::new(ProviderRegistry::new()))
+    }
+}
+
+impl InferenceState {
+    /// Synchronous unload — can be called from a plain worker thread.
+    /// Blocks until the pool is dropped.
+    #[allow(dead_code)]
+    pub fn unload_sync(&self) {
+        *self.pool.blocking_lock() = None;
+        *self.info.blocking_lock() = None;
+        *self.loaded_path.blocking_lock() = None;
+    }
+
+    /// Synchronous local GGUF load — blocks until the model is loaded.
+    #[allow(dead_code)]
+    pub fn load_local_sync(
+        &self,
+        path: &str,
+        app: &AppHandle,
+    ) -> Result<ModelInfo, String> {
+        let p = PathBuf::from(path);
+        if !p.is_file() {
+            return Err(format!("Model file not found: {path}"));
+        }
+        let params = ModelInitParams::default();
+        let event_tx = self
+            .worker_tx
+            .blocking_lock()
+            .clone()
+            .unwrap_or_else(|| spawn_emitter(app.clone()));
+        let app_clone = app.clone();
+        let pool = build_local_pool(&p, &params, event_tx, &app_clone)?;
+        let info = pool.info();
+        *self.pool.blocking_lock() = Some(Arc::new(pool));
+        *self.info.blocking_lock() = Some(info.clone());
+        *self.loaded_path.blocking_lock() = Some(path.to_string());
+        Ok(info)
     }
 }
 
@@ -355,7 +408,7 @@ async fn install_local_model(
     );
     let _ = app.emit("model-loaded", &info);
     let _ = app.emit("model-path", &path_for_event);
-    persist_model_path(&app, &path_for_event);
+    persist_model_path(&app, &path_for_event).await;
     Ok(info)
 }
 
@@ -434,6 +487,7 @@ async fn configure_remote_model(
     interrupt_state: State<'_, InterruptState>,
     context_state: State<'_, ContextState>,
     api_state: State<'_, ApiServerState>,
+    providers: State<'_, ProviderRegistryState>,
     config: RemoteModelConfig,
 ) -> Result<ModelInfo, String> {
     interrupt_state.trigger();
@@ -445,8 +499,22 @@ async fn configure_remote_model(
         .await
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
-    let factory =
-        || RemoteGenerator::new(config.clone()).map(|g| Box::new(g) as Box<dyn TextGenerator>);
+    // Let the registry overrule the Editor backend when a provider is routed
+    // for it; with an empty registry (default) this resolves to the caller's
+    // config, preserving today's single-remote behaviour exactly.
+    let effective_config = {
+        let reg = providers.0.lock().await;
+        match reg.route(ProviderRole::Editor) {
+            Some(p) if p.kind != ProviderKind::Local => {
+                p.to_remote_model_config().unwrap_or_else(|_| config.clone())
+            }
+            _ => config.clone(),
+        }
+    };
+    let factory = || {
+        RemoteGenerator::new(effective_config.clone())
+            .map(|g| Box::new(g) as Box<dyn TextGenerator>)
+    };
     let pool = EnginePool::spawn_with(factory, event_tx, workers)?;
     let info = pool.info();
 
@@ -473,6 +541,182 @@ async fn configure_remote_model(
     );
     let _ = app.emit("model-loaded", &info);
     Ok(info)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider registry commands (drive `ProviderRegistry` from the UI).
+// These persist providers and the role → provider map in Tauri managed state;
+// `configure_remote_model` already consults `route(Editor)` at load time.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn providers_upsert(
+    state: State<'_, ProviderRegistryState>,
+    provider: ProviderConfig,
+) -> Result<String, String> {
+    state.0.lock().await.add_provider(provider.clone());
+    Ok(provider.id)
+}
+
+#[tauri::command]
+async fn providers_remove(
+    state: State<'_, ProviderRegistryState>,
+    id: String,
+) -> Result<bool, String> {
+    Ok(state.0.lock().await.remove_provider(&id))
+}
+
+#[tauri::command]
+async fn providers_set_role(
+    state: State<'_, ProviderRegistryState>,
+    role: ProviderRole,
+    provider_id: String,
+) -> Result<(), String> {
+    state.0.lock().await.set_role_provider(role, provider_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn providers_clear_role(
+    state: State<'_, ProviderRegistryState>,
+    role: ProviderRole,
+) -> Result<(), String> {
+    state.0.lock().await.clear_role(role);
+    Ok(())
+}
+
+#[tauri::command]
+async fn providers_route(
+    state: State<'_, ProviderRegistryState>,
+    role: ProviderRole,
+) -> Result<Option<ProviderConfig>, String> {
+    Ok(state.0.lock().await.route(role).cloned())
+}
+
+#[tauri::command]
+async fn providers_list(
+    state: State<'_, ProviderRegistryState>,
+) -> Result<Vec<ProviderConfig>, String> {
+    Ok(state.0.lock().await.providers().to_vec())
+}
+
+#[cfg(test)]
+mod provider_registry_cmd_tests {
+    use super::{ProviderConfig, ProviderKind, ProviderRegistryState, ProviderRole};
+
+    #[tokio::test]
+    async fn upsert_then_route_returns_provider() {
+        let st = ProviderRegistryState::default();
+        let mut p = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "openai",
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-4o-mini",
+        );
+        p.id = "openai-editor".into();
+        p.roles = vec![ProviderRole::Editor];
+        st.0.lock().await.add_provider(p.clone());
+        {
+            let reg = st.0.lock().await;
+            let routed = reg.route(ProviderRole::Editor);
+            assert!(routed.is_some());
+            assert_eq!(routed.unwrap().id, "openai-editor");
+            let upserted = reg.get_provider("openai-editor").expect("present");
+            assert_eq!(upserted.model, "gpt-4o-mini");
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_by_id() {
+        let st = ProviderRegistryState::default();
+        let mut p = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "openai",
+            "https://api.openai.com/v1",
+            "sk-a",
+            "gpt-4o-mini",
+        );
+        p.id = "p1".into();
+        st.0.lock().await.add_provider(p.clone());
+        let mut p2 = p.clone();
+        p2.model = "gpt-4o".into();
+        st.0.lock().await.add_provider(p2);
+        let reg = st.0.lock().await;
+        assert_eq!(reg.providers().len(), 1);
+        assert_eq!(reg.get_provider("p1").unwrap().model, "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn remove_clears_provider_and_role_map() {
+        let st = ProviderRegistryState::default();
+        let mut p = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "openai",
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-4o-mini",
+        );
+        p.id = "p1".into();
+        p.roles = vec![ProviderRole::Editor];
+        st.0.lock().await.add_provider(p);
+        st.0.lock().await.set_role_provider(ProviderRole::Editor, "p1");
+        assert!(st.0.lock().await.remove_provider("p1"));
+        let reg = st.0.lock().await;
+        assert!(reg.providers().is_empty());
+        assert!(reg.route(ProviderRole::Editor).is_none());
+    }
+
+    #[tokio::test]
+    async fn set_role_and_clear_role() {
+        let st = ProviderRegistryState::default();
+        let mut p = ProviderConfig::remote(
+            ProviderKind::OpenAI,
+            "openai",
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-4o-mini",
+        );
+        p.id = "p1".into();
+        st.0.lock().await.add_provider(p);
+        let p2 = ProviderConfig::remote(
+            ProviderKind::Groq,
+            "groq",
+            "https://api.groq.com/openai/v1",
+            "sk-g",
+            "llama-3.3-70b",
+        );
+        st.0.lock().await.add_provider(p2);
+        st.0.lock().await
+            .set_role_provider(ProviderRole::Editor, "p1");
+        assert_eq!(
+            st.0.lock().await.route(ProviderRole::Editor).unwrap().kind,
+            ProviderKind::OpenAI
+        );
+        st.0.lock().await.set_role_provider(ProviderRole::Editor, "groq");
+        assert_eq!(
+            st.0.lock().await.route(ProviderRole::Editor).unwrap().kind,
+            ProviderKind::Groq
+        );
+        st.0.lock().await.clear_role(ProviderRole::Editor);
+        // No explicit mapping now; falls back to first provider (convention first).
+        assert_eq!(
+            st.0.lock().await.route(ProviderRole::Editor).unwrap().kind,
+            ProviderKind::OpenAI
+        );
+    }
+
+    #[tokio::test]
+    async fn route_falls_back_correctly() {
+        let st = ProviderRegistryState::default();
+        assert!(st.0.lock().await.route(ProviderRole::Embed).is_none());
+        let mut p = ProviderConfig::local("qwen-0.5b");
+        p.roles = vec![ProviderRole::Planner];
+        st.0.lock().await.add_provider(p);
+        // Planner routes to the local; an unrouted role still finds it as fallback.
+        assert!(st.0.lock().await.route(ProviderRole::Planner).is_some());
+        assert!(st.0.lock().await.route(ProviderRole::Editor).is_some());
+    }
 }
 
 #[tauri::command]
@@ -608,24 +852,123 @@ async fn console_history() -> Result<Vec<String>, String> {
     Ok(logging::recent_lines())
 }
 
+/// Generation defaults persisted under the settings `params` key (camelCase,
+/// matching the frontend `GenParams` shape). Opt-in later adds of load-only
+/// fields (e.g. `nWorkers`) simply land in [`AppSettings`]'s catch-all.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenParamsSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n_threads: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n_gpu_layers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+/// Typed shape of `{app_data}/settings.json`, written by both the model
+/// lifecycle (`modelPath`) and the frontend (params / remote / workspace
+/// pointers). Unknown keys survive a load→save round-trip via the flatten
+/// catch-all so the config file format never breaks for newer/older writers.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSettings {
+    /// Last successfully loaded GGUF path (auto-restored on next launch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_path: Option<String>,
+    /// Recently loaded local GGUF paths (frontend MRU list).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recent_models: Option<Vec<String>>,
+    /// Generation defaults (`GenParams`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<GenParamsSettings>,
+    /// Last-used remote endpoint config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<Value>,
+    /// Last workspace root (hydrated on startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_workspace: Option<String>,
+    /// All workspace roots (multi-root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_workspaces: Option<Vec<String>>,
+    /// Last active chat pointer `{project, chatId}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_chat: Option<Value>,
+    /// Any other keys (keep the file format backwards-compatible).
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, Value>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            recent_models: None,
+            params: None,
+            remote: None,
+            last_workspace: None,
+            last_workspaces: None,
+            last_chat: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Parse a settings file leniently: typed fields are honoured when they match,
+/// and anything that cannot be forced into the typed shape (legacy keys with
+/// unexpected value types, unknown keys, …) is preserved in the catch-all
+/// instead of failing the whole load.
+fn parse_settings(text: &str) -> AppSettings {
+    let raw: Value = serde_json::from_str(text).unwrap_or(Value::Object(Default::default()));
+    match serde_json::from_value::<AppSettings>(raw.clone()) {
+        Ok(s) => s,
+        Err(_) => {
+            let mut s = AppSettings::default();
+            if let Value::Object(mut map) = raw {
+                // modelPath drives model auto-load; keep it alive even when a
+                // sibling field is corrupt enough to break the typed parse.
+                if let Some(v) = map.remove("modelPath") {
+                    if let Ok(p) = serde_json::from_value::<String>(v.clone()) {
+                        s.model_path = Some(p);
+                    } else {
+                        map.insert("modelPath".into(), v);
+                    }
+                }
+                s.extra = map.into_iter().collect();
+            }
+            s
+        }
+    }
+}
+
 /// Remember the last successfully loaded GGUF so future launches can restore
 /// it without re-picking (read-modify-write of `settings.json`; best-effort —
 /// a failure must never fail the model load itself).
-fn persist_model_path(app: &AppHandle, path: &Path) {
+async fn persist_model_path(app: &AppHandle, path: &Path) {
     let dir = app_data_dir(app);
     let file = dir.join("settings.json");
-    let mut settings: Value = std::fs::read_to_string(&file)
+    let mut settings: AppSettings = tokio::fs::read_to_string(&file)
+        .await
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| json!({}));
+        .as_deref()
+        .map(parse_settings)
+        .unwrap_or_default();
     let as_str = path.display().to_string();
-    if settings.get("modelPath").and_then(Value::as_str) == Some(as_str.as_str()) {
+    if settings.model_path.as_deref() == Some(as_str.as_str()) {
         return;
     }
-    settings["modelPath"] = json!(as_str);
-    if std::fs::create_dir_all(&dir).is_ok() {
+    settings.model_path = Some(as_str);
+    if tokio::fs::create_dir_all(&dir).await.is_ok() {
         if let Ok(text) = serde_json::to_string_pretty(&settings) {
-            if std::fs::write(&file, text).is_ok() {
+            if tokio::fs::write(&file, text).await.is_ok() {
                 logging::info(None, "model", "saved default model path");
             }
         }
@@ -656,10 +999,10 @@ async fn auto_load_model(
     let mut candidates: Vec<PathBuf> = Vec::new();
     let saved: Option<String> = {
         let file = app_data_dir(&app).join("settings.json");
-        std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|v| v.get("modelPath").and_then(Value::as_str).map(String::from))
+        match tokio::fs::read_to_string(&file).await {
+            Ok(text) => parse_settings(&text).model_path,
+            Err(_) => None,
+        }
     };
     if let Some(p) = saved {
         candidates.push(PathBuf::from(p));
@@ -667,8 +1010,8 @@ async fn auto_load_model(
     for m in hub::list_downloaded(&app_data_dir(&app).join("models")) {
         candidates.push(PathBuf::from(m.path));
     }
-    if let Ok(entries) = std::fs::read_dir(Path::new("models")) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(Path::new("models")).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
                 candidates.push(p);
@@ -772,10 +1115,13 @@ struct AttachedFileInfo {
 /// Attach a file from the UI into the same session index used by the agent.
 #[tauri::command]
 async fn agent_attach_file(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     path: String,
 ) -> Result<AttachedFileInfo, String> {
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read: {e}"))?;
+    let text =
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("Failed to read: {e}"))?;
     let file = { state.rag.lock().unwrap().attach(&path, &text)? };
     Ok(AttachedFileInfo {
         path,
@@ -786,7 +1132,7 @@ async fn agent_attach_file(
 
 /// Detach a file from the session index (UI chip ✕).
 #[tauri::command]
-async fn agent_detach_file(state: State<'_, ToolState>, path: String) -> Result<(), String> {
+async fn agent_detach_file(state: State<'_, std::sync::Arc<ToolState>>, path: String) -> Result<(), String> {
     if !state.rag.lock().unwrap().detach(&path) {
         return Err(format!("`{path}` is not attached"));
     }
@@ -796,7 +1142,7 @@ async fn agent_detach_file(state: State<'_, ToolState>, path: String) -> Result<
 /// List currently attached files.
 #[tauri::command]
 async fn agent_list_attachments(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
 ) -> Result<Vec<AttachedFileInfo>, String> {
     let rag = state.rag.lock().unwrap();
     Ok(rag
@@ -815,12 +1161,14 @@ async fn agent_list_attachments(
 #[tauri::command]
 async fn voice_transcribe_data(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     data: Vec<u8>,
     ext: Option<String>,
 ) -> Result<String, String> {
     let dir = app_data_dir(&app).join("voice");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir failed: {e}"))?;
     let safe_ext = ext
         .unwrap_or_else(|| "webm".into())
         .chars()
@@ -832,7 +1180,9 @@ async fn voice_transcribe_data(
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let path = dir.join(format!("dictation-{nanos}.{safe_ext}"));
-    std::fs::write(&path, &data).map_err(|e| format!("Write failed: {e}"))?;
+    tokio::fs::write(&path, &data)
+        .await
+        .map_err(|e| format!("Write failed: {e}"))?;
     agent::tools::transcribe_file(&state, &path).await
 }
 
@@ -840,14 +1190,48 @@ async fn voice_transcribe_data(
 /// worker's own thread holds the generator for the whole generation. A fresh
 /// circuit-breaker token is armed per run so an old cancellation can never leak
 /// into this one.
+///
+/// The conversation snapshot from the [`ContextState`] manager (which the
+/// frontend populates before invoking — the user turn is already the last
+/// entry) is attached as structured messages so the engine can render it
+/// through the model's own chat template; the flat `request.prompt` remains
+/// the fallback for template-less models.
 #[tauri::command]
 async fn stream_inference(
     app: AppHandle,
     state: State<'_, InferenceState>,
     interrupt_state: State<'_, InterruptState>,
+    context_state: State<'_, ContextState>,
     request: InferenceRequest,
 ) -> Result<u64, String> {
     let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+
+    // Attach the conversation (system prompt + pinned buffers + history).
+    let mut messages = {
+        let snapshot = context_state.inner.lock().await.messages();
+        snapshot
+            .into_iter()
+            .map(|m| engine::ChatTurn {
+                role: m.role,
+                content: m.content,
+            })
+            .collect::<Vec<_>>()
+    };
+    // The frontend pushes the user turn before invoking; only append when the
+    // snapshot does not already end with this exact turn (dedup mirrors
+    // orchestrator's build_prompt behaviour).
+    let tail_dupes = matches!(
+        messages.last(),
+        Some(m) if m.role == "user" && m.content.trim() == request.prompt.trim()
+    );
+    if !tail_dupes {
+        messages.push(engine::ChatTurn {
+            role: "user".into(),
+            content: request.prompt.clone(),
+        });
+    }
+    let mut request = request;
+    request.messages = Some(messages);
 
     let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
@@ -922,7 +1306,7 @@ async fn agent_run_task(
     state: State<'_, InferenceState>,
     interrupt_state: State<'_, InterruptState>,
     context_state: State<'_, ContextState>,
-    tool_state: State<'_, ToolState>,
+    tool_state: State<'_, std::sync::Arc<ToolState>>,
     request: agent::orchestrator::AgentTaskRequest,
 ) -> Result<u64, String> {
     let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
@@ -955,10 +1339,7 @@ async fn agent_run_task(
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
 
-    // SAFETY: `ToolState` is Tauri-managed and outlives the app; the worker
-    // thread(s) only read its workspace root + MCP cache, all behind mutexes.
-    let tool_state_ref: &'static ToolState =
-        unsafe { std::mem::transmute::<&ToolState, &'static ToolState>(tool_state.inner()) };
+    let tool_state_arc = std::sync::Arc::clone(&tool_state);
 
     let context_snapshot = context_state.inner.lock().await.messages();
     let app_for_thread = app.clone();
@@ -969,7 +1350,7 @@ async fn agent_run_task(
     std::thread::spawn(move || {
         let result = agent::orchestrator::run_agent_loop_pool(
             &pool_for_thread,
-            tool_state_ref,
+            &tool_state_arc,
             &app_for_thread,
             &interrupt,
             &tx_clone,
@@ -997,6 +1378,79 @@ async fn agent_run_task(
 #[serde(rename_all = "camelCase")]
 struct StartedEvent {
     session_id: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks (P2-12)
+// ---------------------------------------------------------------------------
+
+/// Start an agent task that runs in the background, independent of the
+/// foreground chat. The task gets its own cancellation token and is tracked
+/// in `ToolState.background_tasks` until completion or abort.
+#[tauri::command]
+async fn agent_run_background(
+    app: AppHandle,
+    state: State<'_, InferenceState>,
+    interrupt_state: State<'_, InterruptState>,
+    context_state: State<'_, ContextState>,
+    tool_state: State<'_, std::sync::Arc<ToolState>>,
+    request: agent::orchestrator::AgentTaskRequest,
+) -> Result<u64, String> {
+    let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+    let tx = state
+        .worker_tx
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| spawn_emitter(app.clone()));
+    let context_snapshot = context_state.inner.lock().await.messages();
+    let context_budget = pool.info().context_size as usize;
+
+    agent::background::start_background_task(
+        pool,
+        &tool_state,
+        &app,
+        &interrupt_state,
+        &tx,
+        &request,
+        &context_snapshot,
+        context_budget,
+    )
+}
+
+/// List all currently running background tasks.
+#[tauri::command]
+async fn list_background_tasks(
+    tool_state: State<'_, std::sync::Arc<ToolState>>,
+) -> Result<Vec<agent::BackgroundTaskInfo>, String> {
+    Ok(tool_state.background_tasks.list())
+}
+
+/// Abort a specific background task by its id.
+#[tauri::command]
+async fn abort_background_task(
+    app: AppHandle,
+    tool_state: State<'_, std::sync::Arc<ToolState>>,
+    task_id: String,
+) -> Result<(), String> {
+    let info = tool_state
+        .background_tasks
+        .abort(&task_id)
+        .ok_or_else(|| format!("Unknown background task: {task_id}"))?;
+
+    // Emit lifecycle event so the frontend cleans up.
+    let _ = app.emit(
+        "agent://bg-task-event",
+        agent::BackgroundTaskEvent {
+            task_id: info.id,
+            session_id: info.session_id,
+            label: info.label,
+            status: "aborted".into(),
+            detail: None,
+        },
+    );
+
+    Ok(())
 }
 
 /// Cancel the in-flight generation (if any) via the circuit breaker.
@@ -1084,10 +1538,10 @@ async fn list_directory(
         return Err(format!("Not a directory: {}", dir.display()));
     }
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
+    let mut read_dir = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.file_type().map_err(|e| e.to_string())?.is_dir();
+        let is_dir = entry.file_type().await.map_err(|e| e.to_string())?.is_dir();
         let rel = if relative.is_some() {
             dir.join(&name).to_string_lossy().into_owned()
         } else {
@@ -1122,6 +1576,15 @@ async fn write_text_file(path: String, content: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Revert a file to its pre-change content (undo an agent edit).
+#[tauri::command]
+async fn revert_file(path: String, before: String) -> Result<(), String> {
+    tokio::fs::write(&path, before)
+        .await
+        .map_err(|e| format!("Failed to revert `{path}`: {e}"))?;
+    Ok(())
+}
+
 /// Save-as dialog for untitled buffers; returns the chosen path or `None` if
 /// the user cancelled.
 #[tauri::command]
@@ -1142,16 +1605,46 @@ async fn save_file_as(app: AppHandle, content: String) -> Result<Option<String>,
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// Save-as dialog for binary exports (PDF, DOCX, CSV). Accepts base64-encoded
+/// bytes and a suggested filename; returns the chosen path or `None` on cancel.
+#[tauri::command]
+async fn save_file_as_bytes(
+    app: AppHandle,
+    content: String,
+    suggested_filename: String,
+) -> Result<Option<String>, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&content)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Export conversation")
+        .set_file_name(&suggested_filename)
+        .add_filter("All files", &["*"])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 // ---------------------------------------------------------------------------
 // Agent core
 // ---------------------------------------------------------------------------
 
 /// Set the active workspace root that file tools operate on by default.
 /// Also scans project skills/rules and syncs them into the context manager.
+/// Replaces all existing workspaces (backward-compatible single-root API).
 #[tauri::command]
 async fn agent_set_workspace(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     context_state: State<'_, ContextState>,
     knowledge_state: State<'_, Arc<KnowledgeState>>,
     root: String,
@@ -1160,7 +1653,8 @@ async fn agent_set_workspace(
     if !p.is_dir() {
         return Err(format!("Not a directory: {}", p.display()));
     }
-    *state.workspace.lock().await = Some(p.clone());
+    state.workspace.lock().await.clear();
+    state.workspace.lock().await.push(p.clone());
     let config_dir = app_config_dir(&app);
     let _ = knowledge_state.scan(&p, &config_dir);
     sync_knowledge(&context_state, &knowledge_state).await;
@@ -1168,11 +1662,68 @@ async fn agent_set_workspace(
     Ok(())
 }
 
-/// Get the currently configured workspace root (if any).
+/// Get all configured workspace roots.
 #[tauri::command]
-async fn agent_get_workspace(state: State<'_, ToolState>) -> Result<Option<String>, String> {
+async fn agent_get_workspaces(state: State<'_, std::sync::Arc<ToolState>>) -> Result<Vec<String>, String> {
     let guard = state.workspace.lock().await;
-    Ok(guard.as_ref().map(|p| p.to_string_lossy().into_owned()))
+    Ok(guard.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+}
+
+/// Add a workspace root (multi-root support). Scans skills/rules from it.
+#[tauri::command]
+async fn agent_add_workspace(
+    app: AppHandle,
+    state: State<'_, std::sync::Arc<ToolState>>,
+    context_state: State<'_, ContextState>,
+    knowledge_state: State<'_, Arc<KnowledgeState>>,
+    root: String,
+) -> Result<Vec<String>, String> {
+    let p = PathBuf::from(&root);
+    if !p.is_dir() {
+        return Err(format!("Not a directory: {}", p.display()));
+    }
+    let mut guard = state.workspace.lock().await;
+    if !guard.contains(&p) {
+        guard.push(p.clone());
+    }
+    let workspaces: Vec<String> = guard.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+    drop(guard);
+    let config_dir = app_config_dir(&app);
+    let _ = knowledge_state.scan(&p, &config_dir);
+    sync_knowledge(&context_state, &knowledge_state).await;
+    let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
+    Ok(workspaces)
+}
+
+/// Remove a workspace root. The primary (first) workspace cannot be removed
+/// via this call — use `agent_set_workspace` to replace it.
+#[tauri::command]
+async fn agent_remove_workspace(
+    app: AppHandle,
+    state: State<'_, std::sync::Arc<ToolState>>,
+    context_state: State<'_, ContextState>,
+    knowledge_state: State<'_, Arc<KnowledgeState>>,
+    root: String,
+) -> Result<Vec<String>, String> {
+    let p = PathBuf::from(&root);
+    let mut guard = state.workspace.lock().await;
+    guard.retain(|w| w != &p);
+    let workspaces: Vec<String> = guard.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+    drop(guard);
+    let config_dir = app_config_dir(&app);
+    if let Some(primary) = state.workspace.lock().await.first().cloned() {
+        let _ = knowledge_state.scan(&primary, &config_dir);
+    }
+    sync_knowledge(&context_state, &knowledge_state).await;
+    let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
+    Ok(workspaces)
+}
+
+/// Get the currently configured primary workspace root (if any).
+#[tauri::command]
+async fn agent_get_workspace(state: State<'_, std::sync::Arc<ToolState>>) -> Result<Option<String>, String> {
+    let guard = state.workspace.lock().await;
+    Ok(guard.first().map(|p| p.to_string_lossy().into_owned()))
 }
 
 /// Execute a single tool call. Real-time progress is pushed over the
@@ -1182,7 +1733,7 @@ async fn agent_get_workspace(state: State<'_, ToolState>) -> Result<Option<Strin
 #[tauri::command]
 async fn agent_execute_tool(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     interrupt_state: State<'_, InterruptState>,
     call: ToolCall,
 ) -> Result<ToolResult, String> {
@@ -1194,7 +1745,7 @@ async fn agent_execute_tool(
 #[tauri::command]
 async fn agent_batch_execute(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     interrupt_state: State<'_, InterruptState>,
     calls: Vec<ToolCall>,
 ) -> Result<Vec<ToolResult>, String> {
@@ -1218,7 +1769,7 @@ async fn agent_tool_schemas() -> Result<std::collections::HashMap<String, serde_
 
 /// Drop all cached MCP server connections (they respawn on demand).
 #[tauri::command]
-async fn agent_reset_mcp(state: State<'_, ToolState>) -> Result<(), String> {
+async fn agent_reset_mcp(state: State<'_, std::sync::Arc<ToolState>>) -> Result<(), String> {
     state.mcp_servers.lock().await.clear();
     Ok(())
 }
@@ -1279,7 +1830,7 @@ async fn mcp_catalog_load(app: AppHandle) -> Result<Vec<agent::mcp::McpServerCon
 #[tauri::command]
 async fn mcp_catalog_save(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     servers: Vec<agent::mcp::McpServerConfig>,
 ) -> Result<(), String> {
     // Validate before writing: unique non-empty names, non-empty commands.
@@ -1358,16 +1909,12 @@ fn knowledge_report(knowledge: &KnowledgeState) -> KnowledgeReport {
 #[tauri::command]
 async fn knowledge_scan(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     context_state: State<'_, ContextState>,
     knowledge_state: State<'_, Arc<KnowledgeState>>,
 ) -> Result<KnowledgeReport, String> {
-    let ws = {
-        let guard = state.workspace.lock().await;
-        guard
-            .clone()
-            .ok_or("No workspace set - open a workspace first")?
-    };
+    let ws = state.primary_workspace().await
+        .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     knowledge_state.scan(&ws, &config_dir)?;
     sync_knowledge(&context_state, &knowledge_state).await;
@@ -1403,18 +1950,14 @@ async fn skill_set_active(
 #[tauri::command]
 async fn skill_install(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     context_state: State<'_, ContextState>,
     knowledge_state: State<'_, Arc<KnowledgeState>>,
     source: String,
     global: bool,
 ) -> Result<KnowledgeReport, String> {
-    let ws = {
-        let guard = state.workspace.lock().await;
-        guard
-            .clone()
-            .ok_or("No workspace set - open a workspace first")?
-    };
+    let ws = state.primary_workspace().await
+        .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     KnowledgeState::install(&ws, &config_dir, Path::new(&source), global)?;
     knowledge_state.scan(&ws, &config_dir)?;
@@ -1427,17 +1970,13 @@ async fn skill_install(
 #[tauri::command]
 async fn skill_uninstall(
     app: AppHandle,
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     context_state: State<'_, ContextState>,
     knowledge_state: State<'_, Arc<KnowledgeState>>,
     name: String,
 ) -> Result<KnowledgeReport, String> {
-    let ws = {
-        let guard = state.workspace.lock().await;
-        guard
-            .clone()
-            .ok_or("No workspace set - open a workspace first")?
-    };
+    let ws = state.primary_workspace().await
+        .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     knowledge_state.uninstall(&name)?;
     knowledge_state.scan(&ws, &config_dir)?;
@@ -1455,7 +1994,7 @@ async fn skill_uninstall(
 /// `always_allow` or `deny` (anything else is treated as a deny).
 #[tauri::command]
 async fn agent_respond_permission(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     request_id: String,
     decision: String,
 ) -> Result<(), String> {
@@ -1472,18 +2011,54 @@ async fn agent_respond_permission(
     Ok(())
 }
 
+/// Complete a pending `ask_question` request from the UI (P1-9). The answer
+/// (a preset choice or free text) is delivered to the blocked agent loop.
+#[tauri::command]
+async fn agent_respond_question(
+    state: State<'_, std::sync::Arc<ToolState>>,
+    request_id: String,
+    answer: String,
+) -> Result<(), String> {
+    let mut reqs = state.pending_questions.lock().await;
+    if let Some(tx) = reqs.remove(&request_id) {
+        let _ = tx.send(answer);
+    }
+    Ok(())
+}
+
+/// One tool-decision record from `{workspace}/.ai/audit.jsonl` (camelCase,
+/// matching the `AuditEntry` type the frontend renders).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditEntry {
+    ts: u64,
+    id: String,
+    tool: String,
+    summary: String,
+    decision: String,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    latency_ms: u64,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 /// Recent audit-log entries (`{workspace}/.ai/audit.jsonl`), newest first.
 #[tauri::command]
 async fn agent_audit_log(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     limit: Option<usize>,
-) -> Result<Vec<Value>, String> {
-    let ws = state.workspace.lock().await.clone();
+) -> Result<Vec<AuditEntry>, String> {
+    let ws = state.primary_workspace().await;
     let Some(ws) = ws else { return Ok(Vec::new()) };
     let path = ws.join(".ai/audit.jsonl");
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read the audit log: {e}"))?;
-    let mut entries: Vec<Value> = text
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Failed to read the audit log: {e}"))?;
+    let mut entries: Vec<AuditEntry> = text
         .lines()
         .rev()
         .filter_map(|l| serde_json::from_str(l.trim_end()).ok())
@@ -1496,27 +2071,20 @@ async fn agent_audit_log(
 /// Effective policy snapshot for the UI (includes session-only YOLO flag and
 /// per-session path grants).
 #[tauri::command]
-async fn agent_policy_snapshot(state: State<'_, ToolState>) -> Result<Value, String> {
-    let ws = state.workspace.lock().await.clone();
+async fn agent_policy_snapshot(
+    state: State<'_, std::sync::Arc<ToolState>>,
+) -> Result<agent::policy::PolicySnapshot, String> {
+    let ws = state.primary_workspace().await;
     let mut snap = agent::policy::snapshot(ws.as_deref());
-    if let Some(obj) = snap.as_object_mut() {
-        obj.insert(
-            "yolo".into(),
-            Value::Bool(state.yolo.load(std::sync::atomic::Ordering::SeqCst)),
-        );
-        let grants = state.path_grants.lock().unwrap();
-        obj.insert(
-            "pathGrants".into(),
-            serde_json::to_value(grants.iter().collect::<Vec<_>>()).unwrap_or(Value::Array(vec![])),
-        );
-    }
+    snap.yolo = Some(state.yolo.load(std::sync::atomic::Ordering::SeqCst));
+    snap.path_grants = state.path_grants.lock().unwrap().iter().cloned().collect();
     Ok(snap)
 }
 
 /// Toggle the YOLO sub-mode (Bionic §3.3): ROUTINE shell commands skip the
 /// approval dialog; red-zone stays denied unconditionally. Session-only.
 #[tauri::command]
-async fn agent_set_yolo(state: State<'_, ToolState>, on: bool) -> Result<(), String> {
+async fn agent_set_yolo(state: State<'_, std::sync::Arc<ToolState>>, on: bool) -> Result<(), String> {
     state.yolo.store(on, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
@@ -1526,7 +2094,7 @@ async fn agent_set_yolo(state: State<'_, ToolState>, on: bool) -> Result<(), Str
 /// persisted to disk.
 #[tauri::command]
 async fn agent_grant_path(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     path: String,
     mode: String,
 ) -> Result<(), String> {
@@ -1545,34 +2113,184 @@ async fn agent_grant_path(
 
 /// Revoke every grant covering `path` (exact match or descendant).
 #[tauri::command]
-async fn agent_revoke_path(state: State<'_, ToolState>, path: String) -> Result<(), String> {
+async fn agent_revoke_path(state: State<'_, std::sync::Arc<ToolState>>, path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(path.trim());
     let mut grants = state.path_grants.lock().unwrap();
     grants.retain(|g| g.path != p && !g.path.starts_with(&p));
     Ok(())
 }
 
-/// Create a git checkpoint commit directly from the UI (bypasses the agent
-/// tool loop; safe, additive — `git add -A` + `git commit`).
-#[tauri::command]
-async fn agent_git_checkpoint_cmd(
-    state: State<'_, ToolState>,
-    interrupt_state: State<'_, InterruptState>,
-    message: Option<String>,
-) -> Result<agent::ToolResult, String> {
-    agent::tools::git_checkpoint(&state, &interrupt_state.current(), message.as_deref()).await
+/// A checkpoint commit shown by the revert UI (`agent_git_checkpoints_cmd`).
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointInfo {
+    hash: String,
+    subject: String,
+    relative: String,
+    /// User-given name when this checkpoint was created with `name`,
+    /// resolved from `.ai/checkpoints.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
-/// List existing checkpoints (hash/subject/relative age), newest first, for
-/// the one-click revert UI.
+/// A user-named snapshot (`.ai/checkpoints.json`), keyed by commit hash.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NamedCheckpoint {
+    hash: String,
+    name: String,
+    time_ms: u64,
+}
+
+fn checkpoint_names_path(ws: &Path) -> PathBuf {
+    ws.join(".ai").join("checkpoints.json")
+}
+
+/// Load the name registry (`{workspace}/.ai/checkpoints.json`).
+async fn load_named_checkpoints(ws: &Path) -> Vec<NamedCheckpoint> {
+    tokio::fs::read_to_string(checkpoint_names_path(ws))
+        .await
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the name registry, creating `.ai` as needed.
+async fn save_named_checkpoints(ws: &Path, list: &[NamedCheckpoint]) -> Result<(), String> {
+    let dir = ws.join(".ai");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    tokio::fs::write(checkpoint_names_path(ws), text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Full HEAD hash in `ws`, after a checkpoint commit wrote it. Best-effort:
+/// anything that prevents git from answering yields `None` and the name is
+/// simply not recorded.
+async fn git_head_hash(ws: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["rev-parse", "HEAD"])
+        .current_dir(ws)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
+/// Create a git checkpoint commit directly from the UI (bypasses the agent
+/// tool loop; safe, additive — `git add -A` + `git commit`). An optional
+/// `name` records a friendly label for the snapshot in
+/// `.ai/checkpoints.json` (backward-compatible: unnamed checkpoints are
+/// simply not registered, and a name-record failure never fails the commit).
+#[tauri::command]
+async fn agent_git_checkpoint_cmd(
+    state: State<'_, std::sync::Arc<ToolState>>,
+    interrupt_state: State<'_, InterruptState>,
+    message: Option<String>,
+    name: Option<String>,
+) -> Result<agent::ToolResult, String> {
+    let result = agent::tools::git_checkpoint(&state, &interrupt_state.current(), message.as_deref())
+        .await?;
+    let label = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    if result.success {
+        if let Some(label) = label {
+            if let Some(ws) = state.primary_workspace().await {
+                if let Some(hash) = git_head_hash(&ws).await {
+                    let mut list = load_named_checkpoints(&ws).await;
+                    list.retain(|c| c.hash != hash);
+                    list.push(NamedCheckpoint {
+                        hash,
+                        name: label,
+                        time_ms: agent::now_ms(),
+                    });
+                    if let Err(e) = save_named_checkpoints(&ws, &list).await {
+                        logging::warn(
+                            None,
+                            "checkpoint",
+                            &format!("checkpoint created but name not persisted: {e}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// List existing checkpoints (hash/subject/relative age/user name), newest
+/// first, for the one-click revert UI.
 #[tauri::command]
 async fn agent_git_checkpoints_cmd(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     interrupt_state: State<'_, InterruptState>,
-) -> Result<Vec<Value>, String> {
-    agent::tools::git_checkpoints(&state, &interrupt_state.current())
-        .await
-        .map(|v| v.into_iter().collect())
+) -> Result<Vec<CheckpointInfo>, String> {
+    let ws = state.primary_workspace().await;
+    let names: HashMap<String, String> = match ws.as_deref() {
+        Some(ws) => load_named_checkpoints(ws)
+            .await
+            .into_iter()
+            .map(|c| (c.hash, c.name))
+            .collect(),
+        None => HashMap::new(),
+    };
+    let values = agent::tools::git_checkpoints(&state, &interrupt_state.current()).await?;
+    Ok(values
+        .into_iter()
+        .map(|v| {
+            let hash = v
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = names.get(&hash).cloned();
+            CheckpointInfo {
+                hash,
+                subject: v
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                relative: v
+                    .get("relative")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name,
+            }
+        })
+        .collect())
+}
+
+/// Browse user-named snapshots (`{workspace}/.ai/checkpoints.json`), newest
+/// first. Unnamed git checkpoints are excluded (see `agent_git_checkpoints_cmd`
+/// for the full list).
+#[tauri::command]
+async fn agent_checkpoint_names_cmd(
+    state: State<'_, std::sync::Arc<ToolState>>,
+) -> Result<Vec<NamedCheckpoint>, String> {
+    let mut list = match state.primary_workspace().await {
+        Some(ws) => load_named_checkpoints(&ws).await,
+        None => Vec::new(),
+    };
+    list.sort_by_key(|c| std::cmp::Reverse(c.time_ms));
+    Ok(list)
 }
 
 /// Hard-reset to a checkpoint commit. Destructive by nature — the frontend
@@ -1580,7 +2298,7 @@ async fn agent_git_checkpoints_cmd(
 /// not apply here because this is an explicit user action, not a model call.
 #[tauri::command]
 async fn agent_git_revert_cmd(
-    state: State<'_, ToolState>,
+    state: State<'_, std::sync::Arc<ToolState>>,
     interrupt_state: State<'_, InterruptState>,
     commit: Option<String>,
 ) -> Result<agent::ToolResult, String> {
@@ -1592,21 +2310,25 @@ async fn agent_git_revert_cmd(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-async fn settings_load(app: AppHandle) -> Result<Value, String> {
+async fn settings_load(app: AppHandle) -> Result<AppSettings, String> {
     let dir = app_data_dir(&app);
     let path = dir.join("settings.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
-        Err(_) => Ok(json!({})),
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => Ok(parse_settings(&text)),
+        Err(_) => Ok(AppSettings::default()),
     }
 }
 
 #[tauri::command]
-async fn settings_save(app: AppHandle, settings: Value) -> Result<(), String> {
+async fn settings_save(app: AppHandle, settings: AppSettings) -> Result<(), String> {
     let dir = app_data_dir(&app);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("settings.json"), text).map_err(|e| e.to_string())
+    tokio::fs::write(dir.join("settings.json"), text)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Sanitize a project string into a filesystem-safe key. This is the legacy
@@ -1657,19 +2379,20 @@ fn session_file(dir: &Path, project: &str, chat_id: Option<&str>) -> PathBuf {
 
 /// Remember the original workspace path behind a sanitized key
 /// (`sessions/projects.json`) so the projects tree can show real names.
-fn remember_project_name(dir: &Path, key: &str, original: &str) {
+async fn remember_project_name(dir: &Path, key: &str, original: &str) {
     if key == original {
         return;
     }
     let idx_path = dir.join("projects.json");
-    let mut map: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&idx_path)
+    let mut map: std::collections::BTreeMap<String, String> = tokio::fs::read_to_string(&idx_path)
+        .await
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     if map.get(key).map(String::as_str) != Some(original) {
         map.insert(key.to_string(), original.to_string());
         if let Ok(json) = serde_json::to_string_pretty(&map) {
-            let _ = std::fs::write(idx_path, json);
+            let _ = tokio::fs::write(idx_path, json).await;
         }
     }
 }
@@ -1746,94 +2469,100 @@ struct SessionProjectInfo {
 #[tauri::command]
 async fn session_projects(app: AppHandle) -> Result<Vec<SessionProjectInfo>, String> {
     let dir = app_data_dir(&app).join("sessions");
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let names: std::collections::BTreeMap<String, String> =
-        std::fs::read_to_string(dir.join("projects.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-    let mut projects: Vec<SessionProjectInfo> = Vec::new();
-    let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let key = stem.to_string();
-            let name = names.get(&key).cloned().unwrap_or_else(|| key.clone());
-            let updated = modified_ms(&path);
-            let title = chat_title(&path).unwrap_or_else(|| "Default chat".to_string());
-            if let Some(p) = projects.iter_mut().find(|p| p.key == key) {
-                p.chats.push(SessionChatInfo {
-                    id: String::new(),
-                    title,
-                    updated_at_ms: updated,
-                    turns: count_lines(&path),
-                });
-                p.last_active_ms = p.last_active_ms.max(updated);
-            } else {
-                projects.push(SessionProjectInfo {
-                    key,
-                    name,
-                    last_active_ms: updated,
-                    chats: vec![SessionChatInfo {
+    tokio::task::spawn_blocking(move || -> Result<Vec<SessionProjectInfo>, String> {
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let names: std::collections::BTreeMap<String, String> =
+            std::fs::read_to_string(dir.join("projects.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        let mut projects: Vec<SessionProjectInfo> = Vec::new();
+        let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let key = stem.to_string();
+                let name = names.get(&key).cloned().unwrap_or_else(|| key.clone());
+                let updated = modified_ms(&path);
+                let title = chat_title(&path).unwrap_or_else(|| "Default chat".to_string());
+                if let Some(p) = projects.iter_mut().find(|p| p.key == key) {
+                    p.chats.push(SessionChatInfo {
                         id: String::new(),
                         title,
                         updated_at_ms: updated,
                         turns: count_lines(&path),
-                    }],
-                });
-            }
-        } else if path.is_dir() {
-            let Some(key) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let key = key.to_string();
-            let name = names.get(&key).cloned().unwrap_or_else(|| key.clone());
-            let mut chats: Vec<SessionChatInfo> = Vec::new();
-            let mut last = 0u64;
-            if let Ok(kids) = std::fs::read_dir(&path) {
-                for kid in kids.flatten() {
-                    let kp = kid.path();
-                    if !kp.is_file() || kp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    let Some(id) = kp.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    let id = id.to_string();
-                    let updated = modified_ms(&kp);
-                    last = last.max(updated);
-                    chats.push(SessionChatInfo {
-                        title: chat_title(&kp).unwrap_or_else(|| "Empty chat".to_string()),
-                        id,
-                        updated_at_ms: updated,
-                        turns: count_lines(&kp),
+                    });
+                    p.last_active_ms = p.last_active_ms.max(updated);
+                } else {
+                    projects.push(SessionProjectInfo {
+                        key,
+                        name,
+                        last_active_ms: updated,
+                        chats: vec![SessionChatInfo {
+                            id: String::new(),
+                            title,
+                            updated_at_ms: updated,
+                            turns: count_lines(&path),
+                        }],
                     });
                 }
-            }
-            match projects.iter_mut().find(|p| p.key == key) {
-                Some(p) => {
-                    p.chats.extend(chats);
-                    p.last_active_ms = p.last_active_ms.max(last);
+            } else if path.is_dir() {
+                let Some(key) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let key = key.to_string();
+                let name = names.get(&key).cloned().unwrap_or_else(|| key.clone());
+                let mut chats: Vec<SessionChatInfo> = Vec::new();
+                let mut last = 0u64;
+                if let Ok(kids) = std::fs::read_dir(&path) {
+                    for kid in kids.flatten() {
+                        let kp = kid.path();
+                        if !kp.is_file()
+                            || kp.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                        {
+                            continue;
+                        }
+                        let Some(id) = kp.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        let id = id.to_string();
+                        let updated = modified_ms(&kp);
+                        last = last.max(updated);
+                        chats.push(SessionChatInfo {
+                            title: chat_title(&kp).unwrap_or_else(|| "Empty chat".to_string()),
+                            id,
+                            updated_at_ms: updated,
+                            turns: count_lines(&kp),
+                        });
+                    }
                 }
-                None => projects.push(SessionProjectInfo {
-                    key,
-                    name,
-                    last_active_ms: last,
-                    chats,
-                }),
+                match projects.iter_mut().find(|p| p.key == key) {
+                    Some(p) => {
+                        p.chats.extend(chats);
+                        p.last_active_ms = p.last_active_ms.max(last);
+                    }
+                    None => projects.push(SessionProjectInfo {
+                        key,
+                        name,
+                        last_active_ms: last,
+                        chats,
+                    }),
+                }
             }
         }
-    }
-    for p in &mut projects {
-        p.chats.sort_by_key(|c| std::cmp::Reverse(c.updated_at_ms));
-    }
-    projects.sort_by_key(|p| std::cmp::Reverse(p.last_active_ms));
-    Ok(projects)
+        for p in &mut projects {
+            p.chats.sort_by_key(|c| std::cmp::Reverse(c.updated_at_ms));
+        }
+        projects.sort_by_key(|p| std::cmp::Reverse(p.last_active_ms));
+        Ok(projects)
+    })
+    .await
+    .map_err(|e| format!("Session scan task panicked: {e}"))?
 }
 
 /// Delete a named chat's log. The default (legacy) chat cannot be deleted.
@@ -1850,11 +2579,11 @@ async fn session_delete_chat(
     let dir = app_data_dir(&app).join("sessions");
     let file = session_file(&dir, &project, Some(chat));
     if file.exists() {
-        std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+        tokio::fs::remove_file(&file).await.map_err(|e| e.to_string())?;
     }
     if let Some(parent) = file.parent() {
         if parent != dir && parent.is_dir() {
-            let _ = std::fs::remove_dir(parent); // only removes when empty
+            let _ = tokio::fs::remove_dir(parent).await; // only removes when empty
         }
     }
     Ok(())
@@ -1869,22 +2598,25 @@ async fn session_append(
     chat_id: Option<String>,
 ) -> Result<(), String> {
     let dir = app_data_dir(&app).join("sessions");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
     let safe = session_key(&project);
-    remember_project_name(&dir, &safe, &project);
+    remember_project_name(&dir, &safe, &project).await;
     let file = session_file(&dir, &project, chat_id.as_deref());
     if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let mut line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     line.push('\n');
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(file)
+        .open(&file)
+        .await
         .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())
+    f.write_all(line.as_bytes()).await.map_err(|e| e.to_string())
 }
 
 /// Load the full history for one project chat (all JSONL records in order).
@@ -1896,7 +2628,7 @@ async fn session_load(
 ) -> Result<Vec<Value>, String> {
     let dir = app_data_dir(&app).join("sessions");
     let file = session_file(&dir, &project, chat_id.as_deref());
-    let Ok(text) = std::fs::read_to_string(&file) else {
+    let Ok(text) = tokio::fs::read_to_string(&file).await else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -2058,13 +2790,15 @@ pub fn run() {
     builder
         .manage(InferenceState::default())
         .manage(HubState::default())
+        .manage(ProviderRegistryState::default())
         .manage(ApiServerState::default())
-        .manage(ToolState {
+        .manage(std::sync::Arc::new(ToolState {
             knowledge: knowledge.clone(),
             ..ToolState::default()
-        })
+        }))
         .manage(InterruptState::default())
         .manage(ContextState::default())
+        .manage(watcher::WatcherState::new())
         .manage(knowledge)
         .setup(|app| {
             // Route every [BE]/[LLM] log line into (a) the rolling file
@@ -2120,20 +2854,34 @@ pub fn run() {
             update_check,
             configure_remote_model,
             list_remote_models,
+            providers_upsert,
+            providers_remove,
+            providers_set_role,
+            providers_clear_role,
+            providers_route,
+            providers_list,
             unload_model,
             model_status,
             stream_inference,
             cancel_inference,
             abort_agent_execution,
             agent_run_task,
+            agent_run_background,
+            list_background_tasks,
+            abort_background_task,
             pick_workspace_folder,
             pick_text_file,
             list_directory,
             read_text_file,
             write_text_file,
+            revert_file,
             save_file_as,
+            save_file_as_bytes,
             agent_set_workspace,
             agent_get_workspace,
+            agent_get_workspaces,
+            agent_add_workspace,
+            agent_remove_workspace,
             agent_execute_tool,
             agent_batch_execute,
             agent_tool_schemas,
@@ -2146,6 +2894,7 @@ pub fn run() {
             skill_install,
             skill_uninstall,
             agent_respond_permission,
+            agent_respond_question,
             agent_audit_log,
             agent_policy_snapshot,
             agent_set_yolo,
@@ -2154,6 +2903,7 @@ pub fn run() {
             agent_git_checkpoint_cmd,
             agent_git_checkpoints_cmd,
             agent_git_revert_cmd,
+            agent_checkpoint_names_cmd,
             settings_load,
             settings_save,
             session_append,
@@ -2166,7 +2916,10 @@ pub fn run() {
             context_status,
             context_set_system_prompt,
             context_set_file_buffer,
-            context_push_turn
+            context_push_turn,
+            watcher::start_file_watcher,
+            watcher::stop_file_watcher,
+            watcher::file_watcher_active,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Editor");

@@ -15,16 +15,27 @@ use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
+use streaming_iterator::StreamingIterator;
 
 use super::{
     now_ms, plan, policy, todo, AgentToolEvent, FileChangedEvent, PermissionDecision,
-    PermissionRequestEvent, ToolCall, ToolResult, ToolState,
+    PermissionRequestEvent, QuestionRequestEvent, ToolCall, ToolResult, ToolState,
 };
 use crate::engine::TextGenerator;
 
 /// How long the agent waits for a human to approve an `ask`-policy tool.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long `ask_question` waits for the user to answer before giving up
+/// (longer than permission approvals — questions may need real thought).
+const QUESTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Safety timeout for tool execution. Prevents a stuck NFS scan, infinite loop,
+/// or unresponsive subprocess from blocking the entire agent loop. Individual
+/// tools (execute_terminal_command, run_python, etc.) may have their own
+/// shorter timeouts passed as parameters.
+const TOOL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The outcome of an `ask`-policy gate, including what the user chose so the
 /// caller can apply decision memory and record the audit trail.
@@ -58,6 +69,7 @@ pub async fn dispatch(
     let started_at = now_ms();
     let id = state.next_event_id();
     let tool = call.name();
+    let session_id = state.session_id.load(std::sync::atomic::Ordering::SeqCst);
 
     emit(
         app,
@@ -69,12 +81,14 @@ pub async fn dispatch(
             started_at,
             duration_ms: None,
             detail: None,
+            session_id,
         },
     );
 
     // ---- policy gate ----
-    let workspace = state.workspace.lock().await.clone();
-    let verdict = policy::check(state, call, workspace.as_deref());
+    let workspaces = state.all_workspaces().await;
+    let workspace = workspaces.first().cloned();
+    let verdict = policy::check(state, call, &workspaces);
     let mut decision = "allow".to_string();
     let allowed = match &verdict {
         policy::Verdict::Allow => true,
@@ -92,6 +106,7 @@ pub async fn dispatch(
                     started_at,
                     duration_ms: Some(duration_ms),
                     detail: result.error.clone(),
+                    session_id,
                 },
             );
             audit(
@@ -117,6 +132,9 @@ pub async fn dispatch(
                 AskOutcome::GrantedSession => {
                     decision = "granted-session".to_string();
                     policy::remember_session(state, call);
+                    // policy.rs inserts directly into `session_allow`; persist
+                    // the resulting set so grants survive app restarts.
+                    state.save_session_allow();
                     true
                 }
                 AskOutcome::GrantedAlways => {
@@ -153,6 +171,7 @@ pub async fn dispatch(
                 started_at,
                 duration_ms: Some(duration_ms),
                 detail: result.error.clone(),
+                session_id,
             },
         );
         audit(
@@ -170,7 +189,8 @@ pub async fn dispatch(
         return Ok(result);
     }
 
-    let result = match call {
+    let result = match tokio::time::timeout(TOOL_EXECUTION_TIMEOUT, async {
+        match call {
         ToolCall::GlobSearchCodebase {
             pattern,
             root,
@@ -192,8 +212,26 @@ pub async fn dispatch(
             start_line,
             end_line,
         } => read_file_range(path, *start_line, *end_line).await,
-        ToolCall::ApplyFileDiff { path, diff } => apply_file_diff(app, path, diff).await,
-        ToolCall::WriteFile { path, content } => write_file(app, path, content).await,
+        ToolCall::ApplyFileDiff { path, diff } => {
+            // Auto-checkpoint before the first file edit in each step.
+            if !state.step_checkpointed.load(std::sync::atomic::Ordering::Relaxed) {
+                state.step_checkpointed.store(true, std::sync::atomic::Ordering::Relaxed);
+                if workspace.is_some() {
+                    let _ = git_checkpoint(state, &CancellationToken::new(), Some("auto-checkpoint before edit")).await;
+                }
+            }
+            apply_file_diff(app, path, diff).await
+        }
+        ToolCall::WriteFile { path, content } => {
+            // Auto-checkpoint before the first file write in each step.
+            if !state.step_checkpointed.load(std::sync::atomic::Ordering::Relaxed) {
+                state.step_checkpointed.store(true, std::sync::atomic::Ordering::Relaxed);
+                if workspace.is_some() {
+                    let _ = git_checkpoint(state, &CancellationToken::new(), Some("auto-checkpoint before write")).await;
+                }
+            }
+            write_file(app, path, content).await
+        }
         ToolCall::SearchFileContents {
             pattern,
             include,
@@ -232,6 +270,9 @@ pub async fn dispatch(
             content,
         } => create_skill(app, state, name, description.as_deref(), content).await,
         ToolCall::ReadSkill { name } => read_skill(state, name).await,
+        ToolCall::SuggestSkills { prompt, path } => {
+            suggest_skills(state, &prompt, path.as_deref()).await
+        }
         ToolCall::ExecuteTerminalCommand {
             command,
             timeout_secs,
@@ -280,6 +321,45 @@ pub async fn dispatch(
         ToolCall::RunTests { command } => {
             run_tests(app, state, &interrupt, command.as_deref()).await
         }
+        ToolCall::GitBlame {
+            path,
+            start_line,
+            end_line,
+        } => git_blame(state, &interrupt, path, *start_line, *end_line).await,
+        ToolCall::GitPush {
+            remote,
+            branch,
+            set_upstream,
+        } => {
+            git_push(
+                state,
+                &interrupt,
+                remote.as_deref(),
+                branch.as_deref(),
+                set_upstream.unwrap_or(false),
+            )
+            .await
+        }
+        ToolCall::GitPull {} => git_pull(state, &interrupt).await,
+        ToolCall::GitCreateBranch { name } => git_create_branch(state, &interrupt, name).await,
+        ToolCall::GitPrStatus {} => git_pr_status(state, &interrupt).await,
+        ToolCall::GitCiStatus {} => git_ci_status(state, &interrupt).await,
+        ToolCall::CreatePr { title, body } => {
+            create_pr_tool(state, &interrupt, title, body.as_deref()).await
+        }
+        ToolCall::SummarizeChanges {} => summarize_changes(state, &interrupt).await,
+        ToolCall::ReadLints { path } => read_lints_tool(state, path).await,
+        ToolCall::AskQuestion { question, choices } => {
+            ask_question(
+                app,
+                state,
+                &interrupt,
+                question,
+                choices.clone().unwrap_or_default(),
+            )
+            .await
+        }
+        ToolCall::SendToUser { message } => send_to_user(message).await,
         ToolCall::CreatePlan { title, goal, items } => create_plan(state, title, goal, items).await,
         ToolCall::ReadPlan {} => read_plan(state).await,
         ToolCall::UpdatePlan {
@@ -292,6 +372,20 @@ pub async fn dispatch(
             "execute_plan",
             "execute_plan is handled by the orchestrator".into(),
             "should not reach dispatch".into(),
+        )),
+        // Task (subagents) is likewise intercepted by the orchestrator.
+        ToolCall::Task {
+            subagent_type,
+            task,
+            model_override: _,
+        } => Ok(ToolResult::err(
+            "task",
+            "task is handled by the orchestrator".into(),
+            format!(
+                "should not reach dispatch (subagent_type: {}, task: {})",
+                subagent_type.as_deref().unwrap_or("explore"),
+                task
+            ),
         )),
         ToolCall::ListDir { path } => list_dir(state, path.as_deref()).await,
         ToolCall::ReadFileChars {
@@ -355,6 +449,30 @@ pub async fn dispatch(
         ToolCall::TranscribeAudio { path, language } => {
             transcribe_audio_tool(state, path, language.as_deref()).await
         }
+        ToolCall::TreeSitterQuery { path, query, max_results } => {
+            tree_sitter_query(path, query, *max_results).await
+        }
+        ToolCall::AnalyzeBug { stack, path } => {
+            analyze_bug(state, stack, path.as_deref()).await
+        }
+        ToolCall::ReviewCode { path, diff } => {
+            review_code(state, &interrupt, path.as_deref(), diff.as_deref()).await
+        }
+        ToolCall::ViewRepoMap { top_n, root } => {
+            view_repo_map(state, top_n.unwrap_or(60), root.as_deref()).await
+        }
+        ToolCall::BrowseWeb { url, action } => {
+            browse_web(state, &interrupt, url, action.as_deref()).await
+        }
+        }
+    }).await {
+        Ok(inner_result) => inner_result,
+        Err(_elapsed) => {
+            Err(format!(
+                "Tool `{tool}` timed out after {}s — the operation was taking too long",
+                TOOL_EXECUTION_TIMEOUT.as_secs()
+            ))
+        }
     };
 
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -384,6 +502,7 @@ pub async fn dispatch(
             started_at,
             duration_ms: Some(duration_ms),
             detail: final_result.error.clone(),
+            session_id,
         },
     );
 
@@ -407,8 +526,9 @@ pub async fn dispatch(
 /// policy decision and outcome. Best effort: a missing/read-only workspace or
 /// disk error never breaks the agent loop. Only the human-readable summary is
 /// logged - raw args (file content, secrets) are never written.
+/// Also used by the orchestrator for intercepted calls (subagents).
 #[allow(clippy::too_many_arguments)]
-fn audit(
+pub(crate) fn audit(
     state: &ToolState,
     workspace: Option<&Path>,
     id: &str,
@@ -529,6 +649,92 @@ async fn ask_approval(
     }
 }
 
+/// Emit a `agent://question-request` and block until the user answers
+/// (P1-9). The answer — a preset choice or free text — becomes the tool's
+/// stdout so the model can act on it directly.
+async fn ask_question(
+    app: &AppHandle,
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    question: &str,
+    choices: Vec<String>,
+) -> Result<ToolResult, String> {
+    if question.trim().is_empty() {
+        return Err("ask_question needs a non-empty question".into());
+    }
+    let request_id = state.next_question_id();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = state.pending_questions.lock().await;
+        pending.insert(request_id.clone(), tx);
+    }
+    crate::logging::info(None, "tool.question", &format!("asking user: {question}"));
+    let _ = app.emit(
+        "agent://question-request",
+        QuestionRequestEvent {
+            request_id: request_id.clone(),
+            question: question.to_string(),
+            choices,
+            timestamp_ms: now_ms(),
+        },
+    );
+
+    enum Rcvd {
+        Answer(String),
+        TimedOut,
+        Aborted,
+    }
+    let rcvd = tokio::select! {
+        r = rx => Rcvd::Answer(r.unwrap_or_else(|_| "[no answer]".to_string())),
+        _ = tokio::time::sleep(QUESTION_TIMEOUT) => Rcvd::TimedOut,
+        _ = interrupt.clone().cancelled_owned() => Rcvd::Aborted,
+    };
+    {
+        let mut pending = state.pending_questions.lock().await;
+        pending.remove(&request_id);
+    }
+
+    match rcvd {
+        Rcvd::Answer(answer) => {
+            let short: String = answer.chars().take(80).collect();
+            Ok(ToolResult::ok(
+                "ask_question",
+                format!("User answered: {short}"),
+                Some(answer),
+                Some(json!({ "requestId": request_id })),
+            ))
+        }
+        Rcvd::TimedOut => Ok(ToolResult::err(
+            "ask_question",
+            "Question timed out with no answer".into(),
+            "The user did not answer within the time limit; proceed with your best judgment and say so."
+                .into(),
+        )),
+        Rcvd::Aborted => Err(super::interrupt::ABORT_REASON.to_string()),
+    }
+}
+
+/// One-way note addressed to the human user. The tool card in the timeline
+/// already renders the message, so this needs no extra plumbing.
+async fn send_to_user(message: &str) -> Result<ToolResult, String> {
+    if message.trim().is_empty() {
+        return Err("send_to_user needs a non-empty message".into());
+    }
+    let short: String = message
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect();
+    Ok(ToolResult::ok(
+        "send_to_user",
+        format!("Message to user: {short}"),
+        Some(message.to_string()),
+        None,
+    ))
+}
+
 /// Independent LLM review of a shell command (Bionic §3.3 hardening).
 ///
 /// Runs a tiny generation ("VERDICT: SAFE/UNSAFE — reason") on a spare engine
@@ -559,11 +765,14 @@ Command: {command_summary}\n"
     );
     let request = crate::engine::InferenceRequest {
         prompt,
+        messages: None,
         max_tokens: 48,
         temperature: Some(0.1),
         top_p: Some(0.9),
+        repeat_penalty: Some(1.1),
         seed: None,
-        stop_words: Some(vec!["<|endoftext|>".into()]),
+        stop_words: Some(vec!["DONE".into()]),
+        cached_prefix_tokens: None,
     };
     // PoolGenerator::generate blocks on a crossbeam reply — keep it off the
     // async runtime thread.
@@ -620,6 +829,7 @@ fn emit_file_changed(app: &AppHandle, path: &str, kind: &str, before: &str, afte
             path: path.to_string(),
             kind: kind.to_string(),
             diff: unified_diff(before, after, path),
+            before: if before.is_empty() { None } else { Some(before.to_string()) },
         },
     );
 }
@@ -663,7 +873,7 @@ async fn resolve_root(state: &ToolState, root: Option<&str>) -> Result<PathBuf, 
         ));
     }
     let guard = state.workspace.lock().await;
-    match guard.as_ref() {
+    match guard.first() {
         Some(p) => Ok(p.clone()),
         None => Err(
             "No workspace set yet - open a workspace first, or pass an explicit `root`."
@@ -985,6 +1195,7 @@ fn sem_tokens(text: &str) -> Vec<String> {
 }
 
 /// One indexed chunk: a window of lines from a file.
+#[derive(Clone)]
 struct SemChunk {
     /// Relative path.
     path: String,
@@ -992,6 +1203,25 @@ struct SemChunk {
     start_line: usize,
     /// TF vector of token → count within the window.
     tf: HashMap<String, usize>,
+}
+
+/// Cached TF-IDF index for semantic search. Invalidated when the workspace
+/// changes or a different root/include pattern is requested.
+pub struct SemIndex {
+    /// Workspace root this index was built for.
+    root: PathBuf,
+    /// Include glob pattern (None = no filter).
+    include: Option<String>,
+    /// Whether gitignore was respected.
+    respect_gitignore: bool,
+    /// Total number of chunks.
+    n: usize,
+    /// Document frequency: token → number of chunks containing it.
+    df: HashMap<String, usize>,
+    /// The indexed chunks.
+    chunks: Vec<SemChunk>,
+    /// Number of files indexed.
+    files_indexed: usize,
 }
 
 /// Build the in-memory TF-IDF index over the workspace and rank windows by
@@ -1005,133 +1235,176 @@ async fn semantic_search_codebase(
     top_k: usize,
 ) -> Result<ToolResult, String> {
     let root = resolve_root(state, root).await?;
-    let include_matcher = include
+    let include_str = include
         .filter(|inc| !inc.trim().is_empty())
-        .map(|inc| {
-            GlobBuilder::new(inc)
-                .case_insensitive(true)
-                .build()
-                .map(|g| g.compile_matcher())
-        })
-        .transpose()
-        .map_err(|e| format!("Invalid include glob `{include:?}`: {e}"))?;
+        .map(|s| s.to_string());
 
-    let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(true)
-        .parents(true)
-        .ignore(true)
-        .git_ignore(respect_gitignore)
-        .git_global(respect_gitignore)
-        .git_exclude(respect_gitignore)
-        .require_git(false)
-        .follow_links(false);
-    builder.filter_entry(|entry| {
-        if entry.depth() == 0 {
-            return true;
-        }
-        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-            let name = entry.file_name().to_string_lossy();
-            return !SKIP_DIRS.contains(&name.as_ref());
-        }
-        true
-    });
+    // Build or reuse the cached index, then drop the lock before scoring.
+    let needs_rebuild = {
+        let guard = state.sem_index.lock().unwrap();
+        !guard.as_ref().map(|idx| {
+            idx.root == root && idx.include == include_str && idx.respect_gitignore == respect_gitignore
+        }).unwrap_or(false)
+    };
 
-    const WINDOW_LINES: usize = 40;
-    const WINDOW_STEP: usize = 20;
-    const MAX_FILES: usize = 600;
-    const MAX_CHUNKS: usize = 4000;
+    if needs_rebuild {
+            // Rebuild the index.
+            let include_matcher = include_str
+                .as_deref()
+                .map(|inc| {
+                    GlobBuilder::new(inc)
+                        .case_insensitive(true)
+                        .build()
+                        .map(|g| g.compile_matcher())
+                })
+                .transpose()
+                .map_err(|e| format!("Invalid include glob `{include_str:?}`: {e}"))?;
 
-    let mut chunks: Vec<SemChunk> = Vec::new();
-    let mut files_indexed = 0usize;
+            let mut builder = WalkBuilder::new(&root);
+            builder
+                .hidden(true)
+                .parents(true)
+                .ignore(true)
+                .git_ignore(respect_gitignore)
+                .git_global(respect_gitignore)
+                .git_exclude(respect_gitignore)
+                .require_git(false)
+                .follow_links(false);
+            builder.filter_entry(|entry| {
+                if entry.depth() == 0 {
+                    return true;
+                }
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let name = entry.file_name().to_string_lossy();
+                    return !SKIP_DIRS.contains(&name.as_ref());
+                }
+                true
+            });
 
-    for entry in builder.build() {
-        let entry = entry.map_err(|e| format!("Walk error: {e}"))?;
-        if files_indexed >= MAX_FILES || chunks.len() >= MAX_CHUNKS {
-            break;
-        }
-        let ft = match entry.file_type() {
-            Some(ft) if ft.is_file() => ft,
-            _ => continue,
-        };
-        if ft.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        let rel = rel_path(&root, path);
-        if let Some(m) = &include_matcher {
-            if !m.is_match(&rel) {
-                continue;
+            const WINDOW_LINES: usize = 40;
+            const WINDOW_STEP: usize = 20;
+            const MAX_FILES: usize = 600;
+            const MAX_CHUNKS: usize = 4000;
+
+            let mut chunks: Vec<SemChunk> = Vec::new();
+            let mut files_indexed = 0usize;
+
+            for entry in builder.build() {
+                let entry = entry.map_err(|e| format!("Walk error: {e}"))?;
+                if files_indexed >= MAX_FILES || chunks.len() >= MAX_CHUNKS {
+                    break;
+                }
+                let ft = match entry.file_type() {
+                    Some(ft) if ft.is_file() => ft,
+                    _ => continue,
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = rel_path(&root, path);
+                if let Some(m) = &include_matcher {
+                    if !m.is_match(&rel) {
+                        continue;
+                    }
+                }
+                let Ok(meta) = std::fs::metadata(path) else {
+                    continue;
+                };
+                if meta.len() > MAX_SEARCH_FILE_SIZE {
+                    continue;
+                }
+                files_indexed += 1;
+
+                let Ok(bytes) = tokio::fs::read(path).await else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                if lines.is_empty() {
+                    continue;
+                }
+                let mut start = 0usize;
+                while start < lines.len() && chunks.len() < MAX_CHUNKS {
+                    let end = (start + WINDOW_LINES).min(lines.len());
+                    let window = lines[start..end].join("\n");
+                    let tf = count_tf(&window);
+                    if !tf.is_empty() {
+                        chunks.push(SemChunk {
+                            path: rel.clone(),
+                            start_line: start + 1,
+                            tf,
+                        });
+                    }
+                    if end == lines.len() {
+                        break;
+                    }
+                    start += WINDOW_STEP;
+                }
             }
-        }
-        let Ok(meta) = std::fs::metadata(path) else {
-            continue;
-        };
-        if meta.len() > MAX_SEARCH_FILE_SIZE {
-            continue;
-        }
-        files_indexed += 1;
 
-        let Ok(bytes) = tokio::fs::read(path).await else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.is_empty() {
-            continue;
-        }
-        let mut start = 0usize;
-        while start < lines.len() && chunks.len() < MAX_CHUNKS {
-            let end = (start + WINDOW_LINES).min(lines.len());
-            let window = lines[start..end].join("\n");
-            let tf = count_tf(&window);
-            if !tf.is_empty() {
-                chunks.push(SemChunk {
-                    path: rel.clone(),
-                    start_line: start + 1,
-                    tf,
+            if chunks.is_empty() {
+                return Ok(ToolResult::ok(
+                    "semantic_search_codebase",
+                    format!("No indexable files under `{}`", root.to_string_lossy()),
+                    Some(String::new()),
+                    Some(json!({ "matches": 0, "root": root.to_string_lossy() })),
+                ));
+            }
+
+            // IDF: log(N / df).
+            let n = chunks.len();
+            let mut df: HashMap<String, usize> = HashMap::new();
+            for c in &chunks {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for t in c.tf.keys() {
+                    if seen.insert(t.as_str()) {
+                        *df.entry(t.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Cache the index.
+            {
+                let mut guard = state.sem_index.lock().unwrap();
+                *guard = Some(SemIndex {
+                    root: root.clone(),
+                    include: include_str.clone(),
+                    respect_gitignore,
+                    n,
+                    df,
+                    chunks,
+                    files_indexed,
                 });
             }
-            if end == lines.len() {
-                break;
-            }
-            start += WINDOW_STEP;
         }
-    }
 
-    if chunks.is_empty() {
-        return Ok(ToolResult::ok(
-            "semantic_search_codebase",
-            format!("No indexable files under `{}`", root.to_string_lossy()),
-            Some(String::new()),
-            Some(json!({ "matches": 0, "root": root.to_string_lossy() })),
-        ));
-    }
+    // Load from cache for scoring (lock released).
+    let (chunks_owned, n_val, files_indexed_val, df_owned) = {
+        let guard = state.sem_index.lock().unwrap();
+        let idx = guard.as_ref().ok_or("Semantic search index unavailable")?;
+        (
+            idx.chunks.clone(),
+            idx.n,
+            idx.files_indexed,
+            idx.df.clone(),
+        )
+    };
 
-    // IDF: log(N / df).
-    let n = chunks.len() as f64;
-    let mut df: HashMap<&str, usize> = HashMap::new();
-    for c in &chunks {
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for t in c.tf.keys() {
-            if seen.insert(t) {
-                *df.entry(t.as_str()).or_insert(0) += 1;
-            }
-        }
-    }
+    let n_f64 = n_val as f64;
 
     // Query vector.
     let q_tokens = sem_tokens(query);
-    let mut q_tf: HashMap<&str, usize> = HashMap::new();
+    let mut q_tf: HashMap<String, usize> = HashMap::new();
     for t in &q_tokens {
-        *q_tf.entry(t.as_str()).or_insert(0) += 1;
+        *q_tf.entry(t.clone()).or_insert(0) += 1;
     }
     let q_vec: Vec<(&str, f64)> = q_tf
         .iter()
-        .filter(|(t, _)| df.contains_key(*t))
+        .filter(|(t, _)| df_owned.contains_key(t.as_str()))
         .map(|(t, &f)| {
-            let idf = (n / (*df.get(t).unwrap() as f64)).ln() + 1.0;
-            (*t, f as f64 * idf)
+            let idf = (n_f64 / (*df_owned.get(t.as_str()).unwrap() as f64)).ln() + 1.0;
+            (t.as_str(), f as f64 * idf)
         })
         .collect();
 
@@ -1145,20 +1418,20 @@ async fn semantic_search_codebase(
     }
 
     // Score chunks by cosine similarity of TF-IDF vectors.
-    let mut scored: Vec<(f64, &SemChunk)> = Vec::with_capacity(chunks.len());
-    for c in &chunks {
+    let mut scored: Vec<(f64, usize)> = Vec::with_capacity(chunks_owned.len());
+    for (ci, c) in chunks_owned.iter().enumerate() {
         let mut dot = 0.0;
         let mut c_norm = 0.0;
         for (t, &count) in &c.tf {
-            let idf = (n / (*df.get(t.as_str()).unwrap() as f64)).ln() + 1.0;
+            let idf = (n_f64 / (*df_owned.get(t.as_str()).unwrap() as f64)).ln() + 1.0;
             let w = count as f64 * idf;
             c_norm += w * w;
-            if let Some((_, qw)) = q_vec.iter().find(|(qt, _)| qt == t) {
+            if let Some((_, qw)) = q_vec.iter().find(|(qt, _)| *qt == t.as_str()) {
                 dot += qw * w;
             }
         }
         if c_norm > 0.0 && dot > 0.0 {
-            scored.push((dot / c_norm.sqrt(), c));
+            scored.push((dot / c_norm.sqrt(), ci));
         }
     }
 
@@ -1176,10 +1449,12 @@ async fn semantic_search_codebase(
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     const SEM_MAX_RESULTS: usize = 25;
+    const WINDOW_LINES: usize = 40;
     let total = scored.len();
     let k = top_k.min(SEM_MAX_RESULTS).min(total);
     let mut out = String::new();
-    for (rank, (score, c)) in scored.iter().take(k).enumerate() {
+    for (rank, (score, ci)) in scored.iter().take(k).enumerate() {
+        let c = &chunks_owned[*ci];
         out.push_str(&format!(
             "{:>2}. {:.2}  {}:{}:{}\n",
             rank + 1,
@@ -1191,7 +1466,7 @@ async fn semantic_search_codebase(
     }
 
     let summary = format!(
-        "Semantic search `{query}` — {total} matching region(s), showing top {k} (indexed {files_indexed} file(s))"
+        "Semantic search `{query}` — {total} matching region(s), showing top {k} (indexed {files_indexed_val} file(s))"
     );
     Ok(ToolResult::ok(
         "semantic_search_codebase",
@@ -1199,7 +1474,7 @@ async fn semantic_search_codebase(
         Some(out),
         Some(json!({
             "matches": total,
-            "filesIndexed": files_indexed,
+            "filesIndexed": files_indexed_val,
             "root": root.to_string_lossy(),
             "topK": k,
             "query": query,
@@ -1216,6 +1491,501 @@ fn count_tf(text: &str) -> HashMap<String, usize> {
 }
 
 // ---------------------------------------------------------------------------
+// semantic reranking (P0-3 extension)
+// ---------------------------------------------------------------------------
+
+/// One rerankable search hit: an opaque payload plus the human-readable text
+/// used to score relevance. `rank_before` preserves the pre-rerank order so
+/// ties stay deterministic.
+struct RerankItem {
+    payload: usize,
+    text: String,
+    rank_before: usize,
+}
+
+/// Query-overlap rerank score: count how many query tokens appear (as whole
+/// words) in the candidate text, weighting exact matches. Higher is better.
+fn overlap_score(query_tokens: &[String], text: &str) -> f64 {
+    let hay: Vec<String> = sem_tokens(text);
+    if hay.is_empty() {
+        return 0.0;
+    }
+    let mut score = 0.0;
+    for qt in query_tokens {
+        let count = hay.iter().filter(|h| h.as_str() == qt.as_str()).count() as f64;
+        if count > 0.0 {
+            score += 1.0 + count;
+        }
+    }
+    score
+}
+
+/// Reorder `(score_hint, payload)` results by relevance to `query`.
+///
+/// When an LLM reranker is available, that callback can replace the whole
+/// body; this default implementation uses deterministic query-overlap plus an
+/// alphanumeric tiebreaker, so behavior is stable and unit-testable. Returns
+/// a new Vec of `(rerank_score, payload)` sorted best-first.
+pub fn rerank_results(
+    query: &str,
+    results: Vec<(f64, usize)>,
+    texts: &[String],
+    _llm_hint: Option<&str>,
+) -> Vec<(f64, usize)> {
+    let q_tokens = sem_tokens(query);
+    if q_tokens.is_empty() {
+        return results;
+    }
+    let mut items: Vec<RerankItem> = results
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, payload))| RerankItem {
+            payload,
+            text: texts.get(payload).cloned().unwrap_or_default(),
+            rank_before: i,
+        })
+        .collect();
+    // Sort by: overlap score desc, then original rank for determinism.
+    items.sort_by(|a, b| {
+        let sa = overlap_score(&q_tokens, &a.text);
+        let sb = overlap_score(&q_tokens, &b.text);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.rank_before.cmp(&b.rank_before))
+    });
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| (1.0 / (1.0 + i as f64), it.payload))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// repo map via symbol graph + PageRank
+// ---------------------------------------------------------------------------
+
+/// Definition-site record used to attach metadata (file, line, kind) to a
+/// symbol graph node.
+struct SymDef {
+    file: String,
+    line: usize,
+    kind: String,
+}
+
+/// Cached directional symbol graph, keyed by file mtimes so rebuilds only
+/// happen when sources change. The struct is `pub` so the ToolState field can
+/// name it; all fields remain private to this module.
+pub struct RepoGraph {
+    /// symbol name -> definition metadata.
+    defs: HashMap<String, SymDef>,
+    /// symbol name -> set of files that referenced it (edges into the symbol).
+    incoming: HashMap<String, HashSet<String>>,
+    /// symbol name -> set of files where it references other symbols.
+    outgoing: HashMap<String, HashSet<String>>,
+}
+
+/// One non-capturing-alternation regex that recognises a definition site in
+/// any supported language and captures the symbol name. Each supported
+/// definition form is an explicit alternative so the capture-group index maps
+/// cleanly to a symbol kind.
+fn def_pattern(ext: &str) -> Option<(&'static str, &'static str)> {
+    match ext {
+        "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" | "tsx" | "jsx" => Some((
+            r"(?m)^\s*(?:export\s+(?:default\s+)?)?(?:(?:async\s+)?function\*?\s+(?P<fn>[A-Za-z_$][A-Za-z0-9_$]*)\s*\(|(?:async\s+)?const\s+(?P<fn2>[A-Za-z_$][A-Za-z0-9_$]*)\s*=|class\s+(?P<class>[A-Za-z_$][A-Za-z0-9_$]*)\s*\{|interface\s+(?P<iface>[A-Za-z_$][A-Za-z0-9_$]*)\s*\{|type\s+(?P<ty>[A-Za-z_$][A-Za-z0-9_$]*)\s*=)",
+            "js",
+        )),
+        "py" | "pyi" => Some((
+            r"(?m)^\s*(?:async\s+)?def\s+(?P<fn>[A-Za-z_][A-Za-z0-9_]*)\s*\(|^\s*class\s+(?P<class>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|\:|:)|^\s*(?P<const>[A-Z][A-Z0-9_]*)\s*=",
+            "py",
+        )),
+        "rs" => Some((
+            r#"(?m)^\s*(?:(?:pub\s+)?unsafe\s+(?:extern\s+")?)?(?:pub\s+)?(?:(?:async\s+)?fn\s+(?P<fn>[A-Za-z_][A-Za-z0-9_]*)|struct\s+(?P<struct>[A-Za-z_][A-Za-z0-9_]*)|enum\s+(?P<enum>[A-Za-z_][A-Za-z0-9_]*)|trait\s+(?P<trait>[A-Za-z_][A-Za-z0-9_]*)|type\s+(?P<ty>[A-Za-z_][A-Za-z0-9_]*)|const\s+(?P<const>[A-Za-z_][A-Za-z0-9_]*)\s*:)"#,
+            "rs",
+        )),
+        _ => None,
+    }
+}
+
+/// Identifier-shaped tokens used as potential references.
+fn sym_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let re = match regex::Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]{1,})\b") {
+        Ok(re) => re,
+        Err(_) => return out,
+    };
+    for cap in re.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            out.push(m.as_str().to_string());
+        }
+    }
+    out
+}
+
+fn def_kind(ext: &str, group: &str) -> &'static str {
+    match ext {
+        "py" => match group {
+            "class" => "class",
+            "fn" => "def",
+            _ => "const",
+        },
+        "rs" => match group {
+            "fn" => "fn",
+            "struct" => "struct",
+            "enum" => "enum",
+            "trait" => "trait",
+            "ty" => "type",
+            _ => "const",
+        },
+        _ => match group {
+            "class" => "class",
+            "iface" => "interface",
+            "ty" => "type",
+            _ => "function",
+        },
+    }
+}
+
+/// Extract `(name, kind, line)` definitions + all identifier references from a
+/// file's text based on its LANguage extension. Deterministic, regex-based.
+fn extract_symbols(text: &str, ext: &str) -> (Vec<(String, String, usize)>, Vec<String>) {
+    let mut defs: Vec<(String, String, usize)> = Vec::new();
+    let Some((pat, lang)) = def_pattern(ext) else {
+        return (Vec::new(), Vec::new());
+    };
+    let _ = lang;
+    let re = match regex::Regex::new(pat) {
+        Ok(re) => re,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    for cap in re.captures_iter(text) {
+        let pos = cap.get(0).unwrap().start();
+        let line = text[..pos].matches('\n').count() + 1;
+        let mut name = String::new();
+        let mut kind = "symbol";
+        for group in ["fn", "fn2", "class", "iface", "ty", "struct", "enum", "trait", "const"] {
+            if let Some(m) = cap.name(group) {
+                if !m.as_str().is_empty() {
+                    name = m.as_str().to_string();
+                    kind = def_kind(ext, group);
+                    break;
+                }
+            }
+        }
+        if !name.is_empty() && seen.insert(name.clone()) {
+            defs.push((name, kind.to_string(), line));
+        }
+    }
+    (defs, sym_identifiers(text))
+}
+
+/// First identifier (after keyword/sigil skipping) on a 1-based line. Used as a
+/// lightweight fallback for naming a definition when the regex capture missed.
+fn first_ident(text: &str, line: usize) -> String {
+    let kw_re = regex::Regex::new(
+        r"\b(?:export|default|pub|async|unsafe|fn|def|struct|class|enum|trait|interface|type|const|let|static|impl)\b",
+    )
+    .unwrap();
+    let line_text = text.lines().nth(line.saturating_sub(1)).unwrap_or("");
+    for tok in line_text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '$') {
+            continue;
+        }
+        if kw_re.is_match(t) {
+            continue;
+        }
+        return t.to_string();
+    }
+    String::new()
+}
+
+/// Iterative PageRank over the symbol graph (damping 0.85, 30 iterations).
+/// Nodes are symbols; a directed edge `from -> name` exists for every file that
+/// references `name`. Ranks converge on symbols referenced from many files
+/// (i.e. hubs the codebase depends on). Deterministic: iteration order is
+/// stabilised by sorting symbol names.
+fn pagerank(
+    defs: &HashMap<String, SymDef>,
+    incoming: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, f64> {
+    let n = defs.len() as f64;
+    if n == 0.0 {
+        return HashMap::new();
+    }
+    let mut names: Vec<String> = defs.keys().cloned().collect();
+    names.sort();
+
+    let mut ranks: HashMap<String, f64> = HashMap::new();
+    for name in &names {
+        ranks.insert(name.clone(), 1.0 / n);
+    }
+    const DAMPING: f64 = 0.85;
+    const ITERATIONS: usize = 30;
+    for _ in 0..ITERATIONS {
+        let mut next: HashMap<String, f64> = HashMap::new();
+        for name in &names {
+            let in_degree = incoming.get(name).map(|s| s.len()).unwrap_or(0) as f64;
+            // Each incoming referencing file contributes equally to the
+            // teleport/authority mass of this node. Normalise by node count so
+            // rank stays in [0,1] and is comparable across graphs.
+            let authority = if in_degree > 0.0 { in_degree } else { 0.0 };
+            let v = (1.0 - DAMPING) / n + DAMPING * (authority / n.max(1.0));
+            next.insert(name.clone(), v);
+        }
+        ranks = next;
+    }
+    ranks
+}
+
+/// Build (or refresh from mtime cache) the symbol graph for the workspace.
+///
+/// The first full build extracts definitions + references from every supported
+/// source file; per-file sub-graphs are cached keyed by file mtime so later
+/// calls only re-read changed files. `state` is currently unused (kept for
+/// signature stability) and `_root` anchors relative paths.
+async fn build_repo_graph(
+    _state: &ToolState,
+    root: &Path,
+    cache: &mut HashMap<String, (u64, RepoGraph)>,
+) -> Result<RepoGraph, String> {
+    const MAX_REPO_FILES: usize = 400;
+    const MAX_REPO_FILE_SIZE: u64 = 512 * 1024;
+
+    let mut graph = RepoGraph {
+        defs: HashMap::new(),
+        incoming: HashMap::new(),
+        outgoing: HashMap::new(),
+    };
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(false);
+    builder.filter_entry(|entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let name = entry.file_name().to_string_lossy();
+            return !SKIP_DIRS.contains(&name.as_ref());
+        }
+        true
+    });
+
+    let mut count = 0usize;
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if count >= MAX_REPO_FILES {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Some(f) if f.is_file() => f,
+            _ => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = rel_path(root, path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "ts" | "js" | "tsx" | "jsx" | "py" | "rs" | "mts" | "cts" | "mjs" | "cjs" | "pyi"
+        ) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if meta.len() > MAX_REPO_FILE_SIZE {
+            continue;
+        }
+        count += 1;
+
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let cache_key = rel.clone();
+
+        // Fast path: unchanged file -> reuse its cached sub-graph.
+        let needs_rebuild = cache
+            .get(&cache_key)
+            .map(|(t, _)| *t != mtime)
+            .unwrap_or(true);
+        if !needs_rebuild {
+            let sub = &cache[&cache_key].1;
+            for (name, def) in &sub.defs {
+                graph.defs.insert(name.clone(), SymDef {
+                    file: def.file.clone(),
+                    line: def.line,
+                    kind: def.kind.clone(),
+                });
+            }
+            for (name, files) in &sub.incoming {
+                graph
+                    .incoming
+                    .entry(name.clone())
+                    .or_insert_with(HashSet::new)
+                    .extend(files.iter().cloned());
+            }
+            for (name, files) in &sub.outgoing {
+                graph
+                    .outgoing
+                    .entry(name.clone())
+                    .or_insert_with(HashSet::new)
+                    .extend(files.iter().cloned());
+            }
+            continue;
+        }
+
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let (defs, refs) = extract_symbols(&text, &ext);
+
+        // First pass: register local definitions so references can resolve
+        // against them (both intra-file and cross-file).
+        let mut sub = RepoGraph {
+            defs: HashMap::new(),
+            incoming: HashMap::new(),
+            outgoing: HashMap::new(),
+        };
+        for (name, kind, line) in defs {
+            sub.defs.entry(name.clone()).or_insert_with(|| SymDef {
+                file: rel.clone(),
+                line,
+                kind,
+            });
+        }
+        // Register everything into the global def table too (so cross-file
+        // references can find a name regardless of file order).
+        for (name, def) in &sub.defs {
+            graph
+                .defs
+                .entry(name.clone())
+                .or_insert_with(|| SymDef {
+                    file: def.file.clone(),
+                    line: def.line,
+                    kind: def.kind.clone(),
+                });
+        }
+
+        // Wire edges: a reference to a locally-or-globally defined symbol adds
+        // an incoming edge to that symbol from this file, and an outgoing edge
+        // from the locally-defined symbols in this file.
+        for r in &refs {
+            if graph.defs.contains_key(r) {
+                graph
+                    .incoming
+                    .entry(r.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(rel.clone());
+                sub.incoming
+                    .entry(r.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(rel.clone());
+            }
+        }
+        for name in sub.defs.keys() {
+            if refs.iter().any(|r| r == name) {
+                sub.outgoing
+                    .entry(name.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(rel.clone());
+                graph
+                    .outgoing
+                    .entry(name.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(rel.clone());
+            }
+        }
+
+        cache.insert(cache_key, (mtime, sub));
+    }
+    Ok(graph)
+}
+
+/// `view_repo_map`: build the symbol graph, run PageRank, and return the top
+/// ranked symbols within a context budget.
+async fn view_repo_map(
+    state: &ToolState,
+    top_n: usize,
+    root: Option<&str>,
+) -> Result<ToolResult, String> {
+    let root = resolve_root(state, root).await?;
+    let top_n = top_n.clamp(1, 300);
+    let graph = {
+        let mut cache = state.repo_graph.lock().await;
+        build_repo_graph(state, &root, &mut cache).await?
+    };
+
+    let ranks = pagerank(&graph.defs, &graph.incoming);
+    let mut ranked: Vec<(&String, &SymDef, f64)> = graph
+        .defs
+        .iter()
+        .map(|(name, def)| (name, def, ranks.get(name).copied().unwrap_or(0.0) + 1.0 / graph.defs.len() as f64))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    ranked.truncate(top_n);
+
+    let mut out = String::new();
+    for (i, (name, def, rank)) in ranked.iter().enumerate() {
+        out.push_str(&format!(
+            "{:>3}. {:<28} {:<12} {}:{}  rank={:.4}\n",
+            i + 1,
+            name,
+            def.kind,
+            def.file,
+            def.line,
+            rank
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("No symbols found in the workspace.\n");
+    }
+
+    let summary = format!(
+        "Repo map: {} symbol(s) ranked, showing top {top_n} (PageRank over the reference graph)",
+        graph.defs.len()
+    );
+    Ok(ToolResult::ok(
+        "view_repo_map",
+        summary,
+        Some(out),
+        Some(json!({
+            "symbols": graph.defs.len(),
+            "topN": ranked.len(),
+            "root": root.to_string_lossy(),
+        })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // view_file_structure
 // ---------------------------------------------------------------------------
 
@@ -1228,11 +1998,37 @@ struct Def {
     end_line: usize,
 }
 
+fn resolve_grammar(ext: &str) -> Option<Language> {
+    match ext {
+        "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => {
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        }
+        "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
+        "json" | "jsonc" => Some(tree_sitter_json::LANGUAGE.into()),
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        _ => None,
+    }
+}
+
 async fn view_file_structure(path: &str, max_depth: usize) -> Result<ToolResult, String> {
     let src = tokio::fs::read(path)
         .await
         .map_err(|e| format!("Cannot read `{path}`: {e}"))?;
-    let lang: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let lang: Option<Language> = resolve_grammar(&ext);
+    let Some(lang) = lang else {
+        return Ok(ToolResult::ok(
+            "view_file_structure",
+            format!("No tree-sitter grammar available for `.{ext}` files — supported: JS/TS/TSX/JSX, Python, JSON, Rust"),
+            Some(String::new()),
+            Some(json!({ "declarations": 0, "maxDepth": max_depth, "path": path, "unsupported": true })),
+        ));
+    };
     let mut parser = Parser::new();
     parser
         .set_language(&lang)
@@ -1263,7 +2059,7 @@ async fn view_file_structure(path: &str, max_depth: usize) -> Result<ToolResult,
     }
 
     let summary = format!(
-        "Parsed `{}` - {} top-level declaration(s)",
+        "Parsed `{}` (.{ext}) - {} top-level declaration(s)",
         Path::new(path)
             .file_name()
             .map(|f| f.to_string_lossy())
@@ -1274,7 +2070,114 @@ async fn view_file_structure(path: &str, max_depth: usize) -> Result<ToolResult,
         "view_file_structure",
         summary,
         Some(out),
-        Some(json!({ "declarations": defs.len(), "maxDepth": max_depth, "path": path })),
+        Some(json!({ "declarations": defs.len(), "maxDepth": max_depth, "path": path, "language": ext })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// tree_sitter_query
+// ---------------------------------------------------------------------------
+
+async fn tree_sitter_query(
+    path: &str,
+    query_str: &str,
+    max_results: Option<usize>,
+) -> Result<ToolResult, String> {
+    let src = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("Cannot read `{path}`: {e}"))?;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let lang: Option<Language> = resolve_grammar(&ext);
+    let Some(lang) = lang else {
+        return Ok(ToolResult::ok(
+            "tree_sitter_query",
+            format!("No tree-sitter grammar available for `.{ext}` files — supported: JS/TS/TSX/JSX, Python, JSON, Rust"),
+            Some(String::new()),
+            Some(json!({ "matches": 0, "path": path, "unsupported": true })),
+        ));
+    };
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&lang)
+        .map_err(|e| format!("Parser language error: {e}"))?;
+    let tree = parser
+        .parse(&src, None)
+        .ok_or_else(|| format!("Failed to parse `{path}`"))?;
+
+    let query = Query::new(&lang, query_str).map_err(|e| format!("Invalid query: {e}"))?;
+
+    let limit = max_results.unwrap_or(50).min(200);
+
+    let mut cursor = QueryCursor::new();
+    cursor.set_timeout_micros(5_000_000); // 5s safety timeout
+    let matches = cursor.matches(&query, tree.root_node(), &src[..]);
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut stream = matches;
+    while let Some(m) = stream.get() {
+        if results.len() >= limit {
+            break;
+        }
+        let mut captures_obj = serde_json::Map::new();
+        for cap in m.captures {
+            let names = query.capture_names();
+            let name = names
+                .get(cap.index as usize)
+                .unwrap_or(&"_");
+            let node_text = cap.node.utf8_text(&src).unwrap_or("");
+            let start = cap.node.start_position();
+            let end = cap.node.end_position();
+            captures_obj.insert(
+                name.to_string(),
+                json!({
+                    "text": node_text,
+                    "type": cap.node.kind(),
+                    "startRow": start.row,
+                    "startCol": start.column,
+                    "endRow": end.row,
+                    "endCol": end.column,
+                }),
+            );
+        }
+        results.push(json!({
+            "patternIndex": m.pattern_index,
+            "captures": Value::Object(captures_obj),
+        }));
+        stream.advance();
+    }
+
+    let total = results.len();
+    let truncated = total >= limit;
+    let out = serde_json::to_string_pretty(&results).unwrap_or_default();
+
+    let summary = format!(
+        "Tree-sitter query on `{}` — {} match(es){}",
+        Path::new(path)
+            .file_name()
+            .map(|f| f.to_string_lossy())
+            .unwrap_or_default(),
+        total,
+        if truncated {
+            format!(" (capped at {limit})")
+        } else {
+            String::new()
+        }
+    );
+    Ok(ToolResult::ok(
+        "tree_sitter_query",
+        summary,
+        Some(out),
+        Some(json!({
+            "matches": total,
+            "path": path,
+            "query": query_str,
+            "truncated": truncated,
+        })),
     ))
 }
 
@@ -1362,6 +2265,807 @@ fn collect_defs(
     for child in node.named_children(&mut cursor) {
         collect_defs(child, src, depth + 1, max_depth, out, seen);
     }
+}
+
+// ---------------------------------------------------------------------------
+// read_lints (P1-11)
+// ---------------------------------------------------------------------------
+
+/// One lint finding: 1-based `line`, severity ("error" | "warning" | "note"),
+/// short machine-ish `rule` id and a human message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lint {
+    line: usize,
+    severity: &'static str,
+    rule: &'static str,
+    message: String,
+}
+
+const MAX_LINTS: usize = 200;
+const LINT_MARKERS: [&str; 4] = ["TODO", "FIXME", "HACK", "XXX"];
+
+/// Earliest work-marker word in `text` (word-boundary aware, so `TODOIZE` or
+/// a string like `myTODO` never match). Pure; unit-tested.
+fn find_marker(text: &str) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for marker in LINT_MARKERS {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(marker) {
+            let start = from + rel;
+            let end = start + marker.len();
+            let boundary = |c: char| !(c.is_alphanumeric() || c == '_');
+            let prev_ok = text[..start].chars().next_back().map_or(true, boundary);
+            let next_ok = text[end..].chars().next().map_or(true, boundary);
+            if prev_ok && next_ok {
+                if best.map_or(true, |(b, _)| start < b) {
+                    best = Some((start, marker));
+                }
+                break;
+            }
+            from = end;
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+/// Language-agnostic pass: scan every line for TODO/FIXME/HACK/XXX markers.
+fn marker_lints(text: &str) -> Vec<Lint> {
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if let Some(marker) = find_marker(line) {
+            out.push(Lint {
+                line: idx + 1,
+                severity: "note",
+                rule: "marker",
+                message: format!("{marker}: {}", line.trim()),
+            });
+        }
+    }
+    out
+}
+
+fn lint_node_text<'a>(node: Node<'a>, src: &'a [u8]) -> String {
+    String::from_utf8_lossy(&src[node.start_byte()..node.end_byte()])
+        .chars()
+        .take(60)
+        .collect()
+}
+
+/// Tree-sitter pass over a JS/TS file: syntax errors, missing tokens, stray
+/// `debugger` statements, empty catch blocks and comment markers. Error nodes
+/// are reported without descending into them (children of a broken node are
+/// noise).
+fn collect_ts_lints(node: Node, src: &[u8], out: &mut Vec<Lint>) {
+    if node.is_error() {
+        out.push(Lint {
+            line: node.start_position().row + 1,
+            severity: "error",
+            rule: "syntax-error",
+            message: format!("Syntax error near `{}`", lint_node_text(node, src)),
+        });
+        return;
+    }
+    if node.is_missing() {
+        out.push(Lint {
+            line: node.start_position().row + 1,
+            severity: "error",
+            rule: "missing-syntax",
+            message: format!("Missing `{}` before here", node.kind()),
+        });
+        return;
+    }
+    match node.kind() {
+        "comment" => {
+            let text = node.utf8_text(src).unwrap_or("");
+            if let Some(marker) = find_marker(text) {
+                out.push(Lint {
+                    line: node.start_position().row + 1,
+                    severity: "note",
+                    rule: "marker",
+                    message: format!(
+                        "{marker}: {}",
+                        text.lines()
+                            .find(|l| l.contains(marker))
+                            .unwrap_or("")
+                            .trim()
+                    ),
+                });
+            }
+        }
+        "debugger_statement" => {
+            out.push(Lint {
+                line: node.start_position().row + 1,
+                severity: "warning",
+                rule: "no-debugger",
+                message: "`debugger` statement left in code".into(),
+            });
+        }
+        "catch_clause" => {
+            let mut cursor = node.walk();
+            let has_empty_block = node
+                .children(&mut cursor)
+                .any(|c| c.kind() == "statement_block" && c.named_child_count() == 0);
+            if has_empty_block {
+                out.push(Lint {
+                    line: node.start_position().row + 1,
+                    severity: "warning",
+                    rule: "empty-catch",
+                    message: "Empty catch block swallows errors silently".into(),
+                });
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.named_children(&mut cursor).collect();
+    for child in children {
+        collect_ts_lints(child, src, out);
+    }
+}
+
+/// Build + sort the lint list for `text` of language extension `ext`: a
+/// tree-sitter pass for supported grammars, otherwise comment-marker lints.
+/// Parse failures fall back to markers so a review never hard-fails.
+fn build_lints(text: &str, ext: &str) -> Vec<Lint> {
+    let lang = resolve_grammar(ext);
+    let mut lints = if let Some(lang) = lang {
+        let mut parser = Parser::new();
+        match parser.set_language(&lang) {
+            Ok(()) => parser
+                .parse(text.as_bytes(), None)
+                .map(|tree| {
+                    let mut found = Vec::new();
+                    collect_ts_lints(tree.root_node(), text.as_bytes(), &mut found);
+                    found
+                })
+                .unwrap_or_default(),
+            Err(_) => marker_lints(text),
+        }
+    } else {
+        marker_lints(text)
+    };
+    lints.sort_by_key(|l| l.line);
+    lints
+}
+
+async fn read_lints_tool(state: &ToolState, path: &str) -> Result<ToolResult, String> {
+    let p = Path::new(path);
+    let full: PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        resolve_root(state, None).await?.join(p)
+    };
+    let src = tokio::fs::read(&full)
+        .await
+        .map_err(|e| format!("Cannot read `{path}`: {e}"))?;
+    let text = String::from_utf8_lossy(&src);
+
+    let ext = full
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut lints = build_lints(&text, &ext);
+    let total = lints.len();
+    let suppressed = total.saturating_sub(MAX_LINTS);
+    lints.truncate(MAX_LINTS);
+
+    let errors = lints.iter().filter(|l| l.severity == "error").count();
+    let warnings = lints.iter().filter(|l| l.severity == "warning").count();
+    let notes = lints.len() - errors - warnings;
+
+    let label = full
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    let summary = if total == 0 {
+        format!("No issues found in `{label}`")
+    } else {
+        format!(
+            "{total} finding(s) in `{label}`: {errors} error(s), {warnings} warning(s), {notes} note(s)"
+        )
+    };
+
+    let mut out = String::new();
+    for l in &lints {
+        out.push_str(&format!(
+            "{:>6}  [{:>7}] ({}) {}\n",
+            format!("L{}", l.line),
+            l.severity,
+            l.rule,
+            l.message
+        ));
+    }
+    if suppressed > 0 {
+        out.push_str(&format!("… {suppressed} more finding(s) suppressed\n"));
+    }
+
+    Ok(ToolResult::ok(
+        "read_lints",
+        summary,
+        Some(out),
+        Some(json!({
+            "path": path,
+            "total": total,
+            "errors": errors,
+            "warnings": warnings,
+            "notes": notes,
+        })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// analyze_bug + review_code — shared bug-pattern tables and diff parsing
+// ---------------------------------------------------------------------------
+
+/// A lightweight static pattern. Used both to flag suspicious lines in a code
+/// review and to rank candidate root causes during bug analysis. Pure string
+/// matching only — no AST, so it stays language-agnostic and cheap.
+#[derive(Debug, Clone, Copy)]
+struct CodePattern {
+    /// Substring that triggers the finding.
+    needle: &'static str,
+    rule: &'static str,
+    severity: &'static str,
+    desc: &'static str,
+    fix: &'static str,
+}
+
+const CODE_PATTERNS: &[CodePattern] = &[
+    CodePattern {
+        needle: ".unwrap(",
+        rule: "panic-unwrap",
+        severity: "high",
+        desc: "Unchecked unpack panics when the value is `None`/`Err`.",
+        fix: "Propagate with `?`, or handle the missing value with `if let` / `.ok_or(...)?`.",
+    },
+    CodePattern {
+        needle: ".expect(",
+        rule: "panic-unwrap",
+        severity: "high",
+        desc: "Unchecked expectation panics when the value is `None`/`Err`.",
+        fix: "Replace the expectation with explicit error handling.",
+    },
+    CodePattern {
+        needle: "assert!",
+        rule: "assert-panic",
+        severity: "medium",
+        desc: "Assertion aborts the process when the invariant is violated.",
+        fix: "Return a `Result`/`Err` instead of asserting on runtime paths.",
+    },
+    CodePattern {
+        needle: "unsafe {",
+        rule: "unsafe-block",
+        severity: "high",
+        desc: "`unsafe` block: undefined behavior is possible on incorrect invariants.",
+        fix: "Prefer safe abstractions; keep the unsafe tight and documented.",
+    },
+    CodePattern {
+        needle: "eval(",
+        rule: "code-eval",
+        severity: "high",
+        desc: "String evaluation executes untrusted input as code.",
+        fix: "Avoid `eval`; use a parser/interpreter or an allow-list.",
+    },
+    CodePattern {
+        needle: "os.system(",
+        rule: "shell-inject",
+        severity: "high",
+        desc: "Shell string invocation — untrusted input can inject commands.",
+        fix: "Use `subprocess.run([...argv])` without a shell instead.",
+    },
+    CodePattern {
+        needle: "subprocess.run(",
+        rule: "shell-inject",
+        severity: "medium",
+        desc: "Subprocess call — verify `shell=False` and that nothing untrusted mixes into the args.",
+        fix: "Pass an argv list; never concatenate user input into the command string.",
+    },
+    CodePattern {
+        needle: "child_process.exec(",
+        rule: "shell-inject",
+        severity: "high",
+        desc: "Shell string invocation — untrusted input can inject commands.",
+        fix: "Use `execFile`/`spawn` with an argv array instead of a shell string.",
+    },
+    CodePattern {
+        needle: "dangerouslySetInnerHTML",
+        rule: "xss",
+        severity: "high",
+        desc: "Unsafe HTML injection — enables XSS when the payload is user-controlled.",
+        fix: "Render via React text children or sanitize the HTML first.",
+    },
+    CodePattern {
+        needle: "innerHTML",
+        rule: "xss",
+        severity: "medium",
+        desc: "Assigning `innerHTML` from user data risks XSS.",
+        fix: "Use `textContent` or a sanitizer.",
+    },
+    CodePattern {
+        needle: "std::env::var",
+        rule: "env-access",
+        severity: "low",
+        desc: "Reading an environment variable — confirm the key is not treated as secret.",
+        fix: "Keep secrets out of env-derived values that get logged or embedded.",
+    },
+];
+
+/// First (leftmost) [`CodePattern`] matched by `line`, if any.
+fn match_code_patterns(line: &str) -> Option<&'static CodePattern> {
+    let trimmed = line.trim();
+    let mut best: Option<(&'static CodePattern, usize)> = None;
+    for pat in CODE_PATTERNS {
+        if let Some(pos) = trimmed.find(pat.needle) {
+            if best.map_or(true, |(_, bp)| pos < bp) {
+                best = Some((pat, pos));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Extract `file:line` references out of a stack trace / error text, e.g.
+/// `at src/foo.rs:12:34`, `foo.js:99`, or `File "x.py", line 7`.
+const STACK_REF_RE: &str =
+    r"(?m)([A-Za-z0-9_\-./\\]+\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|c|cpp|cc|cxx|h|hpp|cs|php|rb|kt|swift|vue|svelte|json|toml|md)):(\d+)(?::\d+)?";
+
+fn parse_stack_refs(stack: &str) -> Vec<(String, usize)> {
+    let re = match regex::Regex::new(STACK_REF_RE) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for cap in re.captures_iter(stack) {
+        if let (Some(p), Some(l)) = (cap.get(1), cap.get(2)) {
+            if let Ok(lineno) = l.as_str().parse::<usize>() {
+                out.push((p.as_str().trim().to_string(), lineno));
+            }
+        }
+    }
+    let mut seen: HashSet<(String, usize)> = HashSet::new();
+    out.retain(|r| seen.insert(r.clone()));
+    out
+}
+
+/// Identifier-shaped tokens (`foo_bar`, `camelCase`, `UPPER`) in the trace
+/// used to grep for related definitions in the workspace.
+fn trace_identifiers(stack: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let re = match regex::Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b") {
+        Ok(re) => re,
+        Err(_) => return out,
+    };
+    for cap in re.captures_iter(stack) {
+        if let Some(m) = cap.get(0) {
+            out.push(m.as_str().to_string());
+        }
+    }
+    // Drop stopwords + tokens that are clearly not code identifiers.
+    let stop: &[&str] = &[
+        "the", "and", "at", "in", "file", "line", "error", "thread", "main", "panic",
+        "called", "expect", "assert", "from", "with", "this", "that", "then", "when",
+    ];
+    out.retain(|t| !stop.contains(&t.as_str()) && !t.starts_with("0x"));
+    let mut seen: HashSet<String> = HashSet::new();
+    out.retain(|t| seen.insert(t.clone()));
+    out
+}
+
+/// Half-window (in lines) read above and below each stack-reference line.
+const BUG_READ_WINDOW: usize = 10;
+/// Cap on distinct `file:line` refs examined per call.
+const MAX_BUG_REFS: usize = 8;
+/// Cap on related-definition searches.
+const MAX_BUG_RELATED: usize = 4;
+
+/// Diagnose a bug from a stack trace: parse refs, read the surrounding code,
+/// grep for related definitions, and rank pattern-rule hits near the reported
+/// lines as the suspected root cause with fix suggestions.
+async fn analyze_bug(
+    state: &ToolState,
+    stack: &str,
+    path: Option<&str>,
+) -> Result<ToolResult, String> {
+    let stack = stack.trim();
+    if stack.is_empty() {
+        return Err("analyze_bug needs a non-empty `stack` — paste a stack trace or error message.".into());
+    }
+    let root = resolve_root(state, None).await?;
+
+    let mut out = String::new();
+    out.push_str("# Bug analysis\n\n## Reported error\n```text\n");
+    out.push_str(&stack.chars().take(2000).collect::<String>());
+    out.push_str("\n```\n");
+
+    // Optional explicit path first, then parsed stack refs.
+    let mut targets: Vec<(String, usize)> = Vec::new();
+    if let Some(p) = path.map(str::trim).filter(|p| !p.is_empty()) {
+        targets.push((p.to_string(), 0));
+    }
+    let refs = parse_stack_refs(stack);
+    refs.iter().take(MAX_BUG_REFS).for_each(|r| targets.push(r.clone()));
+
+    if targets.is_empty() {
+        out.push_str(
+            "\n## Suspected root cause\nNo `file:line` references were found in the trace and no \
+             `path` was given — pass an explicit `path` or a fuller traceback for a code-rooted \
+             analysis.\n",
+        );
+        return Ok(ToolResult::ok(
+            "analyze_bug",
+            "No file:line references found".into(),
+            Some(out),
+            Some(json!({ "refsFound": 0, "findings": 0 })),
+        ));
+    }
+
+    // Read a window around each target and collect pattern-rule hits.
+    let mut windows: Vec<(String, usize, String)> = Vec::new();
+    let mut findings: Vec<(String, usize, String, String, String)> = Vec::new();
+    for (p, lineno) in &targets {
+        let full: PathBuf = if Path::new(p).is_absolute() {
+            PathBuf::from(p)
+        } else {
+            root.join(p)
+        };
+        if !full.is_file() {
+            continue;
+        }
+        let rel = rel_path(&root, &full);
+        let start = lineno.saturating_sub(BUG_READ_WINDOW).max(1) as u64;
+        let end = *lineno as u64 + BUG_READ_WINDOW as u64;
+        let range = read_file_range(&full.to_string_lossy(), start, end).await?;
+        let body = range.stdout.unwrap_or_default();
+        windows.push((rel.clone(), *lineno, body.clone()));
+
+        out.push_str(&format!("\n## `{rel}` around line {lineno}\n```\n"));
+        out.push_str(&body);
+        if !body.chars().last().is_some_and(|c| c == '\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+
+        for (idx, line) in body.lines().enumerate() {
+            let this_line = start as usize + idx;
+            if let Some(pat) = match_code_patterns(line) {
+                let code: String = line.trim().chars().take(80).collect();
+                let anchor = if this_line == *lineno {
+                    " (reported line)"
+                } else {
+                    ""
+                };
+                findings.push((
+                    rel.clone(),
+                    this_line,
+                    code,
+                    format!("{}{}", pat.desc, anchor),
+                    pat.fix.to_string(),
+                ));
+            }
+        }
+    }
+
+    // Related definitions: grep the workspace for identifiers named in the trace.
+    let mut related: Vec<String> = Vec::new();
+    for name in trace_identifiers(stack) {
+        if related.len() >= MAX_BUG_RELATED {
+            break;
+        }
+        let pattern = format!(r"\b(?:fn|def|function|class|impl|func)\s+{name}\b");
+        let probe = search_file_contents(
+            state,
+            &pattern,
+            None,
+            Some(&root.to_string_lossy()),
+            true,
+        )
+        .await?;
+        if let Some(stdout) = probe.stdout {
+            for line in stdout.lines().take(2) {
+                related.push(format!("{line}"));
+            }
+        }
+    }
+    if !related.is_empty() {
+        out.push_str("\n## Related definitions in the workspace\n```\n");
+        out.push_str(&related.join("\n"));
+        out.push_str("\n```\n");
+    }
+
+    // Rank findings by file:line so the report reads top-to-bottom.
+    findings.sort_by_key(|(file, line, _, _, _)| (file.clone(), *line));
+
+    out.push_str("\n## Suspected root cause\n");
+    if findings.is_empty() {
+        if windows.is_empty() {
+            out.push_str("None of the referenced files exist on disk; the trace may be from a build artifact or an older revision.\n");
+        } else {
+            out.push_str("No obvious trigger matched the loaded windows. The decisive frame is usually the top one — read its file with `read_file_range` for a closer look.\n");
+        }
+    } else {
+        out.push_str(
+            "Pattern-rule hits near the reported lines (the line the trace points at is marked):\n\n",
+        );
+        for (file, line, code, note, _fix) in &findings {
+            out.push_str(&format!("- `{file}:{line}` — `{code}` — {note}\n"));
+        }
+    }
+
+    out.push_str("\n## Suggested fixes\n");
+    if findings.is_empty() {
+        out.push_str("Re-read the top frame of the trace, then verify the assumptions at that call site (nullable fields, index bounds, initialisation order).\n");
+    } else {
+        for (file, line, _code, _note, fix) in &findings {
+            out.push_str(&format!("- `{file}:{line}` {fix}\n"));
+        }
+        out.push_str("- Re-run the failing path after applying the fix to confirm the error clears.\n");
+    }
+
+    let summary = format!(
+        "Analyzed {} location(s) from the stack — {} trigger(s) flagged",
+        windows.len(),
+        findings.len()
+    );
+    Ok(ToolResult::ok(
+        "analyze_bug",
+        summary,
+        Some(out),
+        Some(json!({
+            "refsFound": refs.len(),
+            "windowsRead": windows.len(),
+            "findings": findings.len(),
+            "relatedDefinitions": related.len(),
+        })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// review_code — read-only code review
+// ---------------------------------------------------------------------------
+
+/// One structured review finding: severity, `file:line` location, description
+/// and a fix suggestion.
+struct ReviewFinding {
+    severest_item: &'static str,
+    rule: &'static str,
+    location: String,
+    description: String,
+    suggestion: String,
+}
+
+/// Render a single finding with a severity-sorted order.
+fn render_review_report(source_label: &str, findings: &[ReviewFinding]) -> (String, serde_json::Value) {
+    let rank = |s: &str| match s {
+        "high" => 0,
+        "medium" => 1,
+        _ => 2,
+    };
+    let mut ordered: Vec<&ReviewFinding> = findings.iter().collect();
+    ordered.sort_by(|a, b| {
+        rank(a.severest_item)
+            .cmp(&rank(b.severest_item))
+            .then_with(|| a.location.cmp(&b.location))
+    });
+
+    let high = ordered.iter().filter(|f| f.severest_item == "high").count();
+    let medium = ordered.iter().filter(|f| f.severest_item == "medium").count();
+    let low = ordered.len() - high - medium;
+
+    let mut out = String::new();
+    out.push_str(&format!("# Code review — {source_label}\n\n"));
+    out.push_str(&format!(
+        "**{high} high, {medium} medium, {low} low** ({}) finding(s)\n\n",
+        ordered.len()
+    ));
+    if ordered.is_empty() {
+        out.push_str(
+            "No issues detected by the built-in static checks. A focused read of the file is still \
+             recommended for logic-level bugs.\n",
+        );
+    } else {
+        for f in &ordered {
+            out.push_str(&format!(
+                "- **[{}] {}** `{}` — {}\n  Fix: {}\n",
+                f.severest_item, f.rule, f.location, f.description, f.suggestion
+            ));
+        }
+        out.push('\n');
+    }
+
+    let stats = json!({
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "total": findings.len(),
+    });
+    (out, stats)
+}
+
+/// Build the pattern-rule + long-line findings for a single line.
+fn line_findings(file: &str, lineno: usize, line: &str) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    if let Some(pat) = match_code_patterns(line) {
+        let code: String = line.trim().chars().take(80).collect();
+        out.push(ReviewFinding {
+            severest_item: pat.severity,
+            rule: pat.rule,
+            location: format!("{file}:{lineno}"),
+            description: format!("`{code}` — {}", pat.desc),
+            suggestion: pat.fix.to_string(),
+        });
+    }
+    let chars = line.chars().count();
+    if chars > 160 {
+        out.push(ReviewFinding {
+            severest_item: "low",
+            rule: "long-line",
+            location: format!("{file}:{lineno}"),
+            description: format!("Line is {chars} chars — over the 160-char readability limit."),
+            suggestion: "Break the line into multiple statements or wrapped calls.".into(),
+        });
+    }
+    out
+}
+
+/// Parse a unified diff into `(file, [(new-file line no, added line text)])`.
+/// `+++ b/<path>` headers and `@@ -a,b +c,d @@` hunks drive the numbering.
+fn diff_added_lines(diff: &str) -> Vec<(String, Vec<(usize, String)>)> {
+    let mut out: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+    let mut new_no: usize = 0;
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("diff ") || line.starts_with("--- ") || line.starts_with('\\') {
+            in_hunk = false;
+            continue;
+        }
+        if let Some(p) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("+++ "))
+        {
+            out.push((p.trim().to_string(), Vec::new()));
+            new_no = 0;
+            in_hunk = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            if let Some(header) = rest.split(" @@").next() {
+                if let Some(plus) = header.split(' ').nth(1) {
+                    let no = plus.trim_start_matches('+');
+                    new_no = no
+                        .split(',')
+                        .next()
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                }
+            }
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if let Some(added) = line.strip_prefix('+') {
+            if let Some(last) = out.last_mut() {
+                last.1.push((new_no, added.trim_end().to_string()));
+            }
+            new_no += 1;
+        } else if !line.starts_with('-') {
+            new_no += 1; // context line advances the new-file line counter
+        }
+    }
+    out.retain(|(_, lines)| !lines.is_empty());
+    out
+}
+
+/// Review a file's text (path mode) or the added lines of a diff (diff mode),
+/// combining `build_lints` findings with pattern-rule + style findings.
+async fn review_code(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    path: Option<&str>,
+    diff: Option<&str>,
+) -> Result<ToolResult, String> {
+    let root = resolve_root(state, None).await?;
+    let mut findings: Vec<ReviewFinding> = Vec::new();
+    let source_label: String;
+
+    // Diff mode: analyze only the added lines of the provided (or git) diff.
+    if let Some(d) = diff.filter(|d| !d.trim().is_empty()) {
+        source_label = "<provided diff>".into();
+        let files = diff_added_lines(d);
+        for (file, lines) in &files {
+            for (no, line) in lines {
+                findings.extend(line_findings(file, *no, line));
+            }
+        }
+        if files.is_empty() {
+            return Ok(ToolResult::ok(
+                "review_code",
+                "Diff contained no parseable added lines".into(),
+                Some(format!(
+                    "# Code review — provided diff\n\nNo added lines could be parsed from the diff. \
+                     Pass a standard unified diff (`git diff` output)."
+                )),
+                Some(json!({ "high": 0, "medium": 0, "low": 0, "total": 0, "source": "diff" })),
+            ));
+        }
+    } else if let Some(p) = path.map(str::trim).filter(|p| !p.is_empty()) {
+        let full: PathBuf = if Path::new(p).is_absolute() {
+            PathBuf::from(p)
+        } else {
+            root.join(p)
+        };
+        if !full.is_file() {
+            return Err(format!("Not a file: `{p}`"));
+        }
+        let rel = rel_path(&root, &full);
+        source_label = format!("`{rel}`");
+        let text = tokio::fs::read_to_string(&full)
+            .await
+            .map_err(|e| format!("Cannot read `{p}`: {e}"))?;
+        let ext = full
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let lints = build_lints(&text, &ext);
+        for l in &lints {
+            let suggestion = match l.rule {
+                "syntax-error" => "Fix the syntax around this line.".into(),
+                "missing-syntax" => "Insert the missing token or complete the statement.".into(),
+                "no-debugger" => "Remove the `debugger` statement before committing.".into(),
+                "empty-catch" => "Log or handle the error; never swallow it silently.".into(),
+                "marker" => "Address the noted TODO/FIXME/HACK before finishing.".into(),
+                _ => "Review this line for correctness.".into(),
+            };
+            findings.push(ReviewFinding {
+                severest_item: l.severity,
+                rule: l.rule,
+                location: format!("{rel}:{}", l.line),
+                description: l.message.clone(),
+                suggestion,
+            });
+        }
+        for (idx, line) in text.lines().enumerate() {
+            findings.extend(line_findings(&rel, idx + 1, line));
+        }
+    } else {
+        // No path/diff → review the current uncommitted changes.
+        let body = git_diff(state, interrupt, None).await?;
+        let body = body.stdout.unwrap_or_default();
+        if body.trim().is_empty() {
+            return Ok(ToolResult::ok(
+                "review_code",
+                "No uncommitted changes to review".into(),
+                Some(String::from(
+                    "# Code review\n\n`git diff` is clean — nothing to review. Pass `path` or `diff` to review a specific change.",
+                )),
+                Some(json!({ "high": 0, "medium": 0, "low": 0, "total": 0, "source": "git-diff-clean" })),
+            ));
+        }
+        source_label = "<git diff>".into();
+        for (file, lines) in &diff_added_lines(&body) {
+            for (no, line) in lines {
+                findings.extend(line_findings(file, *no, line));
+            }
+        }
+    }
+
+    let (report, stats) = render_review_report(&source_label, &findings);
+    let summary = format!(
+        "Review of {source_label} — {} finding(s)",
+        findings.len()
+    );
+    Ok(ToolResult::ok(
+        "review_code",
+        summary,
+        Some(report),
+        Some(stats),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,7 +3765,7 @@ async fn attach_file(state: &ToolState, path: &str) -> Result<ToolResult, String
     let absolute = if p.is_absolute() {
         p
     } else {
-        let ws = state.workspace.lock().await.clone().unwrap_or_default();
+        let ws = state.primary_workspace().await.unwrap_or_default();
         ws.join(&p)
     };
     let text = std::fs::read_to_string(&absolute)
@@ -2173,7 +3877,7 @@ pub async fn transcribe_file(state: &ToolState, path: &Path) -> Result<String, S
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let ws = state.workspace.lock().await.clone().unwrap_or_default();
+        let ws = state.primary_workspace().await.unwrap_or_default();
         ws.join(path)
     };
     if !absolute.is_file() {
@@ -2390,6 +4094,71 @@ async fn read_skill(state: &ToolState, name: &str) -> Result<ToolResult, String>
 }
 
 // ---------------------------------------------------------------------------
+// suggest_skills — rank available skills against the current task / file
+// ---------------------------------------------------------------------------
+
+/// Recommend skills relevant to the current task. The model calls this when it
+/// wants to know which learned skills to load before acting. Skills are matched
+/// by glob (against an active file path, if any) and by keyword overlap with
+/// the prompt; results are returned rank-ordered with a short match reason.
+async fn suggest_skills(
+    state: &ToolState,
+    prompt: &str,
+    path: Option<&str>,
+) -> Result<ToolResult, String> {
+    let matches = state.knowledge.suggest(prompt, path);
+    if matches.is_empty() {
+        return Ok(ToolResult::ok(
+            "suggest_skills",
+            "No matching skills found.".to_string(),
+            Some(
+                "No skills match the current task. Create one with create_skill, add \
+                 `.ai/skills/*.md`, or call read_skill with a specific name."
+                    .to_string(),
+            ),
+            Some(json!({ "count": 0 })),
+        ));
+    }
+    let total = matches.len();
+    let mut out = String::new();
+    let mut list = Vec::new();
+    for (i, (score, skill)) in matches.iter().enumerate() {
+        let tag_str = if skill.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [tags: {}]", skill.tags.join(", "))
+        };
+        let glob_str = if skill.globs.is_empty() {
+            String::new()
+        } else {
+            format!(" [globs: {}]", skill.globs.join(", "))
+        };
+        out.push_str(&format!(
+            "{}. `{}` — {}{}{}",
+            i + 1,
+            skill.name,
+            skill.description,
+            tag_str,
+            glob_str,
+        ));
+        out.push('\n');
+        list.push(json!({
+            "name": skill.name,
+            "score": score,
+            "active": skill.active,
+            "tags": skill.tags,
+            "globs": skill.globs,
+        }));
+    }
+    Ok(ToolResult::ok(
+        "suggest_skills",
+        format!("Suggested {total} skills matching the task."),
+        Some(out),
+        Some(json!({ "count": total, "suggestions": list })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // run_tests
 // ---------------------------------------------------------------------------
 
@@ -2466,8 +4235,28 @@ async fn git_capture(
     args: &[&str],
     path_filter: Option<&str>,
 ) -> Result<ToolResult, String> {
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    run_capture("git", state, interrupt, owned, path_filter).await
+}
+
+/// Run a GitHub CLI (`gh`) command in the workspace root.
+async fn gh_capture(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    args: Vec<String>,
+) -> Result<ToolResult, String> {
+    run_capture("gh", state, interrupt, args, None).await
+}
+
+async fn run_capture(
+    program: &str,
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    args: Vec<String>,
+    path_filter: Option<&str>,
+) -> Result<ToolResult, String> {
     let dir = resolve_root(state, None).await?;
-    let mut full_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let mut full_args = args;
     if let Some(p) = path_filter {
         if !p.is_empty() {
             full_args.push("--".to_string());
@@ -2475,7 +4264,12 @@ async fn git_capture(
         }
     }
 
-    let mut cmd = tokio::process::Command::new("git");
+    let hint = if program == "gh" {
+        "is the GitHub CLI installed and authenticated (`gh auth login`)?"
+    } else {
+        "is it on PATH?"
+    };
+    let mut cmd = tokio::process::Command::new(program);
     cmd.args(&full_args)
         .current_dir(&dir)
         .stdin(Stdio::null())
@@ -2488,7 +4282,7 @@ async fn git_capture(
     }
     let mut child = cmd.spawn().map_err(|e| {
         format!(
-            "Failed to run `git {}`: {e} (is git on PATH?)",
+            "Failed to run `{program} {}`: {e} ({hint})",
             full_args.join(" ")
         )
     })?;
@@ -2534,13 +4328,13 @@ async fn git_capture(
         GitOutcome::Finished(status, so, se) => {
             let status = match status {
                 Ok(s) => s,
-                Err(e) => return Err(format!("git failed to run: {e}")),
+                Err(e) => return Err(format!("{program} failed to run: {e}")),
             };
             (status, so, se)
         }
         GitOutcome::TimedOut => {
             let _ = kill_tree(pid);
-            return Err("git command timed out".into());
+            return Err(format!("{program} command timed out"));
         }
     };
 
@@ -2550,7 +4344,7 @@ async fn git_capture(
     } else {
         format!("{so}\n{se}")
     };
-    let cmd_str = format!("git {}", full_args.join(" "));
+    let cmd_str = format!("{program} {}", full_args.join(" "));
     let summary = format!(
         "`{cmd_str}` {} (exit {})",
         if success { "succeeded" } else { "failed" },
@@ -2558,7 +4352,7 @@ async fn git_capture(
     );
     Ok(ToolResult {
         success,
-        tool: "git".into(),
+        tool: program.to_string(),
         summary,
         stdout: Some(combined),
         error: if success {
@@ -2596,6 +4390,60 @@ async fn git_diff(
     Ok(body)
 }
 
+/// Produce a concise NL summary of all uncommitted changes by running
+/// `git status` and `git diff`, then combining the output.
+async fn summarize_changes(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+) -> Result<ToolResult, String> {
+    let status = git_capture(state, interrupt, &["status", "--short"], None).await?;
+    let diff = git_capture(state, interrupt, &["diff", "--stat"], None).await?;
+    let staged = git_capture(state, interrupt, &["diff", "--cached", "--stat"], None).await?;
+
+    let mut out = String::new();
+
+    if let Some(s) = &status.stdout {
+        if !s.trim().is_empty() {
+            out.push_str("## Status\n");
+            out.push_str(s);
+            out.push('\n');
+        }
+    }
+    if let Some(d) = &diff.stdout {
+        if !d.trim().is_empty() {
+            out.push_str("\n## Unstaged changes\n");
+            out.push_str(d);
+            out.push('\n');
+        }
+    }
+    if let Some(s) = &staged.stdout {
+        if !s.trim().is_empty() {
+            out.push_str("\n## Staged changes\n");
+            out.push_str(s);
+            out.push('\n');
+        }
+    }
+
+    let total_files = status
+        .stdout
+        .as_deref()
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+
+    let summary = if out.is_empty() {
+        "No uncommitted changes".to_string()
+    } else {
+        format!("{total_files} file(s) with uncommitted changes")
+    };
+
+    Ok(ToolResult::ok(
+        "summarize_changes",
+        summary,
+        if out.is_empty() { None } else { Some(out) },
+        None,
+    ))
+}
+
 async fn git_commit(
     state: &ToolState,
     interrupt: &CancellationToken,
@@ -2606,6 +4454,141 @@ async fn git_commit(
     }
     git_capture(state, interrupt, &["add", "-A"], None).await?;
     git_capture(state, interrupt, &["commit", "-m", message], None).await
+}
+
+// ---------------------------------------------------------------------------
+// extended git tools (P1-10) + GitHub CLI
+// ---------------------------------------------------------------------------
+
+/// `blame` argument builder (pure; unit-tested).
+fn blame_args(start_line: Option<u64>, end_line: Option<u64>) -> Vec<String> {
+    let mut args = vec!["blame".to_string(), "-l".to_string()];
+    match (start_line, end_line) {
+        (Some(s), Some(e)) => args.push(format!("-L{s},{e}")),
+        (Some(s), None) => args.push(format!("-L{s},{s}")),
+        _ => {}
+    }
+    args
+}
+
+async fn git_blame(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    path: &str,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> Result<ToolResult, String> {
+    let owned = blame_args(start_line, end_line);
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    git_capture(state, interrupt, &refs, Some(path)).await
+}
+
+/// `push` argument builder (pure; unit-tested).
+fn push_args(remote: Option<&str>, branch: Option<&str>, set_upstream: bool) -> Vec<String> {
+    let mut args = vec!["push".to_string()];
+    if set_upstream {
+        args.push("-u".to_string());
+    }
+    match (remote, branch) {
+        (Some(r), Some(b)) => {
+            args.push(r.to_string());
+            args.push(b.to_string());
+        }
+        (Some(r), None) => args.push(r.to_string()),
+        (None, Some(b)) => {
+            args.push("origin".to_string());
+            args.push(b.to_string());
+        }
+        (None, None) => {}
+    }
+    args
+}
+
+async fn git_push(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    remote: Option<&str>,
+    branch: Option<&str>,
+    set_upstream: bool,
+) -> Result<ToolResult, String> {
+    let args = push_args(remote, branch, set_upstream);
+    run_capture("git", state, interrupt, args, None).await
+}
+
+async fn git_pull(state: &ToolState, interrupt: &CancellationToken) -> Result<ToolResult, String> {
+    // --no-edit keeps merge commits from opening an editor and hanging.
+    git_capture(state, interrupt, &["pull", "--no-edit"], None).await
+}
+
+/// Basic branch-name sanity: no option injection (`-…`), whitespace/control
+/// chars, or path traversal segments. We exec without a shell, so this only
+/// needs to stop argument smuggling.
+fn validate_branch_name(name: &str) -> Result<(), String> {
+    let n = name.trim();
+    if n.is_empty()
+        || n.starts_with('-')
+        || n.contains("..")
+        || n.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "`{name}` is not a usable branch name (no leading `-`, whitespace, control chars or `..`)."
+        ));
+    }
+    Ok(())
+}
+
+async fn git_create_branch(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    name: &str,
+) -> Result<ToolResult, String> {
+    validate_branch_name(name)?;
+    git_capture(state, interrupt, &["switch", "-c", name.trim()], None).await
+}
+
+async fn git_pr_status(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+) -> Result<ToolResult, String> {
+    gh_capture(state, interrupt, vec!["pr".into(), "status".into()]).await
+}
+
+async fn git_ci_status(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+) -> Result<ToolResult, String> {
+    gh_capture(
+        state,
+        interrupt,
+        vec!["run".into(), "list".into(), "--limit".into(), "5".into()],
+    )
+    .await
+}
+
+/// `pr create` argument builder (pure; unit-tested).
+fn create_pr_args(title: &str, body: Option<&str>) -> Result<Vec<String>, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("create_pr needs a non-empty title".into());
+    }
+    Ok(vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        body.unwrap_or("").trim().to_string(),
+    ])
+}
+
+async fn create_pr_tool(
+    state: &ToolState,
+    interrupt: &CancellationToken,
+    title: &str,
+    body: Option<&str>,
+) -> Result<ToolResult, String> {
+    let args = create_pr_args(title, body)?;
+    gh_capture(state, interrupt, args).await
 }
 
 /// Save a checkpoint: a real commit tagged with a `checkpoint:` prefix so
@@ -3831,6 +5814,30 @@ async fn web_extract(
     ))
 }
 
+/// `browse_web` — headless web fetch for the browser-automation tool slot.
+///
+/// The `fetch` action behaves exactly like [`web_extract`]: an SSRF-guarded
+/// HTTP GET with server-side text extraction and a bounded body. The
+/// `screenshot` action cannot run without a bundled headless browser, so it
+/// returns a clear error rather than silently degrading. Failures are typed
+/// `Err(String)` so the dispatch wrapper surfaces them as tool errors.
+async fn browse_web(
+    _state: &ToolState,
+    interrupt: &CancellationToken,
+    raw_url: &str,
+    action: Option<&str>,
+) -> Result<ToolResult, String> {
+    if matches!(action, Some("screenshot")) {
+        return Err(
+            "The `screenshot` action of `browse_web` requires a bundled headless \
+             browser, which is not currently available. Use the `fetch` action to \
+             read a page's text, or `download_file` to save binary assets."
+                .into(),
+        );
+    }
+    web_extract(_state, interrupt, raw_url).await
+}
+
 async fn download_file_tool(
     state: &ToolState,
     interrupt: &CancellationToken,
@@ -4589,7 +6596,7 @@ mod tests {
         tokio::fs::write(dir.join("a.txt"), "a").await.unwrap();
 
         let state = ToolState::default();
-        *state.workspace.lock().await = Some(tmp.clone());
+        state.workspace.lock().await.push(tmp.clone());
         let result = list_dir(&state, Some("entries")).await.unwrap();
         let out = result.stdout.unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -4609,7 +6616,7 @@ mod tests {
             .unwrap();
 
         let state = ToolState::default();
-        *state.workspace.lock().await = Some(tmp.clone());
+        state.workspace.lock().await.push(tmp.clone());
 
         // Copy refuses existing destination by default.
         tokio::fs::create_dir_all(tmp.join("dst")).await.unwrap();
@@ -4655,7 +6662,7 @@ mod tests {
     async fn create_folder_enforces_depth_cap() {
         let tmp = std::env::temp_dir().join(format!("ai-editor-mkdir-{}", std::process::id()));
         let state = ToolState::default();
-        *state.workspace.lock().await = Some(tmp.clone());
+        state.workspace.lock().await.push(tmp.clone());
         create_folder(&state, "a/b/c").await.unwrap();
         assert!(tmp.join("a/b/c").is_dir());
         let deep = std::iter::repeat("d")
@@ -4810,5 +6817,127 @@ mod tests {
         assert!(!fail.success);
         assert_eq!(fail.error.as_deref(), Some("Traceback…"));
         assert!(fail.stdout.unwrap().contains("--- stderr ---"));
+    }
+
+    // ---- P1-10 extended git tools ----
+
+    #[test]
+    fn blame_args_builds_line_ranges() {
+        assert_eq!(
+            blame_args(None, None),
+            vec!["blame".to_string(), "-l".to_string()]
+        );
+        assert_eq!(blame_args(Some(7), None)[2], "-L7,7");
+        assert_eq!(blame_args(Some(7), Some(9))[2], "-L7,9");
+    }
+
+    #[test]
+    fn push_args_covers_all_combinations() {
+        assert_eq!(push_args(None, None, false), vec!["push".to_string()]);
+        assert_eq!(
+            push_args(Some("upstream"), Some("main"), false),
+            vec![
+                "push".to_string(),
+                "upstream".to_string(),
+                "main".to_string()
+            ]
+        );
+        // Branch without remote defaults to origin.
+        assert_eq!(
+            push_args(None, Some("feat/x"), true),
+            vec![
+                "push".to_string(),
+                "-u".to_string(),
+                "origin".to_string(),
+                "feat/x".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn create_pr_args_validates_title_and_defaults_body() {
+        let args = create_pr_args("  Fix bug  ", None).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "pr".to_string(),
+                "create".to_string(),
+                "--title".to_string(),
+                "Fix bug".to_string(),
+                "--body".to_string(),
+                String::new(),
+            ]
+        );
+        assert!(create_pr_args("   ", None).is_err());
+        let with_body = create_pr_args("T", Some("Long body\n")).unwrap();
+        assert_eq!(with_body[with_body.len() - 1], "Long body");
+    }
+
+    #[test]
+    fn branch_names_reject_injection_and_garbage() {
+        assert!(validate_branch_name("feat/login-flow").is_ok());
+        assert!(validate_branch_name("release/v2.0").is_ok());
+        assert!(validate_branch_name("").is_err());
+        assert!(validate_branch_name("  ").is_err());
+        assert!(validate_branch_name("--force").is_err());
+        assert!(validate_branch_name("-u").is_err());
+        assert!(validate_branch_name("has space").is_err());
+        assert!(validate_branch_name("a..b").is_err());
+    }
+
+    // ---- P1-11 read_lints ----
+
+    #[test]
+    fn find_marker_requires_word_boundaries() {
+        assert_eq!(find_marker("// TODO: fix"), Some("TODO"));
+        assert_eq!(find_marker("# FIXME later"), Some("FIXME"));
+        assert_eq!(find_marker("HACK: temp"), Some("HACK"));
+        assert_eq!(find_marker("XXX TODOX todo_ish"), Some("XXX"));
+        assert_eq!(find_marker("lowercase xxx does not match"), None);
+        assert_eq!(find_marker("no markers here"), None);
+        assert_eq!(find_marker("myTODO should not match"), None);
+        assert_eq!(find_marker("TODOS plural no"), None);
+    }
+
+    #[test]
+    fn marker_lints_report_lines_and_text() {
+        let text = "fn a() {}\n// TODO: refactor\nlet x = 1; # FIXME edge case";
+        let lints = marker_lints(text);
+        assert_eq!(lints.len(), 2);
+        assert_eq!(lints[0].line, 2);
+        assert_eq!(lints[0].rule, "marker");
+        assert!(lints[0].message.starts_with("TODO:"));
+        assert_eq!(lints[1].line, 3);
+        assert!(lints[1].message.contains("FIXME"));
+    }
+
+    #[test]
+    fn ts_lints_find_errors_markers_debugger_and_empty_catch() {
+        let src = b"
+const x = ;            // syntax error
+// TODO: tighten this
+function f() { debugger; }
+try { g(); } catch (e) {}
+try { h(); } catch (e) { log(e); }
+";
+        let lang: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let mut parser = Parser::new();
+        parser.set_language(&lang).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut lints = Vec::new();
+        collect_ts_lints(tree.root_node(), src, &mut lints);
+        let rules: Vec<&str> = lints.iter().map(|l| l.rule).collect();
+        assert!(rules.contains(&"syntax-error"), "rules: {rules:?}");
+        assert!(rules.contains(&"marker"));
+        assert!(rules.contains(&"no-debugger"));
+        assert!(rules.contains(&"empty-catch"), "rules: {rules:?}");
+        // The non-empty catch must NOT be flagged.
+        assert_eq!(lints.iter().filter(|l| l.rule == "empty-catch").count(), 1);
+        // Marker inside a string literal is ignored (only comments scanned).
+        let clean_src = b"const s = \"TODO in string\";";
+        let tree = parser.parse(clean_src, None).unwrap();
+        let mut lints = Vec::new();
+        collect_ts_lints(tree.root_node(), clean_src, &mut lints);
+        assert!(lints.is_empty());
     }
 }

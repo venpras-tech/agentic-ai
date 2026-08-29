@@ -1,12 +1,14 @@
 # Roadmap — From "local chat + editor" to "super agentic coding agent"
 
-_Last updated: 2026-08-22 (boot-smoke root cause fixed — `custom-protocol`
-feature; smoke + live-GGUF verified end-to-end. Earlier: Bionic backlog
-BN-2…BN-8 verified
-complete — todos, web tools, sandboxed code execution, Coder/YOLO hardening,
-skills v2, MCP catalog manager w/ env + allowed-tools filtering, model hub +
-local OpenAI-compatible API server. BN-9/BN-10 partial: neural embedder and
-Voice Keyboard overlay remain).
+_Last updated: 2026-08-25 (**P2-12 background tasks shipped** — `/bg` prefix
+starts an independent agent task with per-task cancellation, pill UI, abort
+controls. Earlier: LLM sync overhaul, inline agentic UI, repeat-penalty
+hotfix, P1-8/P1-9/P1-10/P1-11, Bionic backlog BN-2…BN-8). Then: inline
+agentic UI + repeat-penalty hotfix; P1-9/P1-10/P1-11 shipped —
+blocking `ask_question` + `send_to_user`, extended git/GitHub tools via a
+generic `run_capture`, single-file `read_lints`; P1-8 first-class subagents.
+Bionic backlog BN-2…BN-8 verified complete. BN-9/BN-10 partial:
+neural embedder and Voice Keyboard overlay remain).
 Strategic plan derived from a full codebase audit (`src/` +
 `src-tauri/src/`). Companion to `PROJECT_STATUS.md` (session status / source of
 truth for what has shipped)._
@@ -184,8 +186,82 @@ concurrent generations.
     `set_todo_list` / `get_todo_list` / `mark_todo_item_done` persisted to
     `.ai/todos.json`, live `TodoCard` via `agent://todo-update`, and the
     orchestrator refuses to end a session while items remain open (bounded
-    nudges). Bionic BN-2…BN-8 also shipped (see PROJECT_STATUS). Remaining P1:
-    first-class subagents, `ask_question`/`send_to_user`, git blame/push/pull/
-    branches/PR/CI, file delete/read_lints, `ast-grep`-style tree-sitter
-    queries, token-budget-aware tool fan-out caps, KV-cache reuse across steps,
-    model hot-swap.
+    nudges). **P1-8 shipped (2026-08-24)**: first-class subagents —
+    synchronous `task` tool reusing pool handles with occupancy leasing +
+    depth guard; profiles explore/implement/review with hard per-profile tool
+    restrictions enforced in policy::check before YOLO. Bionic BN-2…BN-8 also
+    shipped (see PROJECT_STATUS). **P1-9/P1-10/P1-11 shipped (2026-08-24)**:
+    blocking `ask_question` (+ QuestionModal UI) + `send_to_user`; git
+    blame/push/pull/create_branch + gh pr/ci status/create_pr via a generic
+    capture runner; single-file `read_lints` (tree-sitter syntax errors,
+    comment markers, empty-catch/debugger checks; delete was already BN-1).
+Remaining P1: `ast-grep`-style tree-sitter queries, token-budget-aware
+tool fan-out caps, KV-cache reuse across steps, model hot-swap.
+**P2-12 shipped (2026-08-25)**: background work + multitasking — `/bg` prefix
+starts an independent agent task; per-task `CancellationToken`; lifecycle
+events via `agent://bg-task-event`; pill UI with expandable task list and abort
+controls. Remaining P2: session management UI (list/fork/watch), modes
+(ASK/DEBUG/CUSTOM).
+11. **Phase 2 P0 Agent Gaps (2026-08-29, all shipped)** — skills active flags
+    persisted to `.ai/skills-state.json` (`save_active_state`/`load_active_state`);
+    session permissions persisted to `.ai/session-permissions.json`
+    (`save_session_allow`/`load_session_allow`); `/bug` + `analyze_bug` tool and
+    `/review` + `review_code` tool; **auto-memory extraction** —
+    `maybe_extract_memory` runs a bounded no-tool pass after each successfully
+    completed coding task and appends durable learnings to `.ai/memory.md`
+    (loaded back on next session, user-editable, 200-line cap); **multi-stage
+    context compaction wired into the live loop** — `trim_working_history` first
+    compresses oversized messages (tool outputs / long replies / non-system
+    pinned buffers) around a head+tail marker via `compress_large_messages`,
+    then evicts oldest non-pinned messages; LLM conversation-summarization
+    stage intentionally deferred (deterministic stages keep payloads under
+    budget). Custom modes (ASK/DEBUG/CUSTOM via `.ai/modes/*.md` subagent
+    profiles) also shipped. Verified: crate compiles clean, 126 tests pass.
+12. **P1 audit + finishing pass (2026-08-29)** — audited the P1 frontend/perf
+    and P1/P2 agent-gap lists against the code; almost all listed items were
+    already implemented (ModelBar click-outside/Escape, Monaco model-based
+    undo, DiffView windowed virtualization, model-list fetch seq-guard,
+    `parseUnifiedDiff` + Monaco-options memoization, `allSettled` listener
+    cleanup, per-directory nested AGENTS.md, skill tags/globs, auto-verify
+    after edits, repo-map engine, named checkpoints, session list/fork/watch
+    UI). Delivered the genuinely-missing pieces:
+    - auto-scroll now respects user scroll position (`isAtBottom`-gated,
+      ChatPanel.tsx:664-668/959);
+    - `view_repo_map` advertised to the model (schema in `core.rs`, policy
+      read-only allow, subagent read-only tools, `prompt.ts`);
+    - **skill auto-suggest** — new `suggest_skills` tool + `KnowledgeState::suggest`
+      (glob-match +100 against active file, plus keyword overlap) with a glob
+      matcher; wired schema/policy/subagent/prompt; tests
+      `suggest_ranks_glob_hit_above_keyword_only` + `glob_match_*`;
+    - **multi-provider routing wired into runtime** — `ProviderRegistry`
+      registered in Tauri state (`ProviderRegistryState`, main.rs:58-69) with
+      `providers_upsert/remove/set_role/clear_role/route/list` commands + IPC
+      + types; integrated into `configure_remote_model` (Editor-role override
+      with empty-registry fallback = today's behavior); 5 command tests.
+    Verified: cargo check 0 errors, 133 tests pass, `npx tsc --noEmit` clean.
+13. **Architecture / design gap analysis (2026-08-29)** — researched how
+    competitor agentic AI tools are architected (Claude Code layered
+    runtime/api/tools/commands + "Messages = State"; Cursor transport/session
+    split; Windsurf agent-first; Cline/Aider git-first) and mapped our own flow
+    (ChatPanel → App sendPrompt → ipc tauriInvoke → main.rs command → EnginePool →
+    orchestrator run_focused_steps → tools.rs match → agent:// events → React).
+    Findings + prioritized TODO list in PROJECT_STATUS.md "Architecture & Design
+    Gaps". Top items:
+    - **P0 registry**: replace the `tools.rs:193` giant match + separate
+      `core.rs:82` schema map with a single `ToolRegistry` (one source of truth
+      for dispatch + schema + permission class + subagent allow-lists).
+    - **P0 idempotent turns**: make session writes idempotent (client turn UUID
+      dedup in `ipc.ts:58-79`) and reconcile the frontend messages state against
+      an authoritative per-turn id — "Messages = State".
+    - **P0 runtime model hand-off**: consult `ProviderRegistry::route(role)` at
+      orchestrator step time (fast model for planning/compaction, flagship for
+      edits) instead of load-time only (`main.rs:484-513`).
+    - **P1 tokenization**: use the real tokenizer (already in `ContextManager`)
+      in the orchestrator budget and add optional stage-3 LLM summarization.
+    - **P1 state split**: shrink the 1809-line `App.tsx` monolith via a reducer /
+      store; type the model-boundary (`Value`→structs, string→literal unions).
+
+_Design principle going forward (mirrors competitors): keep the **model boundary**
+(what the model sees: registry-driven tools, exact-token context) and the **UI
+boundary** (React state, reconcile-from-id) as two decoupled, typed contracts, and
+let the orchestrator route roles at runtime rather than only at load.

@@ -5,12 +5,17 @@ import type { FileNode } from "../types";
 
 interface FileExplorerProps {
   workspaceRoot: string | null;
+  workspaces?: string[];
   onSelectWorkspace: () => void;
+  onAddWorkspace?: () => void;
+  onRemoveWorkspace?: (root: string) => void;
   onOpenFile: (path: string) => void;
   onNewFile: () => void;
   onOpenSkills: () => void;
   /** Bumped whenever the agent touches the filesystem; triggers a re-list. */
   refreshSignal?: number;
+  /** Manual refresh callback for the refresh button. */
+  onRefresh?: () => void;
   /**
    * When true, renders only the tree body (no <aside>/header) for embedding
    * in the shared sidebar with the Chats/Files tab strip (BN-11).
@@ -21,17 +26,23 @@ interface FileExplorerProps {
 export default function FileExplorer(props: FileExplorerProps) {
   const {
     workspaceRoot,
+    workspaces = [],
     onSelectWorkspace,
+    onAddWorkspace,
+    onRemoveWorkspace,
     onOpenFile,
     onNewFile,
     onOpenSkills,
     refreshSignal = 0,
+    onRefresh,
     chromeless = false,
   } = props;
   const [roots, setRoots] = useState<FileNode[]>([]);
   const [children, setChildren] = useState<Record<string, FileNode[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [expanding, setExpanding] = useState<Set<string>>(new Set());
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     if (!workspaceRoot) {
@@ -54,13 +65,19 @@ export default function FileExplorer(props: FileExplorerProps) {
   expandedRef.current = expanded;
   useEffect(() => {
     if (!workspaceRoot || refreshSignal === 0) return;
-    api.listDirectory(workspaceRoot).then(setRoots).catch(() => {});
+    setRefreshing(true);
+    const tasks: Promise<unknown>[] = [
+      api.listDirectory(workspaceRoot).then(setRoots).catch(() => {}),
+    ];
     for (const dir of Array.from(expandedRef.current)) {
-      api
-        .listDirectory(workspaceRoot, dir)
-        .then((list) => setChildren((p) => ({ ...p, [dir]: list })))
-        .catch(() => {});
+      tasks.push(
+        api
+          .listDirectory(workspaceRoot, dir)
+          .then((list) => setChildren((p) => ({ ...p, [dir]: list })))
+          .catch(() => {}),
+      );
     }
+    Promise.all(tasks).finally(() => setRefreshing(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSignal, workspaceRoot]);
 
@@ -72,11 +89,18 @@ export default function FileExplorer(props: FileExplorerProps) {
       }
       const isOpen = expanded.has(node.path);
       if (!isOpen && !children[node.path]) {
+        setExpanding((prev) => new Set(prev).add(node.path));
         try {
           const list = await api.listDirectory(workspaceRoot ?? "", node.path);
           setChildren((prev) => ({ ...prev, [node.path]: list }));
         } catch {
           setChildren((prev) => ({ ...prev, [node.path]: [] }));
+        } finally {
+          setExpanding((prev) => {
+            const next = new Set(prev);
+            next.delete(node.path);
+            return next;
+          });
         }
       }
       setExpanded((prev) => {
@@ -112,6 +136,17 @@ export default function FileExplorer(props: FileExplorerProps) {
             </span>
           </div>
           {isDir && open && kids && renderNodes(kids, depth + 1)}
+          {isDir && open && expanding.has(node.path) && (
+            <div className="space-y-0.5" style={{ paddingLeft: (depth + 1) * 12 + 6 }}>
+              {[40, 56, 32].map((w, i) => (
+                <div
+                  key={i}
+                  className="h-2.5 animate-pulse rounded bg-zinc-200"
+                  style={{ width: `${w}%` }}
+                />
+              ))}
+            </div>
+          )}
         </div>
       );
     });
@@ -130,7 +165,15 @@ export default function FileExplorer(props: FileExplorerProps) {
           </button>
         </div>
       ) : loading ? (
-        <p className="px-1 text-[11px] text-zinc-400">Listing…</p>
+        <div className="space-y-1 px-1">
+          {[48, 64, 56, 40, 72, 52, 60, 44].map((w, i) => (
+            <div
+              key={i}
+              className="h-3 animate-pulse rounded bg-zinc-200"
+              style={{ width: `${w}%` }}
+            />
+          ))}
+        </div>
       ) : roots.length === 0 ? (
         <p className="px-1 text-[11px] text-zinc-400">Empty folder</p>
       ) : (
@@ -140,6 +183,9 @@ export default function FileExplorer(props: FileExplorerProps) {
   );
   if (chromeless) return body;
 
+  const multiRoot = workspaces.length > 1;
+  const [showWsMenu, setShowWsMenu] = useState(false);
+
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-panel">
       <div className="flex h-9 items-center justify-between border-b border-border px-2">
@@ -147,6 +193,15 @@ export default function FileExplorer(props: FileExplorerProps) {
           Explorer
         </span>
         <div className="flex items-center gap-1">
+          {onRefresh && (
+            <button
+              onClick={onRefresh}
+              title="Refresh explorer"
+              className={`rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800 ${refreshing ? "animate-spin" : ""}`}
+            >
+              ↻
+            </button>
+          )}
           <button
             onClick={onNewFile}
             title="New file"
@@ -170,6 +225,68 @@ export default function FileExplorer(props: FileExplorerProps) {
           </button>
         </div>
       </div>
+      {multiRoot && (
+        <div className="relative border-b border-border">
+          <button
+            onClick={() => setShowWsMenu(!showWsMenu)}
+            className="flex w-full items-center gap-1 px-2 py-1 text-left text-[11px] text-zinc-600 hover:bg-zinc-100"
+          >
+            <span className="truncate flex-1" title={workspaceRoot ?? undefined}>
+              {workspaceRoot?.split(/[/\\]/).pop() ?? "none"}
+            </span>
+            <span className="text-zinc-400">▾</span>
+          </button>
+          {showWsMenu && (
+            <div className="absolute left-0 top-full z-50 min-w-full rounded border border-border bg-panel shadow-lg">
+              {workspaces.map((ws) => {
+                const name = ws.split(/[/\\]/).pop() ?? ws;
+                const isPrimary = ws === workspaceRoot;
+                return (
+                  <div
+                    key={ws}
+                    className="flex items-center gap-1 px-2 py-1 text-[11px] hover:bg-zinc-100"
+                  >
+                    <button
+                      className="flex-1 truncate text-left"
+                      title={ws}
+                      onClick={() => {
+                        setShowWsMenu(false);
+                        if (!isPrimary) onRemoveWorkspace?.(ws);
+                        // To switch primary, user re-opens it via the folder picker.
+                      }}
+                    >
+                      {isPrimary ? "● " : ""}{name}
+                    </button>
+                    {!isPrimary && onRemoveWorkspace && (
+                      <button
+                        className="shrink-0 text-zinc-400 hover:text-red-500"
+                        title="Remove workspace"
+                        onClick={() => {
+                          setShowWsMenu(false);
+                          onRemoveWorkspace(ws);
+                        }}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              {onAddWorkspace && (
+                <button
+                  className="flex w-full items-center gap-1 border-t border-border px-2 py-1 text-[11px] text-zinc-500 hover:bg-zinc-100"
+                  onClick={() => {
+                    setShowWsMenu(false);
+                    onAddWorkspace();
+                  }}
+                >
+                  + Add workspace
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {body}
     </aside>
   );

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../lib/ipc";
 import type {
+  DownloadedModel,
   GenParams,
   ModelInfo,
   RemoteModelConfig,
@@ -19,9 +20,11 @@ interface ModelBarProps {
   isStreaming: boolean;
   params: GenParams;
   initialRemote?: RemoteModelConfig | null;
+  recentModels?: string[];
   onParamsChange: (patch: Partial<GenParams>) => void;
   onLoad: () => void;
   onUnload: () => void;
+  onSwitchModel: (path: string) => void;
   onCancel: () => void;
   onConnectRemote: (config: RemoteModelConfig) => void;
 }
@@ -137,7 +140,7 @@ function formatBytes(n: number): string {
 }
 
 export default function ModelBar(props: ModelBarProps) {
-  const { model, path, lastPath, loading, progress, isStreaming, params, initialRemote, onParamsChange, onLoad, onUnload, onCancel, onConnectRemote } = props;
+  const { model, path, lastPath, loading, progress, isStreaming, params, initialRemote, recentModels = [], onParamsChange, onLoad, onUnload, onSwitchModel, onCancel, onConnectRemote } = props;
 
   const fileName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? p;
   const [showRemote, setShowRemote] = useState(false);
@@ -153,9 +156,38 @@ export default function ModelBar(props: ModelBarProps) {
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
+  const [showModelSwitcher, setShowModelSwitcher] = useState(false);
+  const [downloaded, setDownloaded] = useState<DownloadedModel[]>([]);
+
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const fetchSeqRef = useRef(0);
 
   const configRef = useRef(remote);
   configRef.current = remote;
+
+  useEffect(() => {
+    if (!showModelSwitcher && !showRemote) return;
+    const onPointer = (e: MouseEvent | TouchEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setShowModelSwitcher(false);
+        setShowRemote(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setShowModelSwitcher(false);
+        setShowRemote(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("touchstart", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("touchstart", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [showModelSwitcher, showRemote]);
 
   const appliedInitial = useRef(false);
   useEffect(() => {
@@ -171,6 +203,12 @@ export default function ModelBar(props: ModelBarProps) {
   }, [initialRemote]);
 
   const isRemote = model?.architecture === "remote-api";
+
+  // Load downloaded models for the switcher dropdown.
+  useEffect(() => {
+    if (!showModelSwitcher) return;
+    api.listDownloadedModels().then(setDownloaded).catch(() => setDownloaded([]));
+  }, [showModelSwitcher]);
   const preset =
     PROVIDERS.find((p) => p.id === providerId) ?? PROVIDERS[PROVIDERS.length - 1];
 
@@ -179,6 +217,7 @@ export default function ModelBar(props: ModelBarProps) {
       setModels([]);
       return;
     }
+    const seq = ++fetchSeqRef.current;
     setModelsLoading(true);
     setModelsError(null);
     try {
@@ -187,13 +226,15 @@ export default function ModelBar(props: ModelBarProps) {
         baseUrl: cfg.baseUrl.trim(),
         apiKey: cfg.apiKey.trim(),
       });
+      if (seq !== fetchSeqRef.current) return;
       setModels(list);
       setRemote((r) => ({ ...r, model: list.includes(r.model) ? r.model : r.model || list[0] }));
     } catch (e) {
+      if (seq !== fetchSeqRef.current) return;
       setModels([]);
       setModelsError(String(e));
     } finally {
-      setModelsLoading(false);
+      if (seq === fetchSeqRef.current) setModelsLoading(false);
     }
   }, []);
 
@@ -237,12 +278,12 @@ export default function ModelBar(props: ModelBarProps) {
     (!preset.apiKeyRequired || remote.apiKey.trim() !== "");
 
   return (
-    <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-panel px-3">
+    <div ref={rootRef} className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border bg-panel px-3">
       {model ? (
         <>
           <div className="flex min-w-0 flex-col">
             <span className="truncate text-[12px] font-semibold text-ink">{model.name}</span>
-            <span className="text-[10px] text-zinc-500">
+            <span className="min-w-0 truncate text-[10px] text-zinc-500">
               <span
                 className={`mr-1.5 rounded px-1 py-px text-[9px] font-semibold uppercase ${
                   isRemote ? "bg-violet-500/20 text-violet-600" : "bg-emerald-500/20 text-emerald-600"
@@ -264,10 +305,79 @@ export default function ModelBar(props: ModelBarProps) {
           >
             Unload
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowModelSwitcher(!showModelSwitcher)}
+              className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+            >
+              Switch ▾
+            </button>
+            {showModelSwitcher && (
+              <div className="absolute left-0 top-full z-30 mt-1 w-80 max-h-72 overflow-auto rounded-md border border-border bg-panel-2 p-2 shadow-xl">
+                <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                  Switch model
+                </div>
+                {recentModels.length > 0 && (
+                  <>
+                    <div className="mb-1 text-[9px] text-zinc-400">Recent</div>
+                    {recentModels.map((p) => {
+                      const name = p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? p;
+                      const isCurrent = path === p;
+                      return (
+                        <button
+                          key={p}
+                          disabled={isCurrent || isStreaming}
+                          onClick={() => { setShowModelSwitcher(false); onSwitchModel(p); }}
+                          className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[11px] hover:bg-zinc-100 ${isCurrent ? "font-semibold text-accent" : "text-zinc-700"} disabled:opacity-40`}
+                          title={p}
+                        >
+                          <span className="truncate flex-1">{name}</span>
+                          {isCurrent && <span className="text-[9px] text-accent">active</span>}
+                        </button>
+                      );
+                    })}
+                    <div className="my-1 border-t border-border" />
+                  </>
+                )}
+                {downloaded.length > 0 && (
+                  <>
+                    <div className="mb-1 text-[9px] text-zinc-400">Downloaded</div>
+                    {downloaded.map((m) => {
+                      const isCurrent = path === m.path;
+                      return (
+                        <button
+                          key={m.path}
+                          disabled={isCurrent || isStreaming}
+                          onClick={() => { setShowModelSwitcher(false); onSwitchModel(m.path); }}
+                          className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[11px] hover:bg-zinc-100 ${isCurrent ? "font-semibold text-accent" : "text-zinc-700"} disabled:opacity-40`}
+                          title={m.path}
+                        >
+                          <span className="truncate flex-1">{m.fileName}</span>
+                          <span className="shrink-0 text-[9px] text-zinc-400">{formatBytes(m.sizeBytes)}</span>
+                          {isCurrent && <span className="text-[9px] text-accent">active</span>}
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+                {downloaded.length === 0 && recentModels.length === 0 && (
+                  <p className="px-2 py-2 text-[11px] text-zinc-400">
+                    No downloaded models found. Use the Models tab to download from HuggingFace.
+                  </p>
+                )}
+                <button
+                  onClick={() => { setShowModelSwitcher(false); onLoad(); }}
+                  className="mt-2 flex w-full items-center justify-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+                >
+                  + Load from file…
+                </button>
+              </div>
+            )}
+          </div>
           {path && (
             <span
               title={path}
-              className="max-w-72 truncate rounded bg-zinc-500/10 px-2 py-0.5 text-[10px] text-zinc-500"
+              className="max-w-72 min-w-0 truncate rounded bg-zinc-500/10 px-2 py-0.5 text-[10px] text-zinc-500"
             >
               {path}
             </span>
@@ -423,7 +533,7 @@ export default function ModelBar(props: ModelBarProps) {
       )}
 
       {model && !loading && (
-        <div className="flex flex-1 items-center justify-end gap-4 text-[11px] text-zinc-500">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-4 gap-y-1 text-[11px] text-zinc-500">
           <label className="flex items-center gap-1.5">
             ctx
             <select
@@ -459,6 +569,18 @@ export default function ModelBar(props: ModelBarProps) {
               step={0.05}
               value={params.topP}
               onChange={(e) => onParamsChange({ topP: Number(e.target.value) })}
+              className="spin-none w-14 rounded border border-border bg-panel-2 px-1.5 py-0.5 outline-none"
+            />
+          </label>
+          <label className="flex items-center gap-1.5" title="Repetition penalty — raise if the model loops the same output (1 = off)">
+            repeat
+            <input
+              type="number"
+              min={1}
+              max={2}
+              step={0.05}
+              value={params.repeatPenalty}
+              onChange={(e) => onParamsChange({ repeatPenalty: Number(e.target.value) })}
               className="spin-none w-14 rounded border border-border bg-panel-2 px-1.5 py-0.5 outline-none"
             />
           </label>

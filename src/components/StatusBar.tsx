@@ -5,6 +5,7 @@ import CheckpointMenu from "./CheckpointMenu";
 interface StatusBarProps {
   model: ModelInfo | null;
   workspaceRoot: string | null;
+  workspaces?: string[];
   activeFile: OpenFile | null;
   error: string | null;
   usage: ContextUsage | null;
@@ -35,6 +36,7 @@ function formatMs(n: number): string {
 export default function StatusBar({
   model,
   workspaceRoot,
+  workspaces = [],
   activeFile,
   error,
   usage,
@@ -124,6 +126,9 @@ export default function StatusBar({
         )}
         <span className="hidden max-w-60 truncate text-zinc-400 md:inline" title={workspaceRoot ?? undefined}>
           {workspaceRoot ?? "no workspace"}
+          {workspaces.length > 1 && (
+            <span className="ml-1 text-zinc-500">(+{workspaces.length - 1})</span>
+          )}
         </span>
         <span>UTF-8</span>
         <span>Local AI Editor</span>

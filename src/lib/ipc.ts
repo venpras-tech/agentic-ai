@@ -6,6 +6,7 @@ import type {
   ApiServerStatus,
   AttachedFileInfo,
   AuditEntry,
+  BackgroundTaskInfo,
   ContextUsage,
   DownloadedModel,
   GenParams,
@@ -15,12 +16,14 @@ import type {
   McpServerConfig,
   ModelInfo,
   PolicySnapshot,
+  ProviderConfig,
+  ProviderRole,
   RemoteModelConfig,
   SessionProjectInfo,
   CheckpointInfo,
   ToolResultInfo,
 } from "../types";
-import { parseEvent, type EngineHandlers } from "./events";
+import { parseEvent, EVT_CONTEXT_TRIMMED, type EngineHandlers } from "./events";
 
 /**
  * True when running inside the Tauri desktop shell. The `@tauri-apps/api`
@@ -51,7 +54,63 @@ export function tauriInvoke<T>(
       ),
     );
   }
-  return invoke<T>(cmd, args);
+  return invokeWithRetry<T>(cmd, args, 0);
+}
+
+export function tauriInvokeWrite<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (!isTauriRuntime()) {
+    return Promise.reject(
+      new Error(
+        `The desktop backend is not available in this browser tab. ` +
+          `Launch the app with \`npm run tauri:dev\` (not \`npm run dev\`) so the ` +
+          `Tauri shell can connect \`${cmd}\`.`,
+      ),
+    );
+  }
+  return invoke<T>(cmd, args).catch((err) => {
+    if (isTransientError(err)) {
+      throw new Error(
+        `Write command \`${cmd}\` may not have been applied: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    throw err;
+  });
+}
+
+const MAX_RETRIES = 2;
+const RETRY_DELAYS = [200, 500];
+
+function invokeWithRetry<T>(
+  cmd: string,
+  args: Record<string, unknown> | undefined,
+  attempt: number,
+): Promise<T> {
+  return invoke<T>(cmd, args).catch((err) => {
+    if (attempt < MAX_RETRIES && isTransientError(err)) {
+      return new Promise<T>((resolve) =>
+        setTimeout(
+          () => resolve(invokeWithRetry<T>(cmd, args, attempt + 1)),
+          RETRY_DELAYS[attempt],
+        ),
+      );
+    }
+    throw err;
+  });
+}
+
+function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const transient = [
+    "channel is closed",
+    "channel busy",
+    "failed to send",
+    "connection closed",
+    "resource unavailable",
+  ];
+  return transient.some((t) => msg.toLowerCase().includes(t));
 }
 
 export interface StreamInferenceRequest {
@@ -59,6 +118,7 @@ export interface StreamInferenceRequest {
   maxTokens: number;
   temperature: number;
   topP: number;
+  repeatPenalty?: number;
   stopWords: string[];
 }
 
@@ -67,6 +127,7 @@ export interface AgentTaskRequest {
   maxTokens: number;
   temperature: number;
   topP: number;
+  repeatPenalty?: number;
   maxSteps: number;
   stopWords: string[];
   planMode?: boolean;
@@ -83,6 +144,7 @@ const onLoadProgressEvent = "model-load-progress";
 const onToolEvent = "agent://tool-event";
 const onAbortedEvent = "execution-aborted";
 const onPermissionEvent = "agent://permission-request";
+const onQuestionEvent = "agent://question-request";
 const onKnowledgeEvent = "agent-knowledge";
 const onFileChangedEvent = "agent://file-changed";
 const onToolOutputEvent = "agent://tool-output";
@@ -91,7 +153,8 @@ const onSubtaskEvent = "agent-subtask";
 const onSkillsChangedEvent = "agent://skills-changed";
 const onPlanStepEvent = "agent://plan-step";
 const onTodoUpdateEvent = "agent://todo-update";
-
+const onBgTaskEvent = "agent://bg-task-event";
+const onWorkspaceChangedEvent = "workspace://file-changed";
 export const api = {
   // ---- window chrome ----
   minimize: () => getCurrentWindow().minimize(),
@@ -115,6 +178,23 @@ export const api = {
     baseUrl: string;
     apiKey: string;
   }) => tauriInvoke<string[]>("list_remote_models", { config }),
+
+  // ---- multi-provider registry (routing) ----
+  // Drives the backend `ProviderRegistry`. No UI is wired to these yet; the
+  // commands exist so the frontend can register providers and route roles.
+  providersUpsert: (provider: ProviderConfig) =>
+    tauriInvoke<string>("providers_upsert", { provider }),
+  providersRemove: (id: string) =>
+    tauriInvoke<boolean>("providers_remove", { id }),
+  providersSetRole: (role: ProviderRole, providerId: string) =>
+    tauriInvoke<void>("providers_set_role", { role, providerId }),
+  providersClearRole: (role: ProviderRole) =>
+    tauriInvoke<void>("providers_clear_role", { role }),
+  providersRoute: (role: ProviderRole) =>
+    tauriInvoke<ProviderConfig | null>("providers_route", { role }),
+  providersList: () =>
+    tauriInvoke<ProviderConfig[]>("providers_list"),
+
   unloadModel: () => tauriInvoke<void>("unload_model"),
   modelStatus: () => tauriInvoke<ModelInfo | null>("model_status"),
   loadedModelPath: () => tauriInvoke<string | null>("loaded_model_path"),
@@ -123,6 +203,14 @@ export const api = {
   cancelInference: () => tauriInvoke<void>("cancel_inference"),
   agentRunTask: (request: AgentTaskRequest) =>
     tauriInvoke<number>("agent_run_task", { request }),
+
+  // ---- background tasks (P2-12) ----
+  agentRunBackground: (request: AgentTaskRequest) =>
+    tauriInvoke<number>("agent_run_background", { request }),
+  listBackgroundTasks: () =>
+    tauriInvoke<BackgroundTaskInfo[]>("list_background_tasks"),
+  abortBackgroundTask: (taskId: string) =>
+    tauriInvoke<void>("abort_background_task", { taskId }),
 
   // ---- circuit breaker ----
   abortAgentExecution: () => tauriInvoke<{ message: string; sessionId: number }>("abort_agent_execution"),
@@ -140,18 +228,33 @@ export const api = {
   pickWorkspaceFolder: () => tauriInvoke<string | null>("pick_workspace_folder"),
   pickTextFile: () => tauriInvoke<string | null>("pick_text_file"),
   agentSetWorkspace: (root: string) => tauriInvoke<void>("agent_set_workspace", { root }),
+  agentGetWorkspaces: () => tauriInvoke<string[]>("agent_get_workspaces"),
+  agentAddWorkspace: (root: string) => tauriInvoke<string[]>("agent_add_workspace", { root }),
+  agentRemoveWorkspace: (root: string) => tauriInvoke<string[]>("agent_remove_workspace", { root }),
   listDirectory: (root: string, relative: string | null = null) =>
     tauriInvoke<FileNode[]>("list_directory", { root, relative }),
   readTextFile: (path: string) =>
     tauriInvoke<{ path: string; content: string }>("read_text_file", { path }),
   writeTextFile: (path: string, content: string) =>
     tauriInvoke<void>("write_text_file", { path, content }),
+  revertFile: (path: string, before: string) =>
+    tauriInvoke<void>("revert_file", { path, before }),
   saveFileAs: (content: string) =>
     tauriInvoke<string | null>("save_file_as", { content }),
+  saveFileAsBytes: (content: string, suggestedFilename: string) =>
+    tauriInvoke<string | null>("save_file_as_bytes", { content, suggestedFilename }),
+
+  // ---- file watcher ----
+  startFileWatcher: (path: string) =>
+    tauriInvoke<void>("start_file_watcher", { path }),
+  stopFileWatcher: () => tauriInvoke<void>("stop_file_watcher"),
+  fileWatcherActive: () => tauriInvoke<boolean>("file_watcher_active"),
 
   // ---- permissions ----
   agentRespondPermission: (requestId: string, decision: string) =>
     tauriInvoke<void>("agent_respond_permission", { requestId, decision }),
+  agentRespondQuestion: (requestId: string, answer: string) =>
+    tauriInvoke<void>("agent_respond_question", { requestId, answer }),
   agentPolicySnapshot: () => tauriInvoke<PolicySnapshot>("agent_policy_snapshot"),
   agentSetYolo: (on: boolean) => tauriInvoke<void>("agent_set_yolo", { on }),
   agentGrantPath: (path: string, mode: "read" | "write") =>
@@ -228,7 +331,7 @@ export const api = {
     project: string,
     record: Record<string, unknown>,
     chatId?: string | null,
-  ) => tauriInvoke<void>("session_append", { project, record, chatId }),
+  ) => tauriInvokeWrite<void>("session_append", { project, record, chatId }),
   sessionLoad: (project: string, chatId?: string | null) =>
     tauriInvoke<Record<string, unknown>[]>("session_load", { project, chatId }),
   sessionProjects: () =>
@@ -242,7 +345,7 @@ export const api = {
 
   // ---- engine events ----
   subscribeEngineEvents: async (handlers: EngineHandlers) => {
-    const unlisteners = await Promise.all([
+    const results = await Promise.allSettled([
       listen(onStartedEvent, (e) =>
         handlers.onStarted(parseEvent(e.payload)),
       ),
@@ -263,6 +366,9 @@ export const api = {
         : []),
       ...(handlers.onPermission
         ? [listen(onPermissionEvent, (e) => handlers.onPermission!(parseEvent(e.payload)))]
+        : []),
+      ...(handlers.onQuestion
+        ? [listen(onQuestionEvent, (e) => handlers.onQuestion!(parseEvent(e.payload)))]
         : []),
       ...(handlers.onKnowledge
         ? [listen(onKnowledgeEvent, (e) => handlers.onKnowledge!(parseEvent(e.payload)))]
@@ -288,7 +394,27 @@ export const api = {
       ...(handlers.onTodoUpdate
         ? [listen(onTodoUpdateEvent, (e) => handlers.onTodoUpdate!(parseEvent(e.payload)))]
         : []),
+      ...(handlers.onBgTask
+        ? [listen(onBgTaskEvent, (e) => handlers.onBgTask!(parseEvent(e.payload)))]
+        : []),
+      ...(handlers.onWorkspaceChanged
+        ? [listen(onWorkspaceChangedEvent, (e) => handlers.onWorkspaceChanged!(parseEvent(e.payload)))]
+        : []),
+      ...(handlers.onContextTrimmed
+        ? [listen(EVT_CONTEXT_TRIMMED, (e) => handlers.onContextTrimmed!(parseEvent(e.payload)))]
+        : []),
     ]);
+    const unlisteners: (() => void)[] = [];
+    const rejected = results.find((r) => r.status === "rejected") as
+      | PromiseRejectedResult
+      | undefined;
+    for (const r of results) {
+      if (r.status === "fulfilled") unlisteners.push(r.value);
+    }
+    if (rejected) {
+      for (const un of unlisteners) un();
+      throw rejected.reason;
+    }
     return () => {
       for (const un of unlisteners) un();
     };

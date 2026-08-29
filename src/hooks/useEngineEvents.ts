@@ -26,6 +26,7 @@ export function useEngineEvents(handlers: EngineHandlers) {
       onTool: (e) => ref.current.onTool?.(e),
       onAborted: (e) => ref.current.onAborted?.(e),
       onPermission: (e) => ref.current.onPermission?.(e),
+      onQuestion: (e) => ref.current.onQuestion?.(e),
       onKnowledge: (e) => ref.current.onKnowledge?.(e),
       onFileChanged: (e) => ref.current.onFileChanged?.(e),
       onToolOutput: (e) => ref.current.onToolOutput?.(e),
@@ -34,6 +35,8 @@ export function useEngineEvents(handlers: EngineHandlers) {
       onPlanStep: (e) => ref.current.onPlanStep?.(e),
       onSkillsChanged: (e) => ref.current.onSkillsChanged?.(e),
       onTodoUpdate: (e) => ref.current.onTodoUpdate?.(e),
+      onBgTask: (e) => ref.current.onBgTask?.(e),
+      onWorkspaceChanged: (e) => ref.current.onWorkspaceChanged?.(e),
     }).then((un) => {
       if (disposed) un();
       else unlisten = un;

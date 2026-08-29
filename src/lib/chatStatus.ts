@@ -178,7 +178,9 @@ export function reduceChatStatus(
           sinceMs: event.at,
         };
       }
-      return { ...state, label: null, sinceMs: event.at };
+      return state.label === `subtask ${event.index}/${event.total} · ${event.title}`
+        ? { ...state, label: null, sinceMs: event.at }
+        : state;
     case "permission":
       if (!isActivePhase(state.phase)) return state;
       return {

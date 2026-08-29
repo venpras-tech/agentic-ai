@@ -284,11 +284,24 @@ export default function SettingsModal({
               className="rounded border border-border bg-panel px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/60"
             />
           </label>
+
+          <label className="flex flex-col gap-1 text-[11px] text-zinc-500" title="Suppresses repeated tokens — raise if the model loops the same output. 1 = off.">
+            Repeat penalty
+            <input
+              type="number"
+              min={1}
+              max={2}
+              step={0.05}
+              value={local.repeatPenalty}
+              onChange={(e) => setLocal((p) => ({ ...p, repeatPenalty: Number(e.target.value) }))}
+              className="rounded border border-border bg-panel px-2 py-1 text-[12px] text-ink outline-none focus:border-accent/60"
+            />
+          </label>
         </div>
 
         <p className="text-[9px] text-zinc-400">
-          GPU and context settings take effect on the next model load. Temperature and top-p apply
-          to every generation.
+          GPU and context settings take effect on the next model load. Temperature, top-p and
+          repeat penalty apply to every generation.
         </p>
         </>
         )}

@@ -15,6 +15,7 @@ import KnowledgePanel from "./components/KnowledgePanel";
 import SettingsModal from "./components/SettingsModal";
 import ConsolePanel from "./components/ConsolePanel";
 import ResizeHandle from "./components/ResizeHandle";
+import BackgroundTasks from "./components/BackgroundTasks";
 import type { ConsoleEntry } from "./components/ConsolePanel";
 
 import { useEngineEvents } from "./hooks/useEngineEvents";
@@ -26,13 +27,17 @@ import {
   subscribeConsole,
 } from "./lib/consoleBus";
 import { listen } from "@tauri-apps/api/event";
+import { EVT_CONTEXT_TRIMMED } from "./lib/events";
 import {
   initialChatStatus,
   reduceChatStatus,
 } from "./lib/chatStatus";
 import { api, isTauriRuntime } from "./lib/ipc";
+import { exportConversation } from "./lib/exportChat";
 import { AGENT_SYSTEM_PROMPT } from "./lib/prompt";
+import { recordsToMessages } from "./lib/session";
 import type {
+  BackgroundTaskInfo,
   ChatMessage,
   ContextUsage,
   FileChangedEvent,
@@ -45,6 +50,7 @@ import type {
   PermissionRequest,
   PlanStepEvent,
   PolicySnapshot,
+  QuestionRequest,
   RemoteModelConfig,
   StepEvent,
   SubtaskEvent,
@@ -58,6 +64,7 @@ const DEFAULT_PARAMS: GenParams = {
   nGpuLayers: 0,
   temperature: 0.8,
   topP: 0.95,
+  repeatPenalty: 1.15,
   maxTokens: 1024,
 };
 
@@ -73,18 +80,26 @@ export default function App() {
   const [lastLocalPath, setLastLocalPath] = useState<string | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState<number | null>(null);
-  const [workspaceRoot, setWorkspaceRoot] = useState<string | null>(null);
+  const [workspaces, setWorkspaces] = useState<string[]>([]);
+  const workspaceRoot = workspaces[0] ?? null;
   const [files, setFiles] = useState<OpenFile[]>([]);
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // Latest messages for event handlers (avoids stale-closure session lookups).
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [lastDone, setLastDone] = useState<InferenceDone | null>(null);
   const [genParams, setGenParams] = useState<GenParams>(DEFAULT_PARAMS);
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
-  const [agentMode, setAgentMode] = useState(false);
+  const [agentMode, setAgentMode] = useState(true);
   const [permissionReq, setPermissionReq] = useState<PermissionRequest | null>(null);
+  const [questionReq, setQuestionReq] = useState<QuestionRequest | null>(null);
+  const [fileChangeNotice, setFileChangeNotice] = useState(false);
   const [policy, setPolicy] = useState<PolicySnapshot | null>(null);
   const [knowledge, setKnowledge] = useState<KnowledgeReport | null>(null);
   const [showKnowledge, setShowKnowledge] = useState(false);
@@ -101,6 +116,7 @@ export default function App() {
     { path: string; chunkCount: number }[]
   >([]);
   const [explorerRefresh, setExplorerRefresh] = useState(0);
+  const [recentModels, setRecentModels] = useState<string[]>([]);
   const [pendingPlan, setPendingPlan] = useState<{
     sessionId: number;
     planText: string;
@@ -130,11 +146,21 @@ export default function App() {
     reduceChatStatus,
     initialChatStatus,
   );
+  // P2-12: background tasks running independently of the foreground chat.
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskInfo[]>([]);
+  const bgSessionIdsRef = useRef(new Set<number>());
+  const [isSwitching, setIsSwitching] = useState(false);
+  const [contextTrimNotice, setContextTrimNotice] = useState(false);
+  const settingsSaveTimerRef = useRef<number | null>(null);
+  const fileChangeTimerRef = useRef<number | null>(null);
+  const contextTrimTimerRef = useRef<number | null>(null);
 
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
   const verifyRef = useRef(verify);
   verifyRef.current = verify;
+  const isStreamingRef = useRef(isStreaming);
+  isStreamingRef.current = isStreaming;
   const planSessionRef = useRef<number | null>(null);
   const planPromptRef = useRef<string | null>(null);
   const sessionStartRef = useRef<Map<number, number>>(new Map());
@@ -160,7 +186,7 @@ export default function App() {
   const syncAgentFile = useCallback(
     (e: FileChangedEvent) => {
       const path = e.path.replaceAll("\\", "/");
-      if (!files.some((f) => f.path && f.path.replaceAll("\\", "/") === path)) {
+      if (!filesRef.current.some((f) => f.path && f.path.replaceAll("\\", "/") === path)) {
         return;
       }
       void api
@@ -178,11 +204,13 @@ export default function App() {
         })
         .catch(() => {});
     },
-    [files],
+    [],
   );
 
   useEngineEvents({
     onToken: (e) => {
+      // Background sessions accumulate silently — no chat status updates.
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       append(e.sessionId, e.delta);
       dispatchChatStatus({
         type: "token",
@@ -192,6 +220,8 @@ export default function App() {
       });
     },
     onStarted: (e) => {
+      // Background tasks get their own lifecycle via onBgTask; skip chat UI.
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       setActiveSessionId(e.sessionId);
       setIsStreaming(true);
       setError(null);
@@ -204,11 +234,12 @@ export default function App() {
       ]);
     },
     onDone: (e) => {
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const text = streamsRef.current.get(e.sessionId) ?? "";
       setMessages((prev) =>
         prev.map((m) =>
           m.sessionId === e.sessionId
-            ? { ...m, content: text, done: e.done }
+            ? { ...m, content: text, done: e.done, ts: Date.now() }
             : m,
         ),
       );
@@ -257,11 +288,13 @@ export default function App() {
       dispatchChatStatus({ type: "done", sessionId: e.sessionId, at: performance.now() });
     },
     onError: (e) => {
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const text = streamsRef.current.get(e.sessionId) ?? "";
+      const body = `${text}${text ? "\n" : ""}⚠ ${e.message}`;
       setMessages((prev) =>
         prev.map((m) =>
           m.sessionId === e.sessionId
-            ? { ...m, content: `${text}${text ? "\n" : ""}⚠ ${e.message}`, role: "error" }
+            ? { ...m, content: body, role: "error" as const, ts: Date.now() }
             : m,
         ),
       );
@@ -270,8 +303,18 @@ export default function App() {
       setIsStreaming(false);
       setError(e.message);
       dispatchChatStatus({ type: "error", message: e.message, at: performance.now() });
+      // Persist the failed turn too so restored chats show what went wrong.
+      api
+        .sessionAppend(workspaceRoot ?? "default", {
+          role: "error",
+          content: body,
+          ts: Date.now(),
+        }, activeChatId)
+        .then(() => setChatsRefresh((n) => n + 1))
+        .catch(() => {});
     },
     onTool: (e) => {
+      if (e.sessionId != null && bgSessionIdsRef.current.has(e.sessionId)) return;
       dispatchChatStatus({
         type: "tool",
         tool: e.tool,
@@ -279,8 +322,19 @@ export default function App() {
         summary: e.summary,
         at: performance.now(),
       });
-      if (activeSessionId == null) return;
-      const sid = activeSessionId;
+      // Prefer the event's own session id when a matching turn exists; fall
+      // back to the active session so late events still land.
+      const targetSessionId = (() => {
+        if (e.sessionId != null) {
+          const hasTurn = messagesRef.current.some(
+            (m) => m.sessionId === e.sessionId,
+          );
+          if (hasTurn) return e.sessionId;
+        }
+        return activeSessionId;
+      })();
+      if (targetSessionId == null) return;
+      const sid = targetSessionId;
       setLedger((prev) => {
         const idx = prev.findIndex((l) => l.sessionId === sid);
         const entry: LedgerEntry = {
@@ -303,13 +357,22 @@ export default function App() {
                   ? (m.tools ?? []).map((t) =>
                       t.id === e.id ? { ...t, ...e, output: t.output } : t,
                     )
-                  : [...(m.tools ?? []), e],
+                  : [
+                      ...(m.tools ?? []),
+                      {
+                        ...e,
+                        // Anchor the call at the current end of the streamed
+                        // text so the UI can interleave it inline.
+                        atChar: (streamsRef.current.get(sid) ?? "").length,
+                      },
+                    ],
               }
             : m,
         ),
       );
     },
     onStep: (e: StepEvent) => {
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       setCurrentStep(e.step.step);
       sessionHasStepsRef.current.set(e.sessionId, true);
       dispatchChatStatus({
@@ -374,6 +437,7 @@ export default function App() {
     },
     onPlanStep: (e: PlanStepEvent) => {
       if (activeSessionId == null) return;
+      if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const sid = activeSessionId;
       setMessages((prev) =>
         prev.map((m) => {
@@ -396,6 +460,25 @@ export default function App() {
     onTodoUpdate: (e: TodoUpdateEvent) => {
       setTodos(e);
     },
+    onBgTask: (e) => {
+      if (e.status === "started") {
+        bgSessionIdsRef.current.add(e.sessionId);
+        setBackgroundTasks((prev) => [
+          ...prev,
+          {
+            id: e.taskId,
+            sessionId: e.sessionId,
+            label: e.label,
+            status: "running",
+            startedAt: Date.now(),
+          },
+        ]);
+      } else {
+        // completed, error, or aborted — remove from tracking
+        bgSessionIdsRef.current.delete(e.sessionId);
+        setBackgroundTasks((prev) => prev.filter((t) => t.id !== e.taskId));
+      }
+    },
     onToolOutput: (e: ToolOutputEvent) => {
       setConsoleEntries((prev) => [
         ...prev,
@@ -403,6 +486,7 @@ export default function App() {
       ]);
       if (activeSessionId == null) return;
       const sid = activeSessionId;
+      if (bgSessionIdsRef.current.has(sid)) return;
       if (e.tool !== "execute_terminal_command" && e.tool !== "run_tests") return;
       setMessages((prev) =>
         prev.map((m) => {
@@ -429,7 +513,7 @@ export default function App() {
     onFileChanged: (e: FileChangedEvent) => {
       syncAgentFile(e);
       setExplorerRefresh((n) => n + 1);
-      if (e.diff && activeSessionId != null) {
+      if (e.diff && activeSessionId != null && !bgSessionIdsRef.current.has(activeSessionId)) {
         const sid = activeSessionId;
         setMessages((prev) =>
           prev.map((m) =>
@@ -454,6 +538,10 @@ export default function App() {
       setPermissionReq(e);
       dispatchChatStatus({ type: "permission", tool: e.tool, at: performance.now() });
     },
+    onQuestion: (e) => {
+      setQuestionReq(e);
+      dispatchChatStatus({ type: "permission", tool: "ask_question", at: performance.now() });
+    },
     onKnowledge: setKnowledge,
     onModelLoaded: setModel,
     onLoadProgress: (e) => {
@@ -465,6 +553,21 @@ export default function App() {
         setModelLoading(false);
       } else {
         setLoadProgress(e.progress);
+      }
+    },
+    onWorkspaceChanged: () => {
+      // External filesystem change detected — refresh the file explorer.
+      setExplorerRefresh((n) => n + 1);
+      // Show a subtle notice when files change during an active agent task.
+      if (isStreamingRef.current) {
+        setFileChangeNotice(true);
+        if (fileChangeTimerRef.current != null) {
+          window.clearTimeout(fileChangeTimerRef.current);
+        }
+        fileChangeTimerRef.current = window.setTimeout(() => {
+          setFileChangeNotice(false);
+          fileChangeTimerRef.current = null;
+        }, 3000);
       }
     },
   });
@@ -505,6 +608,29 @@ export default function App() {
       alive = false;
       unlisten.then((fn) => fn());
       unsubscribe();
+    };
+  }, []);
+
+  // Subscribe to context-trim notifications so the UI surfaces when the
+  // backend prunes history to fit the context window.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const unlisten = listen(EVT_CONTEXT_TRIMMED, () => {
+      setContextTrimNotice(true);
+      if (contextTrimTimerRef.current != null) {
+        window.clearTimeout(contextTrimTimerRef.current);
+      }
+      contextTrimTimerRef.current = window.setTimeout(() => {
+        setContextTrimNotice(false);
+        contextTrimTimerRef.current = null;
+      }, 6000);
+    }).catch(() => () => {});
+    return () => {
+      unlisten.then((fn) => fn());
+      if (contextTrimTimerRef.current != null) {
+        window.clearTimeout(contextTrimTimerRef.current);
+        contextTrimTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -549,21 +675,112 @@ export default function App() {
         if (params) setGenParams((prev) => ({ ...prev, ...params }));
         const remote = s["remote"] as RemoteModelConfig | undefined;
         if (remote) setSavedRemote(remote);
+        const rm = s["recentModels"];
+        if (Array.isArray(rm)) setRecentModels(rm);
       })
       .catch(() => {});
     refreshPolicy();
     return () => {
       clearAll();
+      if (fileChangeTimerRef.current != null) {
+        window.clearTimeout(fileChangeTimerRef.current);
+        fileChangeTimerRef.current = null;
+      }
     };
   }, [clearAll, refreshPolicy]);
 
-  // Persist tunable params + last-used remote connection (no API key).
+  // ---- chat hydration: restore the last workspace + open chat on startup ----
+  // The JSONL logs persist on disk; without this effect the view starts empty
+  // until the user manually re-picks the workspace ("history lost on restart").
+  const hydrateRef = useRef(false);
   useEffect(() => {
+    if (!isTauriRuntime() || hydrateRef.current) return;
+    hydrateRef.current = true;
     api
       .settingsLoad()
-      .then((s) => api.settingsSave({ ...s, params: genParams }))
+      .then((s) => {
+        const ws = s["lastWorkspace"];
+        if (typeof ws !== "string" || !ws) return;
+        // Restore multi-root workspaces if saved, otherwise just the primary.
+        const savedAll = s["lastWorkspaces"];
+        const restoreAll = Array.isArray(savedAll) && savedAll.length > 0
+          ? savedAll
+          : [ws];
+        const primary = restoreAll[0];
+        // Use the IPC to restore all workspaces.
+        return api.agentAddWorkspace(primary)
+          .then(async (all) => {
+            // Add any additional saved workspaces not already present.
+            for (const extra of restoreAll.slice(1)) {
+              if (!all.includes(extra)) {
+                all = await api.agentAddWorkspace(extra).catch(() => all);
+              }
+            }
+            setWorkspaces(all);
+          })
+          .then(() => {
+            const chat = s["lastChat"] as
+              | { project?: string; chatId?: string | null }
+              | undefined;
+            if (chat?.chatId && chat.project === ws && !isStreamingRef.current) {
+              clearChat();
+              setActiveChatId(chat.chatId);
+              loadSessionIntoView(ws, chat.chatId);
+            }
+          });
+      })
       .catch(() => {});
-  }, [genParams]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot mount hydration
+  }, []);
+
+  // Persist the current workspace/chat pointer + tunable params. Debounced so
+  // rapid workspace/chat/params changes don't fire overlapping read-modify-
+  // write races; flushed on unmount.
+  const debouncedSaveSettings = useCallback(() => {
+    if (settingsSaveTimerRef.current != null) {
+      window.clearTimeout(settingsSaveTimerRef.current);
+    }
+    settingsSaveTimerRef.current = window.setTimeout(() => {
+      settingsSaveTimerRef.current = null;
+      if (!isTauriRuntime()) return;
+      api
+        .settingsLoad()
+        .then((s) =>
+          api.settingsSave({
+            ...s,
+            lastWorkspace: workspaceRoot ?? s["lastWorkspace"],
+            lastWorkspaces: workspaces,
+            lastChat: { project: workspaceRoot ?? "default", chatId: activeChatId },
+            params: genParams,
+          }),
+        )
+        .catch(() => {});
+    }, 500);
+  }, [workspaceRoot, workspaces, activeChatId, genParams]);
+
+  useEffect(() => {
+    debouncedSaveSettings();
+    return () => {
+      if (settingsSaveTimerRef.current != null) {
+        window.clearTimeout(settingsSaveTimerRef.current);
+        settingsSaveTimerRef.current = null;
+        if (isTauriRuntime()) {
+          api
+            .settingsLoad()
+            .then((s) =>
+              api.settingsSave({
+                ...s,
+                lastWorkspace: workspaceRoot ?? s["lastWorkspace"],
+                lastWorkspaces: workspaces,
+                lastChat: { project: workspaceRoot ?? "default", chatId: activeChatId },
+                params: genParams,
+              }),
+            )
+            .catch(() => {});
+        }
+      }
+    };
+  }, [debouncedSaveSettings, workspaceRoot, workspaces, activeChatId, genParams]);
 
   // ---- model actions ----
   const loadModel = useCallback(async () => {
@@ -577,7 +794,19 @@ export default function App() {
         contextSize: genParams.contextSize,
         nThreads: genParams.nThreads,
       });
-      if (info) setModel(info);
+      if (info) {
+        setModel(info);
+        const p = await api.loadedModelPath().catch(() => null);
+        if (p) {
+          setRecentModels((prev) => {
+            const next = [p, ...prev.filter((x) => x !== p)].slice(0, 10);
+            api.settingsLoad().then((s) =>
+              api.settingsSave({ ...s, recentModels: next }),
+            ).catch(() => {});
+            return next;
+          });
+        }
+      }
       api
         .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
         .then(setUsage)
@@ -592,6 +821,12 @@ export default function App() {
   }, [genParams, modelLoading, refreshUsage]);
 
   const unloadModel = useCallback(async () => {
+    if (messages.length > 0) {
+      const ok = window.confirm(
+        "Unload the current model?\n\nThis clears the visible conversation and cannot be undone.",
+      );
+      if (!ok) return;
+    }
     try {
       await api.unloadModel();
       setModel(null);
@@ -601,7 +836,37 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [messages.length]);
+
+  /** Switch to a different local GGUF model: unload current, then load new. */
+  const switchModel = useCallback(async (newPath: string) => {
+    try {
+      setModelLoading(true);
+      setLoadProgress(0);
+      if (model) await api.unloadModel();
+      setModel(null);
+      setModelPath(null);
+      const info = await api.loadModelFromPath(newPath);
+      if (info) {
+        setModel(info);
+        setRecentModels((prev) => {
+          const next = [newPath, ...prev.filter((p) => p !== newPath)].slice(0, 10);
+          // Persist to settings.
+          api.settingsLoad().then((s) =>
+            api.settingsSave({ ...s, recentModels: next }),
+          ).catch(() => {});
+          return next;
+        });
+      }
+      api.contextSetSystemPrompt(AGENT_SYSTEM_PROMPT).then(setUsage).catch(() => {});
+      refreshUsage();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setModelLoading(false);
+      setLoadProgress(null);
+    }
+  }, [model, refreshUsage]);
 
   // Keep the displayed GGUF path in sync with the backend's load state.
   useEffect(() => {
@@ -669,6 +934,23 @@ export default function App() {
     },
     [],
   );
+
+  const respondQuestion = useCallback(async (requestId: string, answer: string) => {
+    setQuestionReq(null);
+    try {
+      await api.agentRespondQuestion(requestId, answer);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const abortBackgroundTask = useCallback(async (taskId: string) => {
+    try {
+      await api.abortBackgroundTask(taskId);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
 
   const refreshCheckpoints = useCallback(() => {
     api
@@ -752,7 +1034,10 @@ export default function App() {
         const next = prev.filter((f) => f.id !== id);
         if (activeKey === id) {
           const neighbor = idx > 0 ? next[idx - 1] : next[idx];
-          setActiveKey(neighbor ? neighbor.id : null);
+          // Defer setActiveKey to avoid calling setState inside another
+          // setState updater (React anti-pattern that can cause incorrect
+          // state selection).
+          queueMicrotask(() => setActiveKey(neighbor ? neighbor.id : null));
         }
         return next;
       });
@@ -802,6 +1087,11 @@ export default function App() {
     }
   }, [activeFile]);
 
+  const openFilePicker = useCallback(async () => {
+    const path = await api.pickTextFile();
+    if (path) openFile(path);
+  }, [openFile]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
@@ -824,31 +1114,32 @@ export default function App() {
         e.preventDefault();
         loadModel();
       }
+      if (e.key === "Escape") {
+        if (showSettings || showKnowledge || permissionReq != null) {
+          e.preventDefault();
+          if (showSettings) setShowSettings(false);
+          if (showKnowledge) setShowKnowledge(false);
+          if (permissionReq != null) setPermissionReq(null);
+          return;
+        }
+        if (isStreamingRef.current) {
+          e.preventDefault();
+          void abortAgentExecution();
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [saveActive, loadModel]);
-
-  const openFilePicker = useCallback(async () => {
-    const path = await api.pickTextFile();
-    if (path) openFile(path);
-  }, [openFile]);
+  }, [saveActive, openFilePicker, loadModel, abortAgentExecution, showSettings, showKnowledge, permissionReq]);
 
   /** Replay one project chat's JSONL log into the chat view + model context. */
   const loadSessionIntoView = useCallback(
     (project: string, chatId: string | null) => {
+      setIsSwitching(true);
       api
         .sessionLoad(project, chatId)
         .then((records) => {
-          const replay: ChatMessage[] = [];
-          for (const r of records) {
-            const role = r["role"];
-            const content = r["content"];
-            if (typeof content !== "string") continue;
-            if (role === "user") replay.push({ role: "user", content });
-            else if (role === "assistant")
-              replay.push({ role: "assistant", content: content || "…" });
-          }
+          const replay = recordsToMessages(records as never[]);
           setMessages(replay);
           for (const m of replay) {
             api
@@ -857,7 +1148,8 @@ export default function App() {
               .catch(() => {});
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => setIsSwitching(false));
     },
     [],
   );
@@ -866,20 +1158,27 @@ export default function App() {
    * open its default chat. Shared by the folder picker and the chats tree. */
   const applyWorkspace = useCallback(
     async (root: string) => {
-      setWorkspaceRoot(root);
-      setActiveChatId(null);
-      await api.agentSetWorkspace(root).catch(() => {});
-      refreshPolicy();
-      setCheckpoints([]);
-      api
-        .knowledgeReport()
-        .then(setKnowledge)
-        .catch(() => {});
-      api
-        .gitCheckpoints()
-        .then(setCheckpoints)
-        .catch(() => setCheckpoints([]));
-      loadSessionIntoView(root, null);
+      setIsSwitching(true);
+      try {
+        const all = await api.agentAddWorkspace(root).catch(() => [root]);
+        setWorkspaces(all);
+        setActiveChatId(null);
+        // Start file watcher for auto-reload on external changes.
+        api.startFileWatcher(root).catch(() => {});
+        refreshPolicy();
+        setCheckpoints([]);
+        api
+          .knowledgeReport()
+          .then(setKnowledge)
+          .catch(() => {});
+        api
+          .gitCheckpoints()
+          .then(setCheckpoints)
+          .catch(() => setCheckpoints([]));
+        loadSessionIntoView(root, null);
+      } finally {
+        setIsSwitching(false);
+      }
     },
     [refreshPolicy, loadSessionIntoView],
   );
@@ -888,6 +1187,23 @@ export default function App() {
     const root = await api.pickWorkspaceFolder();
     if (root) await applyWorkspace(root);
   }, [applyWorkspace]);
+
+  /** Add an additional workspace root (multi-root). */
+  const addWorkspace = useCallback(async () => {
+    const root = await api.pickWorkspaceFolder();
+    if (!root || workspaces.includes(root)) return;
+    const all = await api.agentAddWorkspace(root).catch(() => [...workspaces, root]);
+    setWorkspaces(all);
+    refreshPolicy();
+  }, [workspaces, refreshPolicy]);
+
+  /** Remove a workspace root. Cannot remove the primary. */
+  const removeWorkspace = useCallback(async (root: string) => {
+    if (workspaces.length <= 1) return;
+    const all = await api.agentRemoveWorkspace(root).catch(() => workspaces.filter(w => w !== root));
+    setWorkspaces(all);
+    refreshPolicy();
+  }, [workspaces, refreshPolicy]);
 
   // ---- context: active-file buffer (debounced so typing doesn't spam IPC) ----
   useEffect(() => {
@@ -916,6 +1232,7 @@ export default function App() {
         maxTokens: genParams.maxTokens,
         temperature: genParams.temperature,
         topP: genParams.topP,
+        repeatPenalty: genParams.repeatPenalty,
         maxSteps: 6,
         stopWords: ["<|endoftext|>"],
         planMode: opts?.planMode ?? false,
@@ -952,7 +1269,8 @@ export default function App() {
             .catch(() => {});
         }
       }
-      setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+      const userTs = Date.now();
+      setMessages((prev) => [...prev, { role: "user", content: trimmed, ts: userTs }]);
       api
         .contextPushTurn("user", trimmed)
         .then(setUsage)
@@ -961,10 +1279,39 @@ export default function App() {
         .sessionAppend(workspaceRoot ?? "default", {
           role: "user",
           content: trimmed,
-          ts: Date.now(),
+          ts: userTs,
         }, activeChatId)
         .catch(() => {});
       try {
+        if (text.startsWith("/bg ")) {
+          // Background task: runs independently, does not block the chat.
+          const bgPrompt = text.slice(4).trim();
+          if (!bgPrompt) return;
+          const bgLabel = bgPrompt.slice(0, 48);
+          const sessionId = await api.agentRunBackground({
+            prompt: bgPrompt,
+            maxTokens: genParams.maxTokens,
+            temperature: genParams.temperature,
+            topP: genParams.topP,
+            repeatPenalty: genParams.repeatPenalty,
+            maxSteps: 6,
+            stopWords: ["</s>"],
+            planMode: false,
+            verify: verifyRef.current,
+            decompose: false,
+          });
+          sessionLabelRef.current.set(sessionId, bgLabel);
+          bgSessionIdsRef.current.add(sessionId);
+          setBackgroundTasks((prev) => [
+            ...prev,
+            { id: `bg-pending-${sessionId}`, sessionId, label: bgLabel, status: "running", startedAt: Date.now() },
+          ]);
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `Background task started: ${bgLabel}` },
+          ]);
+          return;
+        }
         if (agentModeRef.current || opts?.planMode || opts?.decompose) {
           await runAgentTask(trimmed, opts);
         } else {
@@ -973,6 +1320,7 @@ export default function App() {
             maxTokens: genParams.maxTokens,
             temperature: genParams.temperature,
             topP: genParams.topP,
+            repeatPenalty: genParams.repeatPenalty,
             stopWords: ["<|endoftext|>", "\n\n---", "User:"],
           });
         }
@@ -1015,6 +1363,91 @@ export default function App() {
     setTodos(null);
     dispatchChatStatus({ type: "reset", at: performance.now() });
   }, []);
+
+  // Edit & resubmit: truncate messages from the edited index, push the
+  // updated user message, and re-invoke the agent loop.
+  const editResubmit = useCallback(
+    async (newText: string, messageIndex: number) => {
+      if (isStreaming) return;
+      const trimmed = newText.trim();
+      if (!trimmed) return;
+
+      // Fork: create a new chat branching from the edit point.
+      // Messages up to and including messageIndex are preserved in the new branch.
+      const forkId = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      setMessages((prev) => {
+        // Take messages up to (and including) the edited message.
+        const forkPrefix = prev.slice(0, messageIndex + 1);
+        // Replace the edited message content.
+        const lastMsg = forkPrefix[forkPrefix.length - 1];
+        if (lastMsg && lastMsg.role === "user") {
+          forkPrefix[forkPrefix.length - 1] = { ...lastMsg, content: trimmed };
+        }
+        // Persist the prefix to the new chat's JSONL.
+        const ws = workspaceRoot ?? "default";
+        for (const msg of forkPrefix) {
+          const record: Record<string, unknown> = {
+            role: msg.role,
+            content: msg.content,
+          };
+          if (msg.ts) record.ts = msg.ts;
+          if (msg.done) record.done = msg.done;
+          api.sessionAppend(ws, record, forkId).catch(() => {});
+        }
+        return forkPrefix;
+      });
+      setActiveChatId(forkId);
+      setLastDone(null);
+      setCurrentStep(null);
+
+      // Push the prefix messages into the model context.
+      // (We need to re-push since the context was cleared for the fork.)
+      const forkPrefix = messages.slice(0, messageIndex);
+      for (const msg of forkPrefix) {
+        api.contextPushTurn(msg.role, msg.content).catch(() => {});
+      }
+
+      // Push the edited user message.
+      api.contextPushTurn("user", trimmed).then(setUsage).catch(() => {});
+
+      dispatchChatStatus({ type: "submit", at: performance.now() });
+      try {
+        if (agentModeRef.current) {
+          await runAgentTask(trimmed);
+        } else {
+          await api.streamInference({
+            prompt: trimmed,
+            maxTokens: genParams.maxTokens,
+            temperature: genParams.temperature,
+            topP: genParams.topP,
+            repeatPenalty: genParams.repeatPenalty,
+            stopWords: ["</s>", "\n\n---", "User:"],
+          });
+        }
+      } catch (e) {
+        const msg = String(e);
+        setError(msg);
+        dispatchChatStatus({ type: "error", message: msg, at: performance.now() });
+      }
+    },
+    [activeChatId, genParams, isStreaming, messages, runAgentTask, workspaceRoot],
+  );
+
+  // Export conversation via the proper export library (PDF / DOCX / CSV).
+  const [exportFormat, setExportFormat] = useState<"pdf" | "docx" | "csv">("pdf");
+
+  const exportChat = useCallback(async () => {
+    if (messages.length === 0) return;
+    const firstUserMsg = messages.find((m) => m.role === "user");
+    const title = firstUserMsg
+      ? firstUserMsg.content.slice(0, 60).replace(/\n/g, " ")
+      : "Chat Export";
+    try {
+      await exportConversation({ messages, title, format: exportFormat });
+    } catch (err) {
+      console.error("Export failed:", err);
+    }
+  }, [messages, exportFormat]);
 
   // ---- BN-11: projects/chats sidebar ----
   const newChat = useCallback(() => {
@@ -1069,6 +1502,59 @@ export default function App() {
     [activeChatId, clearChat, workspaceRoot],
   );
 
+  const handleParamsChange = useCallback((patch: Partial<GenParams>) => {
+    setGenParams((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleYoloChange = useCallback((v: boolean) => {
+    setYolo(v);
+    api.agentSetYolo(v).catch(() => {});
+  }, []);
+
+  const handleAttachClick = useCallback(async () => {
+    try {
+      const picked = await api.pickTextFile();
+      if (!picked) return;
+      const info = await api.agentAttachFile(picked);
+      setAttachments((prev) =>
+        prev.some((a) => a.path === info.path)
+          ? prev
+          : [...prev, { path: info.path, chunkCount: info.chunkCount }],
+      );
+    } catch {
+      // picker cancelled / read failed — ignore silently
+    }
+  }, []);
+
+  const handleDetachFile = useCallback((path: string) => {
+    api.agentDetachFile(path).catch(() => {});
+    setAttachments((prev) => prev.filter((a) => a.path !== path));
+  }, []);
+
+  const handleDropFiles = useCallback(async (paths: string[]) => {
+    for (const p of paths) {
+      try {
+        const info = await api.agentAttachFile(p);
+        setAttachments((prev) =>
+          prev.some((a) => a.path === info.path)
+            ? prev
+            : [...prev, { path: info.path, chunkCount: info.chunkCount }],
+        );
+      } catch {
+        // skip files that can't be read/attached
+      }
+    }
+  }, []);
+
+  const skills = useMemo(
+    () => (knowledge?.skills ?? []).map((s) => s.name),
+    [knowledge],
+  );
+
+  const handleExportFormatChange = useCallback((fmt: string) => {
+    setExportFormat(fmt as "pdf" | "docx" | "csv");
+  }, []);
+
   return (
     <div className="flex h-full w-full flex-col bg-editor text-ink">
       <TitleBar />
@@ -1089,14 +1575,17 @@ export default function App() {
         isStreaming={isStreaming}
         params={genParams}
         initialRemote={savedRemote}
-        onParamsChange={(patch) => setGenParams((prev) => ({ ...prev, ...patch }))}
+        recentModels={recentModels}
+        onParamsChange={handleParamsChange}
         onLoad={loadModel}
         onUnload={unloadModel}
+        onSwitchModel={switchModel}
         onCancel={cancelInference}
         onConnectRemote={connectRemote}
       />
       <div className="flex min-h-0 flex-1">
-        <div
+        <nav
+          aria-label="Sidebar"
           className="flex shrink-0 flex-col border-r border-border bg-panel"
           style={{ width: sidebarW, minWidth: 160, maxWidth: 520 }}
         >
@@ -1156,11 +1645,15 @@ export default function App() {
             <FileExplorer
               chromeless
               workspaceRoot={workspaceRoot}
+              workspaces={workspaces}
               onSelectWorkspace={selectWorkspace}
+              onAddWorkspace={addWorkspace}
+              onRemoveWorkspace={removeWorkspace}
               onOpenFile={openFile}
               onNewFile={newFile}
               onOpenSkills={() => setShowKnowledge(true)}
               refreshSignal={explorerRefresh}
+              onRefresh={() => setExplorerRefresh((n) => n + 1)}
             />
           </div>
           {leftView === "chats" && (
@@ -1174,7 +1667,7 @@ export default function App() {
               onOpenProject={(path) => void applyWorkspace(path)}
             />
           )}
-        </div>
+        </nav>
         <ResizeHandle
           axis="x"
           onDragStart={() => (paneStarts.current.sidebar = sidebarW)}
@@ -1182,7 +1675,7 @@ export default function App() {
             setSidebarW(Math.min(520, Math.max(160, paneStarts.current.sidebar + d)))
           }
         />
-        <div className="flex min-w-0 flex-1 flex-col">
+        <main className="flex min-w-0 flex-1 flex-col">
           <Tabs
             files={files}
             activeKey={activeKey}
@@ -1192,7 +1685,7 @@ export default function App() {
           <div className="min-h-0 flex-1 overflow-hidden">
             <EditorPane file={activeFile} onContentChange={updateContent} />
           </div>
-        </div>
+        </main>
         <ResizeHandle
           axis="x"
           onDragStart={() => (paneStarts.current.chat = chatW)}
@@ -1217,38 +1710,42 @@ export default function App() {
           currentStep={currentStep}
           currentSubtask={currentSubtask}
           todos={todos}
+          questionReq={questionReq}
+          onRespondQuestion={respondQuestion}
           verify={verify}
           onVerifyChange={setVerify}
           yolo={yolo}
-          onYoloChange={(v) => {
-            setYolo(v);
-            api.agentSetYolo(v).catch(() => {});
-          }}
-          skills={(knowledge?.skills ?? []).map((s) => s.name)}
+          onYoloChange={handleYoloChange}
+          skills={skills}
           attachments={attachments}
-          onAttachClick={async () => {
-            try {
-              const picked = await api.pickTextFile();
-              if (!picked) return;
-              const info = await api.agentAttachFile(picked);
-              setAttachments((prev) =>
-                prev.some((a) => a.path === info.path)
-                  ? prev
-                  : [...prev, { path: info.path, chunkCount: info.chunkCount }],
-              );
-            } catch {
-              // picker cancelled / read failed — ignore silently
-            }
-          }}
-          onDetachFile={(path) => {
-            api.agentDetachFile(path).catch(() => {});
-            setAttachments((prev) => prev.filter((a) => a.path !== path));
-          }}
+          onAttachClick={handleAttachClick}
+          onDetachFile={handleDetachFile}
+          onDropFiles={handleDropFiles}
           pendingPlan={pendingPlan}
           onApprovePlan={approvePlan}
           onRejectPlan={rejectPlan}
           onOpenSkills={() => setShowKnowledge(true)}
+          onEditResubmit={editResubmit}
+          onExport={exportChat}
+          exportFormat={exportFormat}
+          onExportFormatChange={handleExportFormatChange}
+          contextUsage={usage}
         />
+        {isSwitching && (
+          <div className="pointer-events-none absolute right-6 top-1/2 z-40 -translate-y-1/2 rounded-md border border-border bg-panel px-3 py-1.5 text-[11px] text-zinc-500 shadow-sm">
+            Loading…
+          </div>
+        )}
+        {contextTrimNotice && (
+          <div className="pointer-events-none absolute bottom-24 right-4 z-50 animate-fade-in rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700 shadow-sm">
+            Context trimmed — earlier history was summarized to fit the window.
+          </div>
+        )}
+        {fileChangeNotice && (
+          <div className="pointer-events-none absolute right-4 top-14 z-50 animate-fade-in rounded-md border border-border bg-panel-2 px-3 py-1.5 text-[11px] text-zinc-500 shadow-sm">
+            External file changes detected — explorer refreshed
+          </div>
+        )}
       </div>
       {showConsole && (
         <ResizeHandle
@@ -1268,6 +1765,7 @@ export default function App() {
       <StatusBar
         model={model}
         workspaceRoot={workspaceRoot}
+        workspaces={workspaces}
         activeFile={activeFile}
         error={error}
         usage={usage}
@@ -1280,6 +1778,12 @@ export default function App() {
       <div className="pointer-events-none absolute bottom-8 right-4 z-30">
         <InterruptButton visible={isStreaming} onAbort={abortAgentExecution} />
       </div>
+      <div className="pointer-events-none absolute bottom-8 right-20 z-30">
+        <BackgroundTasks
+          tasks={backgroundTasks}
+          onAbort={abortBackgroundTask}
+        />
+      </div>
       <PermissionModal
         request={permissionReq}
         policy={policy}
@@ -1290,7 +1794,7 @@ export default function App() {
         open={showSettings}
         onClose={() => setShowSettings(false)}
         params={genParams}
-        onParamsChange={(patch) => setGenParams((prev) => ({ ...prev, ...patch }))}
+        onParamsChange={handleParamsChange}
       />
     </div>
   );

@@ -20,6 +20,12 @@ pub const DEFAULT_LIMIT: usize = 8192;
 /// Fraction of the limit at which eviction starts (0.80 = 80%).
 pub const EVICTION_THRESHOLD: f32 = 0.80;
 
+/// Per-message character cap used by [`ContextManager::compact_context`] when a
+/// caller does not supply one. Tool feedback is already capped around 2000 chars
+/// upstream; 6000 truncates pathological multi-hundred-thousand-char outputs
+/// while leaving ordinary messages untouched.
+pub const COMPACT_DEFAULT_MAX_CHARS: usize = 6000;
+
 /// A single conversation message. `pinned` messages are protected from eviction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +46,19 @@ pub struct UsageReport {
     pub used_percent: f32,
     pub evicted_turns: usize,
     pub message_count: usize,
+    pub overflow: bool,
+}
+
+/// Summary of one [`ContextManager::compact_context`] pass.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactReport {
+    /// Turns dropped by stage-1 budget eviction.
+    pub evicted_turns: usize,
+    /// Messages truncated by stage-2 oversized-content compression.
+    pub compressed_messages: usize,
+    pub total_tokens: usize,
+    pub used_percent: f32,
     pub overflow: bool,
 }
 
@@ -261,6 +280,68 @@ impl ContextManager {
     fn token_count(&self, text: &str) -> usize {
         count_tokens(&self.tokenizer, text)
     }
+
+    /// Stage 1 of the compaction pipeline: budget-aware eviction. Drops the
+    /// oldest evictable turns (and, last-resort, pinned buffers) until usage is
+    /// back under the 80% threshold. Returns the number of turns shed by this
+    /// call.
+    pub fn evict_to_budget(&mut self) -> usize {
+        let before = self.evicted_turns;
+        self.enforce_budget();
+        self.evicted_turns - before
+    }
+
+    /// Stage 2 of the compaction pipeline: compress oversized messages instead
+    /// of dropping them. History turns (tool outputs, long assistant replies)
+    /// are truncated first; oversized non-system pinned buffers (active-file
+    /// context, skills) follow only when history alone was not enough. The
+    /// system prompt is never compressed here — eviction handles it as the last
+    /// resort. Returns the number of messages rewritten.
+    pub fn compress_oversized(&mut self, max_chars: usize) -> usize {
+        let mut compressed = 0usize;
+        for t in self.history.iter_mut() {
+            if let Some(replacement) = compress_message_content(&t.message.content, max_chars) {
+                t.message.content = replacement;
+                compressed += 1;
+            }
+        }
+        for t in self.pinned.iter_mut() {
+            if t.message.role == "system" {
+                continue;
+            }
+            if let Some(replacement) = compress_message_content(&t.message.content, max_chars) {
+                t.message.content = replacement;
+                compressed += 1;
+            }
+        }
+        self.recount_all();
+        self.enforce_budget();
+        compressed
+    }
+
+    /// Multi-stage compaction entry point for the orchestrator when a task is
+    /// approaching the context limit:
+    ///
+    /// 1. [`Self::evict_to_budget`] — drop the oldest evictable turns.
+    /// 2. [`Self::compress_oversized`] — truncate oversized messages around an
+    ///    informative marker so their head-and-tail survives eviction.
+    ///
+    /// A stage-3 LLM conversation summarization pass is deliberately *not*
+    /// wired here: it would need a generation handle this module does not own.
+    /// The two deterministic stages keep the payload under budget without
+    /// sacrificing a partially-applied plan.
+    #[allow(dead_code)] // orchestrator integration point (not yet wired to a command)
+    pub fn compact_context(&mut self) -> CompactReport {
+        let evicted = self.evict_to_budget();
+        let compressed = self.compress_oversized(COMPACT_DEFAULT_MAX_CHARS);
+        CompactReport {
+            evicted_turns: evicted,
+            compressed_messages: compressed,
+            total_tokens: self.total,
+            used_percent: (self.total as f32 / self.limit as f32) * 100.0,
+            overflow: self.total > self.threshold,
+        }
+    }
 }
 
 /// Count tokens with the registered tokenizer, falling back to the heuristic.
@@ -283,6 +364,28 @@ fn heuristic(text: &str) -> usize {
     } else {
         chars.div_ceil(4)
     }
+}
+
+/// Replace `content` with its head + tail framed by an informative truncation
+/// marker once it exceeds `max_chars`. Keeps 3/4 of the budget in the head
+/// (where emitted tool output usually carries the command + start of results)
+/// and the rest in the tail (where errors and summaries land). Returns `None`
+/// when the content is within budget.
+fn compress_message_content(content: &str, max_chars: usize) -> Option<String> {
+    let max_chars = max_chars.max(128);
+    let total = content.chars().count();
+    if total <= max_chars {
+        return None;
+    }
+    let keep_head = max_chars * 3 / 4;
+    let keep_tail = max_chars - keep_head;
+    let head: String = content.chars().take(keep_head).collect();
+    let tail: String = content.chars().skip(total - keep_tail).collect();
+    let marker = format!(
+        "\n\n[Content compressed: {} → {max_chars} chars. Tool output was truncated to protect the context window; re-run the tool against a narrower range to recover the middle.]\n\n",
+        total
+    );
+    Some(format!("{head}{marker}{tail}"))
 }
 
 #[cfg(test)]
@@ -330,5 +433,39 @@ mod tests {
         assert_eq!(heuristic(""), 1);
         assert_eq!(heuristic("abcd"), 1);
         assert_eq!(heuristic("abcdefgh"), 2);
+    }
+
+    #[test]
+    fn compress_keeps_head_tail_and_marks_truncation() {
+        let long = "x".repeat(10_000);
+        let out = compress_message_content(&long, 1000).unwrap();
+        assert!(out.chars().count() < 10_000);
+        assert!(out.contains("Content compressed"));
+        assert!(out.starts_with(&"x".repeat(750)));
+        assert!(out.ends_with(&"x".repeat(250)));
+    }
+
+    #[test]
+    fn compress_skips_short_messages() {
+        assert!(compress_message_content("short", 1000).is_none());
+    }
+
+    #[test]
+    fn compact_context_compresses_oversized_buffers_back_under_threshold() {
+        let mut m = ContextManager::new(2000);
+        m.set_system_prompt("SYS.".repeat(10)); // ~10 tok
+        // 7000-char active-file buffer (~1750 tok): above the 1600 threshold but
+        // below the hard limit, so it survives auto-eviction while overflowing.
+        m.upsert_pinned("context", "X".repeat(7000));
+        assert!(m.usage().overflow);
+        let report = m.compact_context();
+        assert!(!report.overflow);
+        assert!(report.total_tokens <= m.usage().limit);
+        assert!(report.compressed_messages >= 1);
+        // The head+tail marker is present so the model knows data was elided.
+        assert!(m
+            .messages()
+            .iter()
+            .any(|msg| msg.content.contains("Content compressed")));
     }
 }
