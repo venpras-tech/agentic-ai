@@ -11,12 +11,14 @@
 //!   tokens out through a bounded cross-beam MPSC channel. The UI thread never
 //!   touches llama.cpp.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::logging;
+use crate::remote::RemoteGenerator;
 use crossbeam_channel::Sender;
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -85,6 +87,12 @@ pub struct StandaloneEngine {
     context: LlamaContext<'static>,
     model: Arc<LlamaModel>,
     _backend: Arc<LlamaBackend>,
+    /// The exact token IDs (prompt + generated output) currently held in the KV
+    /// cache of `context`. Used to compute a *verified* common prefix before
+    /// reusing the cache on the next request — mirroring how llama-server
+    /// reuses a cache only up to the first divergent token. Generated output
+    /// tokens that don't round-trip identically are simply not reused.
+    cached_tokens: Vec<llama_cpp_2::token::LlamaToken>,
 }
 
 // Safety: all llama.cpp calls are serialized by the owning async mutex and the
@@ -143,6 +151,21 @@ pub struct ChatTurn {
     pub content: String,
 }
 
+/// An attached image, carried as a base64 data URL so it can be injected as a
+/// vision content block for multimodal remote providers. Local llama.cpp has no
+/// vision, so these are ignored by the local render path and only surfaced to
+/// OpenAI-compatible / Anthropic remote backends that accept image blocks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    /// `data:image/png;base64,...` (or similar). The media type is parsed from
+    /// the data URL; the payload is the base64 body.
+    pub data_url: String,
+    /// Optional short label / description the model can reference.
+    #[serde(default)]
+    pub alt: String,
+}
+
 /// A single streaming inference request (camelCase over the wire).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +180,10 @@ pub struct InferenceRequest {
     /// models. Roles other than `user`/`assistant` are passed as `system`.
     #[serde(default)]
     pub messages: Option<Vec<ChatTurn>>,
+    /// Base64 image attachments to include with the user turn for vision-capable
+    /// remote providers. Ignored by the local llama.cpp path.
+    #[serde(default)]
+    pub images: Option<Vec<ImageAttachment>>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -241,6 +268,10 @@ pub struct StepStat {
 
 /// Sub-task progress for decomposed agentic tasks (camelCase). `status` is one
 /// of "running" | "done" | "failed".
+///
+/// The three optional fields feed the row-by-row subagent status panel: the
+/// model the sub-task ran on, how long it has been running, and the tool it is
+/// currently executing (`None` while generating / between tools).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtaskStat {
@@ -248,6 +279,12 @@ pub struct SubtaskStat {
     pub total: usize,
     pub title: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// Model load progress pushed to the frontend (camelCase).
@@ -405,7 +442,99 @@ struct EngineWorker {
     _handle: std::thread::JoinHandle<()>,
 }
 
-/// A pool of engine worker threads, each owning its own generator (own
+// ---------------------------------------------------------------------------
+// Runtime role routing (model hand-off).
+//
+// The [`EnginePool`] is built from one backend (usually local GGUF). The
+// [`RuntimeRouter`] lets the orchestrator hand a generation off to a different
+// provider mid-task by role: e.g. a cheap/fast remote model plans while the
+// pool's flagship model edits. Local routes (the common case) borrow a worker
+// handle from the pool; non-local routes lazily spawn a [`RemoteGenerator`]
+// and cache one per role. The router is single-threaded by design (it lives on
+// the orchestrator's own thread), so no interior mutability is needed.
+// ---------------------------------------------------------------------------
+
+/// A generator produced by [`RuntimeRouter::resolve`] for one routed step.
+pub enum RoutedGen<'a> {
+    /// A handle into the primary engine pool (local provider).
+    Pool(PoolGenerator),
+    /// A lazily-created remote generator cached for the role.
+    Remote(&'a mut dyn TextGenerator),
+}
+
+impl TextGenerator for RoutedGen<'_> {
+    fn info(&self) -> ModelInfo {
+        match self {
+            RoutedGen::Pool(g) => g.info(),
+            RoutedGen::Remote(g) => g.info(),
+        }
+    }
+
+    fn generate(
+        &mut self,
+        request: &InferenceRequest,
+        session_id: u64,
+        interrupt: &CancellationToken,
+        tx: &Sender<WorkerEvent>,
+    ) -> Result<GenerationOutcome, String> {
+        match self {
+            RoutedGen::Pool(g) => g.generate(request, session_id, interrupt, tx),
+            RoutedGen::Remote(g) => g.generate(request, session_id, interrupt, tx),
+        }
+    }
+}
+
+/// Routes a generation to the provider assigned to a [`ProviderRole`] at
+/// runtime (see module docs above).
+pub struct RuntimeRouter<'a> {
+    pool: &'a EnginePool,
+    registry: ProviderRegistry,
+    event_tx: Sender<WorkerEvent>,
+    remote: HashMap<ProviderRole, Box<dyn TextGenerator>>,
+}
+
+impl<'a> RuntimeRouter<'a> {
+    /// Build a router over the primary pool + a provider registry snapshot.
+    pub fn new(
+        pool: &'a EnginePool,
+        registry: ProviderRegistry,
+        event_tx: Sender<WorkerEvent>,
+    ) -> Self {
+        Self {
+            pool,
+            registry,
+            event_tx,
+            remote: HashMap::new(),
+        }
+    }
+
+    /// Return a generator suitable for role `role`. Local-routed roles get a
+    /// handle into the shared pool (so KV-cache/worker semantics are preserved);
+    /// remote-routed roles get a cached per-role [`RemoteGenerator`].
+    pub fn resolve(&mut self, role: ProviderRole) -> Result<RoutedGen<'_>, String> {
+        match self.registry.route(role) {
+            Some(p) if p.kind != ProviderKind::Local => {
+                if !self.remote.contains_key(&role) {
+                    let cfg = p.to_remote_model_config().map_err(|e| {
+                        format!("Role `{role}` provider `{}` is not usable: {e}", p.id)
+                    })?;
+                    let gen = RemoteGenerator::new(cfg)
+                        .map(|g| Box::new(g) as Box<dyn TextGenerator>)?;
+                    self.remote.insert(role, gen);
+                }
+                Ok(RoutedGen::Remote(
+                    self.remote
+                        .get_mut(&role)
+                        .expect("provider inserted above")
+                        .as_mut(),
+                ))
+            }
+            // Local (or no matching provider → default fallback): reuse pool.
+            _ => Ok(RoutedGen::Pool(self.pool.handle(0))),
+        }
+    }
+}
+
 /// llama.cpp context for local models, own client for remote). Generations
 /// dispatch to workers round-robin; parallel subtasks take one worker each.
 pub struct EnginePool {
@@ -534,6 +663,7 @@ impl LoadedModel {
             context,
             model: self.model.clone(),
             _backend: self.backend.clone(),
+            cached_tokens: Vec::new(),
         })
     }
 }
@@ -647,13 +777,18 @@ pub fn run_generation(
         ));
     }
 
-    // Clear any KV state left over from a previous session so positions start
-    // from zero and cross-request caches never bleed into one another.
-    // When cached_prefix_tokens is set, preserve the cache for prefix reuse.
-    let prefix_len = request.cached_prefix_tokens.unwrap_or(0);
-    if prefix_len == 0 {
-        engine.context.clear_kv_cache();
-    }
+    // KV-cache prefix reuse is DISABLED across agent-loop calls. The naive
+    // reuse (resume at `cached_prefix_tokens` / the LCP of the previous prompt)
+    // leaves the llama.cpp KV cache with positions that are not strictly
+    // consecutive with what the model expects, so the very next decode returns
+    // `-1` (surfaced by the crate as "Decode Error -1: n_tokens == 0" — a
+    // generic failure, not actually an empty batch) and multi-step agentic
+    // replies break on step 2. Re-evaluating the full prompt every step is
+    // correct (consecutive positions 0..n) at the cost of some speed.
+    let _ = request.cached_prefix_tokens;
+    engine.context.clear_kv_cache();
+    engine.cached_tokens.clear();
+    let prefix_len = 0usize;
     engine.context.reset_timings();
 
     let mut sampler = build_sampler(request);
@@ -662,11 +797,9 @@ pub fn run_generation(
     // 512). Chunk it so every `decode` call stays within the batch capacity;
     // logits are only requested on the final prompt token so generation starts
     // from the correct KV position.
-    // When prefix_len > 0, skip re-encoding tokens already in the KV cache.
     const PROMPT_BATCH: usize = 512;
     let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
-    let start = prefix_len.min(prompt_tokens.len());
-    let mut pos = start;
+    let mut pos = prefix_len;
     while pos < prompt_tokens.len() {
         let end = (pos + PROMPT_BATCH).min(prompt_tokens.len());
         batch.clear();
@@ -683,6 +816,29 @@ pub fn run_generation(
             .map_err(|e| format!("Prompt evaluation failed: {e}"))?;
         pos = end;
     }
+
+    // If the prompt was entirely served from the KV cache, the loop above never
+    // ran and `batch` is still empty. Feeding that to generation samples from
+    // an invalid index (`batch.n_tokens() - 1 == -1`) on stale logits, which
+    // derails the queue and surfaces as `n_tokens == 0` decode failures on
+    // later agent steps. Re-evaluate just the final prompt token: it is the
+    // same token at the same KV position, so the write is idempotent, and it
+    // yields fresh logits at a valid sampler index for this request.
+    if batch.n_tokens() == 0 {
+        let last = prompt_tokens.len() - 1;
+        batch
+            .add(prompt_tokens[last], last as i32, &[0], true)
+            .map_err(|e| format!("Failed to queue cached-prompt token: {e}"))?;
+        engine
+            .context
+            .decode(&mut batch)
+            .map_err(|e| format!("Prompt evaluation (cached tail) failed: {e}"))?;
+    }
+
+    // The whole prompt is now in the KV cache. Rebuild the ledger so the
+    // in-cache token sequence stays authoritative for any future (opt-in)
+    // prefix reuse; with reuse currently disabled this is just the prompt.
+    engine.cached_tokens = prompt_tokens.clone();
 
     let started = Instant::now();
     let mut n_cur = prompt_len;
@@ -718,6 +874,7 @@ pub fn run_generation(
         // Some control/unknown tokens decode to an empty piece; still advance
         // the KV position so the loop cannot spin.
         if piece.is_empty() {
+            engine.cached_tokens.push(token);
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
@@ -745,6 +902,7 @@ pub fn run_generation(
         })
         .map_err(|e| format!("Token stream channel closed: {e}"))?;
 
+        engine.cached_tokens.push(token);
         batch.clear();
         batch
             .add(token, n_cur, &[0], true)
@@ -763,9 +921,10 @@ pub fn run_generation(
         0.0
     };
 
-    // Report actual cache statistics: prefix tokens served from cache, rest written.
+    // Report actual cache statistics: `prefix_len` tokens were served from the
+    // reused KV cache; the rest of the prompt plus the outputs were written.
     let cache_reads = prefix_len as u64;
-    let cache_writes = (prompt_len as u64).saturating_sub(cache_reads);
+    let cache_writes = ((prompt_len as usize - prefix_len) as u64) + total_tokens;
     Ok(GenerationOutcome {
         done: InferenceDone {
             total_tokens,
@@ -921,6 +1080,7 @@ mod tests {
         let request = InferenceRequest {
             prompt: "p".into(),
             messages: None,
+            images: None,
             max_tokens: 8,
             temperature: None,
             top_p: None,
@@ -957,6 +1117,46 @@ mod tests {
         assert_eq!(o2.done.total_tokens, 8);
     }
 
+    #[test]
+    fn runtime_router_routes_local_roles_to_the_pool() {
+        let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
+        let pool = EnginePool::spawn_with(
+            || {
+                Ok(Box::new(FakeGen {
+                    tag: "pool".into(),
+                }) as Box<dyn TextGenerator>)
+            },
+            ev_tx.clone(),
+            1,
+        )
+        .expect("spawn pool");
+
+        // Local-only registry: every role must fall back to the pool handle.
+        let mut router = RuntimeRouter::new(&pool, ProviderRegistry::with_defaults("qwen", None), ev_tx.clone());
+        for role in [
+            ProviderRole::Planner,
+            ProviderRole::Editor,
+            ProviderRole::Autocomplete,
+            ProviderRole::Embed,
+        ] {
+            let gen = router.resolve(role).expect("local role resolves");
+            assert!(
+                matches!(gen, RoutedGen::Pool(_)),
+                "role {role:?} must reuse the pool when no remote is routed"
+            );
+        }
+
+        // A Local provider explicitly mapped to a role still routes to the pool.
+        let mut reg = ProviderRegistry::with_defaults("qwen", None);
+        let mut local = ProviderConfig::local("qwen");
+        local.id = "my_local".into();
+        local.roles = vec![ProviderRole::Planner, ProviderRole::Editor];
+        reg.add_provider(local.clone());
+        reg.set_role_provider(ProviderRole::Editor, "my_local");
+        let mut router2 = RuntimeRouter::new(&pool, reg, ev_tx);
+        assert!(matches!(router2.resolve(ProviderRole::Editor), Ok(RoutedGen::Pool(_))));
+    }
+
     /// End-to-end headless chat test: load the real GGUF, run `run_generation`
     /// (the exact path the app's chat uses, including the chunked prompt
     /// decode), and confirm tokens actually stream. Skipped when the model file
@@ -985,6 +1185,7 @@ mod tests {
         let request = InferenceRequest {
             prompt: "hi".to_string(),
             messages: None,
+            images: None,
             max_tokens: 48,
             temperature: Some(0.0),
             top_p: Some(1.0),
@@ -1024,6 +1225,7 @@ mod tests {
         let request2 = InferenceRequest {
             prompt: "what is 2+2?".to_string(),
             messages: None,
+            images: None,
             max_tokens: 32,
             temperature: Some(0.0),
             top_p: Some(1.0),
@@ -1046,6 +1248,7 @@ mod tests {
         let big_request = InferenceRequest {
             prompt: big_prompt,
             messages: None,
+            images: None,
             max_tokens: 24,
             temperature: Some(0.0),
             top_p: Some(1.0),

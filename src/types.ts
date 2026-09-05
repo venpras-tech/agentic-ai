@@ -28,6 +28,49 @@ export interface RemoteModelConfig {
   model: string;
 }
 
+/** A user-defined agent mode from `.ai/modes/*.md` (camelCase mirror of the
+ *  Rust `subagent::Mode`). An empty `allowedTools` means unrestricted. */
+export interface AgentMode {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  allowedTools: string[];
+  allowedGlobs?: string[];
+  modelOverride?: string;
+}
+
+/** A reusable recipe in `.ai/workflows/*.md`, invoked via `/name`. */
+export interface Workflow {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  allowedTools: string[];
+}
+
+/** Persisted `{project, chatId}` pointer (survives app restarts). */
+export interface LastChatPointer {
+  project: string;
+  chatId: string | null;
+}
+
+/**
+ * Typed mirror of the Rust `AppSettings` struct (`{app_data}/settings.json`).
+ * Fields are optional because the file is written by both the model lifecycle
+ * (`modelPath`) and the frontend, and unknown keys survive a load→save round
+ * trip via the catch-all.
+ */
+export interface AppSettingsRecord {
+  modelPath?: string;
+  recentModels?: string[];
+  params?: Partial<GenParams>;
+  remote?: RemoteModelConfig;
+  lastWorkspace?: string;
+  lastWorkspaces?: string[];
+  lastChat?: LastChatPointer;
+  /** Preserved verbatim on load→save round trips (legacy/unknown keys). */
+  [key: string]: unknown;
+}
+
 export type ProviderRole =
   | "planner"
   | "editor"
@@ -72,6 +115,12 @@ export interface RemoteProviderPreset {
 export interface ChatMessage {
   role: "user" | "assistant" | "error";
   content: string;
+  /**
+   * Client-generated UUID for this turn; both the user and assistant halves of
+   * a turn share it. Stored in the JSONL record as `turnId` so the backend can
+   * dedupe replayed `sessionAppend` writes (idempotent turns).
+   */
+  turnId?: string;
   sessionId?: number;
   /** Wall-clock completion time (ms epoch); persisted for exports. */
   ts?: number;
@@ -92,7 +141,8 @@ export interface AgentToolEvent {
   startedAt: number;
   durationMs?: number;
   detail?: string;
-  /** @deprecated not emitted by the backend; kept for legacy hydration. */
+  /** Live terminal/test output — accumulated client-side from
+   *  `tool-output` events (`execute_terminal_command`, `run_tests`). */
   output?: string;
   /** Owning agent session (from the backend) — pins the event to its turn. */
   sessionId: number;
@@ -110,6 +160,9 @@ export interface FileChangedEvent {
   diff?: string;
   /** Pre-change file content (for undo/revert). */
   before?: string;
+  /** Per-diff resolution, set client-side via the chat reducer
+   *  (`chatReducer` "diffResolved"). Absent while still pending. */
+  resolved?: "accepted" | "rejected";
 }
 
 export interface ToolOutputEvent {
@@ -147,6 +200,12 @@ export interface SubtaskStat {
   total: number;
   title: string;
   status: "running" | "done" | "failed";
+  /** Model the sub-task is running on (first-class subagents; decompose may omit). */
+  model?: string;
+  /** Running/completed duration in ms (0 while just started). */
+  elapsedMs?: number;
+  /** Tool currently executing; absent while generating or between tools. */
+  tool?: string;
 }
 
 export interface SubtaskEvent {
@@ -243,6 +302,13 @@ export interface SessionProjectInfo {
   chats: SessionChatInfo[];
 }
 
+/** An attached image carried as a base64 `data:` URL for vision-capable remote
+ * providers. Not supported by the local llama.cpp path. */
+export interface ImageAttachment {
+  dataUrl: string;
+  alt?: string;
+}
+
 export interface ContextUsage {
   totalTokens: number;
   limit: number;
@@ -251,6 +317,18 @@ export interface ContextUsage {
   evictedTurns: number;
   messageCount: number;
   overflow: boolean;
+  /** Per-category token split surfaced in the status bar. */
+  breakdown?: ContextBreakdown;
+}
+
+export interface ContextBreakdown {
+  system: number;
+  file: number;
+  rules: number;
+  skills: number;
+  memory: number;
+  otherPinned: number;
+  turns: number;
 }
 
 export interface PermissionRequest {
@@ -277,6 +355,10 @@ export interface Skill {
   content: string;
   source: string;
   active: boolean;
+  /** User-defined tags surfaced in the knowledge panel (empty when none). */
+  tags?: string[];
+  /** Glob patterns this skill applies to (matched against active-file paths). */
+  globs?: string[];
 }
 
 export interface KnowledgeReport {
@@ -339,12 +421,15 @@ export interface AttachedFileInfo {
 
 export interface PolicyRule {
   tool: string;
-  policy: string;
+  /** "allow" | "ask" | "deny" — the lenient loader preserves unknown values, but
+   *  this is the documented contract (see `.ai/policy.json`). */
+  policy: "allow" | "ask" | "deny";
   commandPatterns: string[];
 }
 
 export interface PolicySnapshot {
-  default: string;
+  /** Fallback verdict for tools with no explicit rule. */
+  default: "ask" | "allow" | "deny";
   rules: PolicyRule[];
   /** YOLO sub-mode: ROUTINE shell commands skip approval (session-only). */
   yolo?: boolean;
@@ -356,6 +441,16 @@ export interface CheckpointInfo {
   hash: string;
   subject: string;
   relative: string;
+  /** User-given name when this checkpoint was created with `git_checkpoint(..., name)` /
+   *  `git_checkpoints(..., name)`; resolved from `.ai/checkpoints.json`. */
+  name?: string;
+}
+
+/** A user-named snapshot (`.ai/checkpoints.json`), keyed by commit hash. */
+export interface NamedCheckpoint {
+  hash: string;
+  name: string;
+  timeMs: number;
 }
 
 export interface ToolResultInfo {

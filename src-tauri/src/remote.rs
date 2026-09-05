@@ -119,7 +119,7 @@ fn default_provider() -> String {
 }
 
 /// User-supplied remote endpoint settings (camelCase over the wire).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelConfig {
     /// Provider id from the preset registry, e.g. `openai`, `ollama`, `custom`.
@@ -365,6 +365,55 @@ async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, St
     Ok(resp)
 }
 
+/// Split a `data:image/png;base64,AAAA...` URL into `(media_type, base64_body)`.
+/// Returns `None` when the string is not a base64 data URL.
+fn split_data_url(data_url: &str) -> Option<(String, String)> {
+    if !data_url.starts_with("data:") {
+        return None;
+    }
+    let rest = &data_url["data:".len()..];
+    let (meta, body) = rest.split_once(',')?;
+    if !meta.contains(";base64") {
+        return None;
+    }
+    Some((
+        meta.split(';').next().unwrap_or("image/png").to_string(),
+        body.to_string(),
+    ))
+}
+
+/// Build the `content` field of the leading user message. With no images this is
+/// the plain prompt string (unchanged from today). With images it becomes an
+/// array of multimodal content blocks — OpenAI schema for
+/// [`GenerationStyle::ChatCompletions`], Anthropic schema otherwise.
+fn user_content_value(request: &InferenceRequest, anthropic: bool) -> Value {
+    let images = request.images.as_deref().unwrap_or_default();
+    if images.is_empty() {
+        return Value::String(request.prompt.clone());
+    }
+    let mut blocks: Vec<Value> = Vec::with_capacity(images.len() + 1);
+    if anthropic {
+        blocks.push(json!({ "type": "text", "text": request.prompt }));
+        for img in images {
+            if let Some((media, data)) = split_data_url(&img.data_url) {
+                blocks.push(json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media, "data": data }
+                }));
+            }
+        }
+    } else {
+        for img in images {
+            blocks.push(json!({
+                "type": "image_url",
+                "image_url": { "url": img.data_url }
+            }));
+        }
+        blocks.push(json!({ "type": "text", "text": request.prompt }));
+    }
+    Value::Array(blocks)
+}
+
 pub struct RemoteGenerator {
     client: Client,
     base_url: String,
@@ -484,9 +533,10 @@ impl RemoteGenerator {
         tx: &Sender<WorkerEvent>,
     ) -> Result<(String, RemoteUsage, String), String> {
         let url = format!("{}/chat/completions", self.base_url);
+        let user_content = user_content_value(request, false);
         let mut body = json!({
             "model": self.model,
-            "messages": [{ "role": "user", "content": request.prompt }],
+            "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature.unwrap_or(0.8),
@@ -593,11 +643,12 @@ impl RemoteGenerator {
         tx: &Sender<WorkerEvent>,
     ) -> Result<(String, RemoteUsage, String), String> {
         let url = format!("{}/messages", self.base_url);
+        let user_content = user_content_value(request, true);
         let mut body = json!({
             "model": self.model,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature.unwrap_or(0.8),
-            "messages": [{ "role": "user", "content": request.prompt }],
+            "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
         });
         let stop = request.stop_words.clone().unwrap_or_default();
@@ -907,7 +958,10 @@ impl ProviderConfig {
 /// A registry of known providers and a role → provider mapping.
 ///
 /// Default construction mirrors today's single-local + optional-remote setup so
-/// `main.rs` can adopt the registry incrementally without breaking.
+/// `main.rs` can adopt the registry incrementally without breaking. Cloning
+/// snapshots the current role map + provider table for hand-off to worker
+/// threads (runtime role routing).
+#[derive(Clone)]
 pub struct ProviderRegistry {
     providers: Vec<ProviderConfig>,
     role_map: HashMap<ProviderRole, String>,
@@ -1002,6 +1056,23 @@ impl ProviderRegistry {
         }
         self.providers.first()
     }
+
+    /// Find a non-Local provider whose `model`, `id` or `name` matches `needle`
+    /// (case-insensitive). This is what lets a subagent `modelOverride` route
+    /// to a distinct remote generator at runtime; unknown or local names return
+    /// `None` so the caller falls back to the pooled local worker.
+    pub fn find_best_remote_provider(&self, needle: &str) -> Option<&ProviderConfig> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        self.providers.iter().find(|p| {
+            p.kind != ProviderKind::Local
+                && (p.model.to_lowercase() == needle
+                    || p.id.to_lowercase() == needle
+                    || p.name.to_lowercase() == needle)
+        })
+    }
 }
 
 impl Default for ProviderRegistry {
@@ -1095,6 +1166,38 @@ mod registry_tests {
     }
 
     #[test]
+    #[test]
+    fn find_best_remote_provider_matches_model_id_or_name_case_insensitive() {
+        let mut reg = ProviderRegistry::new();
+        reg.add_provider(ProviderConfig::local("qwen-0.5b"));
+        let remote = ProviderConfig::remote(
+            ProviderKind::OpenRouter,
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            "sk-or-xxx",
+            "anthropic/claude-sonnet",
+        );
+        let id = remote.id.clone();
+        reg.add_provider(remote);
+
+        // Match by model name (any case).
+        let by_model = reg.find_best_remote_provider("Anthropic/Claude-Sonnet");
+        assert!(by_model.is_some());
+        assert_eq!(by_model.unwrap().kind, ProviderKind::OpenRouter);
+        // Match by provider id.
+        let by_id = reg.find_best_remote_provider(&id);
+        assert!(by_id.is_some());
+        // Match by display name.
+        let by_name = reg.find_best_remote_provider("openrouter");
+        assert!(by_name.is_some());
+        // Unknown override -> None (caller falls back to the local pool).
+        assert!(reg.find_best_remote_provider("llama4:70b").is_none());
+        // Local model name is never treated as a remote match.
+        assert!(reg.find_best_remote_provider("qwen-0.5b").is_none());
+        // Empty/whitespace -> None.
+        assert!(reg.find_best_remote_provider("   ").is_none());
+    }
+
     fn to_remote_model_config_round_trips_correctly() {
         let cfg = ProviderConfig::remote(
             ProviderKind::OpenAI,

@@ -72,7 +72,7 @@ export default function ConsolePanel({ entries, visible, height, onClear }: Cons
 
   return (
     <div
-      className="flex shrink-0 flex-col border-t border-border bg-editor"
+      className="flex shrink-0 select-text flex-col border-t border-border bg-editor"
       style={height != null ? { height } : undefined}
     >
       <div className="flex items-center justify-between border-b border-border px-3 py-1">

@@ -7,6 +7,10 @@ interface MenuBarProps {
   onSelectModel: () => void;
   onConsole: () => void;
   consoleVisible: boolean;
+  onTerminal: () => void;
+  terminalVisible: boolean;
+  onGraph: () => void;
+  graphVisible: boolean;
 }
 
 interface MenuDef {
@@ -15,7 +19,7 @@ interface MenuDef {
 }
 
 export default function MenuBar(props: MenuBarProps) {
-  const { onOpenFolder, onOpenFile, onSettings, onSelectModel, onConsole, consoleVisible } = props;
+  const { onOpenFolder, onOpenFile, onSettings, onSelectModel, onConsole, consoleVisible, onTerminal, terminalVisible, onGraph, graphVisible } = props;
   const [open, setOpen] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -33,6 +37,8 @@ export default function MenuBar(props: MenuBarProps) {
         { label: "Settings", shortcut: "Ctrl+,", action: onSettings },
         { label: "Select Model…", shortcut: "Ctrl+Shift+L", action: onSelectModel },
         { label: "Console", shortcut: "Ctrl+`", action: onConsole, active: consoleVisible },
+        { label: "Terminal", shortcut: "Ctrl+Alt+T", action: onTerminal, active: terminalVisible },
+        { label: "Execution graph", shortcut: "Ctrl+Alt+G", action: onGraph, active: graphVisible },
       ],
     },
   ];

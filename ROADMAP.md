@@ -247,19 +247,19 @@ controls. Remaining P2: session management UI (list/fork/watch), modes
     orchestrator run_focused_steps → tools.rs match → agent:// events → React).
     Findings + prioritized TODO list in PROJECT_STATUS.md "Architecture & Design
     Gaps". Top items:
-    - **P0 registry**: replace the `tools.rs:193` giant match + separate
-      `core.rs:82` schema map with a single `ToolRegistry` (one source of truth
-      for dispatch + schema + permission class + subagent allow-lists).
-    - **P0 idempotent turns**: make session writes idempotent (client turn UUID
-      dedup in `ipc.ts:58-79`) and reconcile the frontend messages state against
-      an authoritative per-turn id — "Messages = State".
-    - **P0 runtime model hand-off**: consult `ProviderRegistry::route(role)` at
-      orchestrator step time (fast model for planning/compaction, flagship for
-      edits) instead of load-time only (`main.rs:484-513`).
+    - **P0 registry**: ✓ done this session — see PROJECT_STATUS P0.
+    - **P0 idempotent turns**: ✓ done this session — client `turnId` + backend dedup (`log_has_turn_id`); transcript moved to `chatReducer`.
+    - **P0 runtime model hand-off**: ✓ done this session — `RuntimeRouter` routes Plan/plan_subtasks/extract_memory via `ProviderRegistry::route(role)`.
     - **P1 tokenization**: use the real tokenizer (already in `ContextManager`)
       in the orchestrator budget and add optional stage-3 LLM summarization.
-    - **P1 state split**: shrink the 1809-line `App.tsx` monolith via a reducer /
-      store; type the model-boundary (`Value`→structs, string→literal unions).
+    - **P1 state split**: ✓ started this session — chat transcript in a pure
+      `chatReducer` store (14 tests); **Zustand stores shipped 2026-09-02:
+      `customModes.ts`, `modelStore.ts`, `policyStore.ts`, `filesStore.ts`
+      (editor tabs), `agentRunStore.ts`** for the custom-modes/model/policy/
+      editor-tab/agent-run domains — including replacing the `isStreamingRef`
+      stale-closure mirror with a getState-backed `runStreaming()` helper;
+      remaining: trailing inline JSX callback extraction + closing the
+      chatReducer↔agent-run coordination gap.
 
 _Design principle going forward (mirrors competitors): keep the **model boundary**
 (what the model sees: registry-driven tools, exact-token context) and the **UI

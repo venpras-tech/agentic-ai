@@ -175,15 +175,10 @@ impl KnowledgeState {
             let rel_path = rel.to_path_buf();
             push_rule(&rel_path, &body, &mut rules, &mut rules_sources);
         }
-        // Load auto-extracted memory as additive context for the model.
-        // Labeled distinctly so the model treats it as learned context rather
-        // than project conventions.
-        if let Some(mem) = read_memory(workspace) {
-            if !mem.trim().is_empty() {
-                rules_sources.push(".ai/memory.md".to_string());
-                rules.push_str(&format!("### Memory (auto-extracted)\n{}\n\n", mem.trim()));
-            }
-        }
+        // NOTE: auto-extracted memory is no longer folded into the rules buffer.
+        // It is surfaced to the context manager as its own pinned `"memory"`
+        // buffer so the token breakdown can show it as a distinct category.
+        // See `sync_knowledge` in main.rs.
 
         // Load persisted active flags from disk (survives restarts).
         let persisted_active = Self::load_active_state(workspace);
@@ -500,6 +495,11 @@ impl KnowledgeState {
             .unwrap_or_default()
     }
 
+    /// The first scanned workspace root (used for `.ai` file paths).
+    pub fn workspace(&self) -> PathBuf {
+        self.roots.lock().unwrap().first().cloned().unwrap_or_default()
+    }
+
     /// Render all *active* skills as one pinned "skill" buffer.
     ///
     /// Skills are auto-active on first discovery, so this includes every
@@ -723,15 +723,6 @@ fn timestamp_str() -> String {
         now.minute(),
         now.second()
     )
-}
-
-/// Read `.ai/memory.md` if present; returns `None` when missing/unreadable.
-fn read_memory(workspace: &Path) -> Option<String> {
-    let path = workspace.join(".ai").join("memory.md");
-    if !path.is_file() {
-        return None;
-    }
-    std::fs::read_to_string(&path).ok()
 }
 
 #[cfg(test)]
@@ -1140,15 +1131,14 @@ mod tests {
         ks.append_memory(&ws, "api uses rust conv").unwrap();
 
         let report = ks.scan(&ws, &dir.join("cfg")).unwrap();
-        // Memory is loaded into the pinned rules/context buffer.
-        let memory_header = report
-            .rules
-            .find("### Memory (auto-extracted)")
-            .expect("memory must be labeled in the rules buffer");
-        assert!(report.rules.contains("api uses rust conv"));
-        // Root rules come before memory.
-        assert!(report.rules.find("ROOT RULES").unwrap() < memory_header);
-        assert!(report.rules_sources.contains(&".ai/memory.md".to_string()));
+        // Memory is no longer folded into the rules buffer — it now lives in a
+        // dedicated pinned `"memory"` buffer (see `sync_knowledge` in main.rs)
+        // so the token breakdown can show it as a distinct category.
+        assert!(!report.rules.contains("### Memory (auto-extracted)"));
+        assert!(!report.rules.contains("api uses rust conv"));
+        assert!(!report.rules_sources.contains(&".ai/memory.md".to_string()));
+        // The memory text is still reachable via `memory_content` / `workspace`.
+        assert!(ks.memory_content(&ks.workspace()).contains("api uses rust conv"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -47,7 +47,7 @@ export interface PlanStepHandlerEvent extends PlanStepEvent {}
 export interface TodoUpdateHandlerEvent extends TodoUpdateEvent {}
 export interface BgTaskHandlerEvent extends BackgroundTaskEvent {}
 export interface WorkspaceChangedEvent {
-  kind: string;
+  kind: "create" | "modify" | "remove" | "any";
   paths: string[];
 }
 

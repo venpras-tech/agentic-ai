@@ -197,6 +197,7 @@ export default function FileExplorer(props: FileExplorerProps) {
             <button
               onClick={onRefresh}
               title="Refresh explorer"
+              aria-label="Refresh explorer"
               className={`rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800 ${refreshing ? "animate-spin" : ""}`}
             >
               ↻
@@ -205,6 +206,7 @@ export default function FileExplorer(props: FileExplorerProps) {
           <button
             onClick={onNewFile}
             title="New file"
+            aria-label="New file"
             className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             +
@@ -212,6 +214,7 @@ export default function FileExplorer(props: FileExplorerProps) {
           <button
             onClick={onOpenSkills}
             title="Skills & rules"
+            aria-label="Skills and rules"
             className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             ✦
@@ -219,6 +222,7 @@ export default function FileExplorer(props: FileExplorerProps) {
           <button
             onClick={onSelectWorkspace}
             title="Open workspace"
+            aria-label="Open workspace"
             className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
           >
             📁

@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type {
   ApiServerStatus,
+  AgentMode,
+  AppSettingsRecord,
   AttachedFileInfo,
   AuditEntry,
   BackgroundTaskInfo,
@@ -12,9 +14,11 @@ import type {
   GenParams,
   FileNode,
   HfModel,
+  InferenceDone,
   KnowledgeReport,
   McpServerConfig,
   ModelInfo,
+  NamedCheckpoint,
   PolicySnapshot,
   ProviderConfig,
   ProviderRole,
@@ -22,8 +26,24 @@ import type {
   SessionProjectInfo,
   CheckpointInfo,
   ToolResultInfo,
+  Workflow,
+  ImageAttachment,
 } from "../types";
 import { parseEvent, EVT_CONTEXT_TRIMMED, type EngineHandlers } from "./events";
+import type { SessionRecord } from "./session";
+
+/**
+ * One typed JSONL record the frontend persists for a chat turn. `turnId` is
+ * the client-generated turn UUID that makes `sessionAppend` idempotent: the
+ * backend no-ops a replay of a turn it already recorded.
+ */
+export type SessionAppendRecord = {
+  role: "user" | "assistant" | "error";
+  content: string;
+  ts?: number;
+  done?: InferenceDone;
+  turnId?: string;
+};
 
 /**
  * True when running inside the Tauri desktop shell. The `@tauri-apps/api`
@@ -120,6 +140,17 @@ export interface StreamInferenceRequest {
   topP: number;
   repeatPenalty?: number;
   stopWords: string[];
+  /** Base64 image attachments for vision-capable remote providers. */
+  images?: ImageAttachment[];
+}
+
+export interface AutocompleteRequest {
+  /** Code before the cursor. */
+  prefix: string;
+  /** Code after the cursor (for fill-in-the-middle), if any. */
+  suffix?: string;
+  language?: string;
+  maxTokens?: number;
 }
 
 export interface AgentTaskRequest {
@@ -133,6 +164,10 @@ export interface AgentTaskRequest {
   planMode?: boolean;
   verify?: boolean;
   decompose?: boolean;
+  /** Active user-defined agent mode name (`.ai/modes/*.md`), if any. */
+  agentMode?: string;
+  /** Base64 image attachments for vision-capable remote providers. */
+  images?: ImageAttachment[];
 }
 
 const onTokenEvent = "inference-token";
@@ -155,6 +190,22 @@ const onPlanStepEvent = "agent://plan-step";
 const onTodoUpdateEvent = "agent://todo-update";
 const onBgTaskEvent = "agent://bg-task-event";
 const onWorkspaceChangedEvent = "workspace://file-changed";
+export const onTerminalOutputEvent = "agent://terminal-output";
+
+/** Event payload for streamed terminal output. */
+export interface TerminalOutputEvent {
+  id: string;
+  data: string;
+  stream: "stdout" | "stderr" | "exit";
+  exitCode?: number | null;
+}
+
+/** A live terminal session descriptor. */
+export interface TerminalInfo {
+  id: string;
+  cwd: string;
+}
+
 export const api = {
   // ---- window chrome ----
   minimize: () => getCurrentWindow().minimize(),
@@ -201,8 +252,22 @@ export const api = {
   streamInference: (request: StreamInferenceRequest) =>
     tauriInvoke<number>("stream_inference", { request }),
   cancelInference: () => tauriInvoke<void>("cancel_inference"),
+  // Monaco inline code completion (routes via the Autocomplete provider role,
+  // defaults to the local pool). Returns the continuation text.
+  autocomplete: (request: AutocompleteRequest) =>
+    tauriInvoke<string>("autocomplete_generate", { request }),
   agentRunTask: (request: AgentTaskRequest) =>
     tauriInvoke<number>("agent_run_task", { request }),
+
+  // ---- interactive terminal (persistent shell sessions) ----
+  terminalSpawn: (cwd?: string) =>
+    tauriInvoke<string>("terminal_spawn", { cwd }),
+  terminalWrite: (id: string, line: string) =>
+    tauriInvoke<void>("terminal_write", { id, line }),
+  terminalKill: (id: string) =>
+    tauriInvoke<void>("terminal_kill", { id }),
+  terminalList: () =>
+    tauriInvoke<TerminalInfo[]>("terminal_list"),
 
   // ---- background tasks (P2-12) ----
   agentRunBackground: (request: AgentTaskRequest) =>
@@ -271,12 +336,18 @@ export const api = {
     tauriInvoke<ToolResultInfo>("agent_git_checkpoint_cmd", { message }),
   gitCheckpoints: () =>
     tauriInvoke<CheckpointInfo[]>("agent_git_checkpoints_cmd"),
+  checkpointNames: () =>
+    tauriInvoke<NamedCheckpoint[]>("agent_checkpoint_names_cmd"),
   gitRevert: (commit?: string) =>
     tauriInvoke<ToolResultInfo>("agent_git_revert_cmd", { commit }),
 
   // ---- skills & rules ----
   knowledgeScan: () => tauriInvoke<KnowledgeReport>("knowledge_scan"),
   knowledgeReport: () => tauriInvoke<KnowledgeReport>("knowledge_report_cmd"),
+  modesLoad: () => tauriInvoke<AgentMode[]>("agent_modes"),
+  workflowsLoad: () => tauriInvoke<Workflow[]>("agent_workflows"),
+  workflowEnforceTools: (name: string, allowedTools: string[]) =>
+    tauriInvoke<void>("workflow_enforce_tools", { name, allowedTools }),
   skillSetActive: (name: string, active: boolean) =>
     tauriInvoke<KnowledgeReport>("skill_set_active", { name, active }),
   skillInstall: (source: string, global: boolean) =>
@@ -324,16 +395,16 @@ export const api = {
     tauriInvoke<string>("voice_transcribe_data", { data, ext }),
 
   // ---- settings / session persistence ----
-  settingsLoad: () => tauriInvoke<Record<string, unknown>>("settings_load"),
-  settingsSave: (settings: Record<string, unknown>) =>
+  settingsLoad: () => tauriInvoke<AppSettingsRecord>("settings_load"),
+  settingsSave: (settings: AppSettingsRecord) =>
     tauriInvoke<void>("settings_save", { settings }),
   sessionAppend: (
     project: string,
-    record: Record<string, unknown>,
+    record: SessionAppendRecord,
     chatId?: string | null,
   ) => tauriInvokeWrite<void>("session_append", { project, record, chatId }),
   sessionLoad: (project: string, chatId?: string | null) =>
-    tauriInvoke<Record<string, unknown>[]>("session_load", { project, chatId }),
+    tauriInvoke<SessionRecord[]>("session_load", { project, chatId }),
   sessionProjects: () =>
     tauriInvoke<SessionProjectInfo[]>("session_projects"),
   sessionDeleteChat: (project: string, chatId: string) =>
@@ -420,3 +491,12 @@ export const api = {
     };
   },
 };
+
+/** Subscribe to streamed terminal output. Returns an unsubscribe fn. */
+export function subscribeTerminalOutput(
+  handler: (e: TerminalOutputEvent) => void,
+): Promise<() => void> {
+  return listen(onTerminalOutputEvent, (e) =>
+    handler(e.payload as TerminalOutputEvent),
+  );
+}

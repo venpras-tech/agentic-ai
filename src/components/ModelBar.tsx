@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import { api } from "../lib/ipc";
 import type {
   DownloadedModel,
   GenParams,
+  HfModel,
+  HubDownloadProgress,
   ModelInfo,
   RemoteModelConfig,
   RemoteProviderPreset,
@@ -139,6 +142,44 @@ function formatBytes(n: number): string {
   return `${n} B`;
 }
 
+function ProgressBar({
+  p,
+  downloaded,
+  onSwitchModel,
+}: {
+  p: HubDownloadProgress;
+  downloaded: DownloadedModel[];
+  onSwitchModel: (path: string) => void;
+}) {
+  const done = p.done || p.cancelled || p.error != null;
+  const frac =
+    p.totalBytes && p.totalBytes > 0 ? (p.receivedBytes ?? 0) / p.totalBytes : null;
+  const local = downloaded.find(
+    (m) => m.repoId === p.repoId && m.fileName === p.file,
+  );
+  return (
+    <div className="mt-0.5 flex items-center gap-1.5">
+      <div className="h-1 flex-1 overflow-hidden rounded-full bg-panel-2">
+        <div
+          className="h-full rounded-full bg-accent transition-[width] duration-200"
+          style={{ width: `${Math.round((frac ?? 0) * 100)}%` }}
+        />
+      </div>
+      <span className="shrink-0 text-[9px] tabular-nums text-zinc-400">
+        {p.error ? "error" : p.cancelled ? "cancelled" : frac != null ? `${Math.round(frac * 100)}%` : "…"}
+      </span>
+      {done && !p.error && !p.cancelled && local && (
+        <button
+          onClick={() => onSwitchModel(local.path)}
+          className="shrink-0 rounded border border-accent/40 px-1.5 py-px text-[10px] text-accent hover:bg-accent/10"
+        >
+          Load
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function ModelBar(props: ModelBarProps) {
   const { model, path, lastPath, loading, progress, isStreaming, params, initialRemote, recentModels = [], onParamsChange, onLoad, onUnload, onSwitchModel, onCancel, onConnectRemote } = props;
 
@@ -158,6 +199,12 @@ export default function ModelBar(props: ModelBarProps) {
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [showModelSwitcher, setShowModelSwitcher] = useState(false);
   const [downloaded, setDownloaded] = useState<DownloadedModel[]>([]);
+  // Hub search + download surfaced in-bar (mirrors Settings → Models tab).
+  const [hubQuery, setHubQuery] = useState("");
+  const [hubResults, setHubResults] = useState<HfModel[] | null>(null);
+  const [hubBusy, setHubBusy] = useState(false);
+  const [hubError, setHubError] = useState<string | null>(null);
+  const [hubProgress, setHubProgress] = useState<Record<string, HubDownloadProgress>>({});
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const fetchSeqRef = useRef(0);
@@ -209,6 +256,55 @@ export default function ModelBar(props: ModelBarProps) {
     if (!showModelSwitcher) return;
     api.listDownloadedModels().then(setDownloaded).catch(() => setDownloaded([]));
   }, [showModelSwitcher]);
+
+  const refreshDownloaded = () => {
+    api.listDownloadedModels().then(setDownloaded).catch(() => setDownloaded([]));
+  };
+
+  // Live hub download progress while the switcher is open.
+  useEffect(() => {
+    if (!showModelSwitcher) return;
+    const unlisten = listen<HubDownloadProgress>(
+      "hf-download-progress",
+      (e) => {
+        const p = e.payload;
+        setHubProgress((prev) => ({ ...prev, [`${p.repoId}::${p.file}`]: p }));
+        if (p.done || p.cancelled || p.error) refreshDownloaded();
+      },
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [showModelSwitcher]);
+
+  const searchHub = useCallback(async (query: string) => {
+    if (!query.trim()) {
+      setHubResults(null);
+      return;
+    }
+    setHubBusy(true);
+    setHubError(null);
+    try {
+      setHubResults(await api.hfSearch(query.trim(), 12));
+    } catch (e) {
+      setHubError(String(e));
+      setHubResults(null);
+    } finally {
+      setHubBusy(false);
+    }
+  }, []);
+
+  // Debounced hub search as the user types in the in-bar search box.
+  useEffect(() => {
+    if (!showModelSwitcher) return;
+    const timer = setTimeout(() => void searchHub(hubQuery), 400);
+    return () => clearTimeout(timer);
+  }, [hubQuery, showModelSwitcher, searchHub]);
+
+  const startHubDownload = (repoId: string, file: string) => {
+    setHubError(null);
+    api.hfDownloadModel(repoId, file).catch((e) => setHubError(String(e)));
+  };
   const preset =
     PROVIDERS.find((p) => p.id === providerId) ?? PROVIDERS[PROVIDERS.length - 1];
 
@@ -308,6 +404,7 @@ export default function ModelBar(props: ModelBarProps) {
           <div className="relative">
             <button
               onClick={() => setShowModelSwitcher(!showModelSwitcher)}
+              aria-label="Switch model"
               className="rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
             >
               Switch ▾
@@ -371,6 +468,59 @@ export default function ModelBar(props: ModelBarProps) {
                 >
                   + Load from file…
                 </button>
+                <div className="my-2 border-t border-border" />
+                <div className="mb-1 text-[9px] text-zinc-400">Model Hub (HuggingFace)</div>
+                <input
+                  value={hubQuery}
+                  onChange={(e) => setHubQuery(e.target.value)}
+                  placeholder="Search GGUF models…"
+                  spellCheck={false}
+                  className="w-full rounded border border-border bg-panel px-2 py-1 text-[11px] text-ink outline-none focus:border-accent/60"
+                />
+                {hubBusy && (
+                  <p className="mt-1 px-0.5 text-[10px] text-zinc-400">Searching hub…</p>
+                )}
+                {hubError && (
+                  <p className="mt-1 px-0.5 text-[10px] text-red-500">{hubError}</p>
+                )}
+                {hubResults && hubResults.length > 0 && (
+                  <div className="mt-1 max-h-44 overflow-auto">
+                    {hubResults.map((m) => {
+                      const gguf = m.files.find((f) => f.name.endsWith(".gguf") && !f.name.includes(".json"));
+                      if (!gguf) return null;
+                      return (
+                        <div key={m.repoId} className="flex flex-col gap-0.5 rounded px-1 py-1 hover:bg-zinc-100">
+                          <div className="flex items-center gap-1.5">
+                            <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-700" title={m.repoId}>
+                              {m.repoId}
+                            </span>
+                            <span className="shrink-0 text-[9px] text-zinc-400">
+                              {m.downloads.toLocaleString()} dl
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="min-w-0 flex-1 truncate text-[10px] text-zinc-400">
+                              {gguf.name} · {gguf.size != null ? formatBytes(gguf.size) : "?"}
+                            </span>
+                            <button
+                              disabled={isStreaming}
+                              onClick={() => startHubDownload(m.repoId, gguf.name)}
+                              className="shrink-0 rounded border border-border px-1.5 py-px text-[10px] text-zinc-600 hover:border-accent/50 hover:text-accent disabled:opacity-40"
+                            >
+                              Download
+                            </button>
+                          </div>
+                          {hubProgress[`${m.repoId}::${gguf.name}`] && (
+                            <ProgressBar p={hubProgress[`${m.repoId}::${gguf.name}`]} downloaded={downloaded} onSwitchModel={onSwitchModel} />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {hubResults && hubResults.length === 0 && !hubBusy && hubQuery.trim() !== "" && (
+                  <p className="mt-1 px-0.5 text-[10px] text-zinc-400">No matching GGUF models.</p>
+                )}
               </div>
             )}
           </div>
@@ -401,8 +551,100 @@ export default function ModelBar(props: ModelBarProps) {
               last: {fileName(lastPath)}
             </span>
           )}
+          <div className="relative">
+            <button
+              onClick={() => setShowModelSwitcher((v) => !v)}
+              aria-label="Browse and download models from the HuggingFace hub"
+              className="rounded border border-border px-3 py-1.5 text-[12px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+            >
+              Browse Models…
+            </button>
+            {!loading && showModelSwitcher && (
+              <div className="absolute left-0 top-full z-30 mt-1 w-80 max-h-72 overflow-auto rounded-md border border-border bg-panel-2 p-2 shadow-xl">
+                <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                  Browse models
+                </div>
+                {downloaded.length > 0 && (
+                  <>
+                    <div className="mb-1 text-[9px] text-zinc-400">Downloaded</div>
+                    {downloaded.map((m) => {
+                      const isCurrent = path === m.path;
+                      return (
+                        <button
+                          key={m.path}
+                          disabled={isCurrent || isStreaming}
+                          onClick={() => { setShowModelSwitcher(false); onSwitchModel(m.path); }}
+                          className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[11px] hover:bg-zinc-100 ${isCurrent ? "font-semibold text-accent" : "text-zinc-700"} disabled:opacity-40`}
+                          title={m.path}
+                        >
+                          <span className="truncate flex-1">{m.fileName}</span>
+                          <span className="shrink-0 text-[9px] text-zinc-400">{formatBytes(m.sizeBytes)}</span>
+                          {isCurrent && <span className="text-[9px] text-accent">active</span>}
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+                {downloaded.length === 0 && (
+                  <p className="px-2 py-2 text-[11px] text-zinc-400">
+                    No downloaded models yet — search HuggingFace below.
+                  </p>
+                )}
+                <button
+                  onClick={() => { setShowModelSwitcher(false); onLoad(); }}
+                  className="mt-2 flex w-full items-center justify-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+                >
+                  + Load from file…
+                </button>
+                <div className="my-2 border-t border-border" />
+                <div className="mb-1 text-[9px] text-zinc-400">Model Hub (HuggingFace)</div>
+                <input
+                  value={hubQuery}
+                  onChange={(e) => setHubQuery(e.target.value)}
+                  placeholder="Search GGUF models…"
+                  spellCheck={false}
+                  className="w-full rounded border border-border bg-panel px-2 py-1 text-[11px] text-ink outline-none focus:border-accent/60"
+                />
+                {hubBusy && <p className="mt-1 px-0.5 text-[10px] text-zinc-400">Searching hub…</p>}
+                {hubError && <p className="mt-1 px-0.5 text-[10px] text-red-500">{hubError}</p>}
+                {hubResults && hubResults.length > 0 && (
+                  <div className="mt-1 max-h-44 overflow-auto">
+                    {hubResults.map((m) => {
+                      const gguf = m.files.find((f) => f.name.endsWith(".gguf") && !f.name.includes(".json"));
+                      if (!gguf) return null;
+                      return (
+                        <div key={m.repoId} className="flex flex-col gap-0.5 rounded px-1 py-1 hover:bg-zinc-100">
+                          <div className="flex items-center gap-1.5">
+                            <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-700" title={m.repoId}>{m.repoId}</span>
+                            <span className="shrink-0 text-[9px] text-zinc-400">{m.downloads.toLocaleString()} dl</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="min-w-0 flex-1 truncate text-[10px] text-zinc-400">{gguf.name} · {gguf.size != null ? formatBytes(gguf.size) : "?"}</span>
+                            <button
+                              disabled={isStreaming}
+                              onClick={() => startHubDownload(m.repoId, gguf.name)}
+                              className="shrink-0 rounded border border-border px-1.5 py-px text-[10px] text-zinc-600 hover:border-accent/50 hover:text-accent disabled:opacity-40"
+                            >
+                              Download
+                            </button>
+                          </div>
+                          {hubProgress[`${m.repoId}::${gguf.name}`] && (
+                            <ProgressBar p={hubProgress[`${m.repoId}::${gguf.name}`]} downloaded={downloaded} onSwitchModel={onSwitchModel} />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {hubResults && hubResults.length === 0 && !hubBusy && (
+                  <p className="mt-1 px-0.5 text-[10px] text-zinc-400">No models found.</p>
+                )}
+              </div>
+            )}
+          </div>
           <button
             onClick={() => setShowRemote((v) => !v)}
+            aria-label="Connect a remote model provider"
             className="rounded border border-border px-3 py-1.5 text-[12px] text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
           >
             Remote…

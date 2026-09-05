@@ -31,6 +31,12 @@ pub enum Verdict {
     Allow,
     Deny(String),
     Ask { request_id: String },
+    /// A recursive **folder** delete (vs a single file). Never auto-approved,
+    /// never session-remembered — the user must confirm every one, even when
+    /// the tool is configured `allow` or was granted earlier in the session.
+    /// `detail` carries the resolved target and entry count for a stronger
+    /// warning.
+    AskFolderDelete { request_id: String, detail: String },
 }
 
 /// Configured policy for one tool.
@@ -179,6 +185,39 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
     //     leak across the subagent boundary.
     if let Some(reason) = super::subagent::child_verdict(tool) {
         return Verdict::Deny(reason);
+    }
+
+    // 3b. Custom-mode `allowedGlobs` (`.ai/modes/*.md` `globs:`): inside a
+    //     custom mode child, deny file-mutating calls targeting a file outside
+    //     the mode's declared globs. Runs after `child_verdict` so tool-level
+    //     allow-lists are checked first; globs are an additional file-scope gate.
+    if let Some(reason) = super::subagent::child_glob_verdict(workspaces, call) {
+        return Verdict::Deny(reason);
+    }
+
+    // 2b. Recursive folder deletion is high-risk: it destroys a whole tree in
+    //     one step. Force a dedicated, stronger approval on EVERY call — even
+    //     if the tool is configured `allow` in policy.json or was granted
+    //     earlier in the session — so a single errant delete can never pass
+    //     silently (see the user-reported `delete_file_or_folder` hallucination
+    //     during a read-only "list files" request).
+    if let ToolCall::DeleteFileOrFolder { path } = call {
+        if let Some(abs) = resolve_abs(workspaces, path) {
+            if abs.is_dir() {
+                let n = std::fs::read_dir(&abs)
+                    .map(|rd| rd.count())
+                    .unwrap_or(0);
+                return Verdict::AskFolderDelete {
+                    request_id: state.next_request_id(),
+                    detail: format!(
+                        "Recursively deleting folder `{}` with {n} contained item(s). \
+                         This removes the whole tree and is not covered by any earlier approval — \
+                         you must confirm each folder deletion explicitly.",
+                        abs.display()
+                    ),
+                };
+            }
+        }
     }
 
     // 4. YOLO sub-mode (Bionic §3.3): ROUTINE shell commands skip the
@@ -349,6 +388,10 @@ pub fn default_allow(tool: &str) -> bool {
             | "task"
             // Tree-sitter query is read-only structural search.
             | "tree_sitter_query"
+            // browse_web is a guarded read-only HTTP fetch (SSRF-blocked); the
+            // returned content is surfaced to the user in the transcript, and
+            // any follow-up download still hits `download_file` (always_ask).
+            | "browse_web"
     )
 }
 
@@ -436,12 +479,19 @@ fn call_target_paths(call: &ToolCall) -> Vec<String> {
     }
 }
 
+/// Resolve a tool target path to an absolute [`PathBuf`] using the primary
+/// workspace root for relative paths. Returns `None` when no workspace is open
+/// (nothing to anchor a relative path against).
+fn resolve_abs(workspaces: &[PathBuf], path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        workspaces.first().map(|ws| ws.join(p))
+    }
+}
+
 /// Canonicalized prefix check: is `path` inside `root`?
-///
-/// Both sides are normalized the same way; on Windows `canonicalize` returns
-/// extended-length (`\\?\C:\…`) paths for existing entries only, so the prefix
-/// is stripped to keep existing/new-path comparisons consistent (a brand-new
-/// file must not look "outside" the workspace).
 fn is_within(path: &Path, root: &Path) -> bool {
     fn norm(p: &Path) -> PathBuf {
         let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
@@ -639,6 +689,16 @@ mod tests {
     }
 
     #[test]
+    fn browse_web_is_default_allowed_and_never_always_ask() {
+        // browse_web is a guarded read-only fetch — default-allow, and it must
+        // never be in the always-ask set either.
+        assert!(default_allow("browse_web"));
+        assert!(!always_ask("browse_web"));
+        assert!(default_allow("view_repo_map"));
+        assert!(!default_allow("execute_terminal_command"));
+    }
+
+    #[test]
     fn task_delegation_is_default_allowed() {
         let state = super::super::ToolState::default();
         let call = ToolCall::Task {
@@ -697,6 +757,54 @@ mod tests {
             end_line: 2,
         };
         assert!(matches!(check(&state, &other, w(&ws)), Verdict::Deny(_)));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn recursive_folder_delete_always_requires_strong_approval_even_when_allowed() {
+        let state = super::super::ToolState::default();
+        let ws = std::env::temp_dir().join(format!("ai-editor-ws6-{}", std::process::id()));
+        let removed_dir = ws.join("test");
+        std::fs::create_dir_all(&removed_dir).unwrap();
+        std::fs::write(removed_dir.join("a.txt"), "a").unwrap();
+        std::fs::write(removed_dir.join("b.txt"), "b").unwrap();
+
+        // A directory target -> the dedicated high-risk verdict, with the
+        // entry count surfaced for the stronger warning.
+        let dir = ToolCall::DeleteFileOrFolder {
+            path: "test".into(),
+        };
+        match check(&state, &dir, w(&ws)) {
+            Verdict::AskFolderDelete { detail, .. } => {
+                assert!(detail.contains("test"), "detail should name the target: {detail}");
+                assert!(detail.contains("2"), "detail should count entries: {detail}");
+            }
+            other => panic!("expected AskFolderDelete, got {other:?}"),
+        }
+
+        // Even if policy.json marks delete_file_or_folder "allow", a folder
+        // delete must STILL require per-call approval.
+        let cfg_path = ws.join(".ai");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        std::fs::write(
+            cfg_path.join("policy.json"),
+            r#"{"default":"ask","rules":[{"tool":"delete_file_or_folder","policy":"allow"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(check(&state, &dir, w(&ws)), Verdict::AskFolderDelete { .. }),
+            "explicit `allow` must not unlock a recursive folder delete"
+        );
+
+        // A single-file delete, by contrast, honors the explicit `allow` rule
+        // (it is recoverable via the OS Trash and is not a whole-tree wipe) —
+        // not the dedicated folder verdict. This contrast proves the guard is
+        // specifically about recursive folder deletion.
+        let file = ToolCall::DeleteFileOrFolder {
+            path: "test/a.txt".into(),
+        };
+        assert_eq!(check(&state, &file, w(&ws)), Verdict::Allow);
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -28,9 +28,11 @@ pub mod policy;
 pub mod rag;
 pub mod registry;
 pub mod skills;
+pub mod smalltalk;
 pub mod subagent;
 pub mod todo;
 pub mod tools;
+pub mod workflows;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -455,9 +457,82 @@ impl ToolCall {
 ToolCall::TreeSitterQuery { .. } => "tree_sitter_query",
             ToolCall::AnalyzeBug { .. } => "analyze_bug",
             ToolCall::ReviewCode { .. } => "review_code",
-            ToolCall::ViewRepoMap { .. } => "view_repo_map",
+ToolCall::ViewRepoMap { .. } => "view_repo_map",
             ToolCall::BrowseWeb { .. } => "browse_web",
         }
+    }
+
+    /// Every snake_case tool name the dispatcher can execute.
+    ///
+    /// Mirrors the exhaustive arms of [`ToolCall::name`] as a plain list so the
+    /// canonical [`registry`](crate::agent::registry) can be drift-checked
+    /// against the dispatcher (`core::test_registry_matches_dispatcher`). Add a
+    /// name here whenever a new `ToolCall` variant ships.
+    pub fn all_tool_names() -> Vec<&'static str> {
+        vec![
+            "glob_search_codebase",
+            "search_file_contents",
+            "view_file_structure",
+            "read_file_range",
+            "apply_file_diff",
+            "execute_terminal_command",
+            "call_mcp_tool",
+            "git_status",
+            "git_diff",
+            "git_commit",
+            "git_checkpoint",
+            "git_revert",
+            "run_tests",
+            "write_file",
+            "create_skill",
+            "read_skill",
+            "suggest_skills",
+            "semantic_search_codebase",
+            "create_plan",
+            "read_plan",
+            "update_plan",
+            "execute_plan",
+            "list_dir",
+            "read_file_chars",
+            "create_folder",
+            "copy_file_or_folder",
+            "move_file_or_folder",
+            "delete_file_or_folder",
+            "get_scratchpad_folder",
+            "set_todo_list",
+            "get_todo_list",
+            "mark_todo_item_done",
+            "web_search",
+            "web_extract",
+            "download_file",
+            "run_python",
+            "run_javascript",
+            "calculate",
+            "task",
+            "git_blame",
+            "git_push",
+            "git_pull",
+            "git_create_branch",
+            "git_pr_status",
+            "git_ci_status",
+            "create_pr",
+            "summarize_changes",
+            "read_lints",
+            "ask_question",
+            "send_to_user",
+            "list_mcp_servers",
+            "add_mcp_server",
+            "remove_mcp_server",
+            "attach_file",
+            "search_attached_files",
+            "detach_file",
+            "transcribe_audio",
+            "tree_sitter_query",
+            "analyze_bug",
+            "review_code",
+            "view_repo_map",
+            "browse_web",
+        ]
     }
 
     /// A short human-readable description used in the UI timeline header.

@@ -6,6 +6,7 @@ export type SessionRecord = {
   content?: unknown;
   ts?: unknown;
   done?: unknown;
+  turnId?: unknown;
 };
 
 const VALID_ROLES = new Set(["user", "assistant", "error"]);
@@ -49,6 +50,7 @@ export function recordsToMessages(records: SessionRecord[]): ChatMessage[] {
       role: role as ChatMessage["role"],
       // Legacy records may hold an empty assistant body — keep it visible.
       content: role === "assistant" && !content.trim() ? "…" : content,
+      ...(typeof r.turnId === "string" && r.turnId ? { turnId: r.turnId } : {}),
       ...(typeof r.ts === "number" && Number.isFinite(r.ts) ? { ts: r.ts } : {}),
       ...(role !== "user" ? { done: parseDone(r.done) } : {}),
     });

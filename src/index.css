@@ -69,3 +69,19 @@ input[type="range"] {
   -moz-appearance: textfield;
   appearance: textfield;
 }
+
+/* Per-hunk authored-change decorations (see HunkDecorations.tsx) */
+.monaco-editor .hunk-glyph {
+  width: 0 !important;
+  border-left: 5px solid #0891b2;
+  margin-left: 3px;
+}
+.monaco-editor .hunk-glyph.hunk-glyph-reverted {
+  border-left-color: #adb5bd;
+}
+.monaco-editor .hunk-added-line {
+  background: rgba(8, 145, 178, 0.08);
+}
+.monaco-editor .hunk-reverted-line {
+  background: rgba(134, 142, 150, 0.1);
+}

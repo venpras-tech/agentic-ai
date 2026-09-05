@@ -123,38 +123,22 @@ pub async fn dispatch(
             );
             return Ok(result);
         }
+        // Ask + high-risk AskFolderDelete share one approval flow; the
+        // folder-delete flavour passes a stronger summary and never persists a
+        // grant (remember=false), so every recursive folder delete asks again.
         policy::Verdict::Ask { request_id } => {
-            match ask_approval(app, state, request_id, tool, call.summary(), &interrupt).await {
-                AskOutcome::GrantedOnce => {
-                    decision = "granted".to_string();
-                    true
-                }
-                AskOutcome::GrantedSession => {
-                    decision = "granted-session".to_string();
-                    policy::remember_session(state, call);
-                    // policy.rs inserts directly into `session_allow`; persist
-                    // the resulting set so grants survive app restarts.
-                    state.save_session_allow();
-                    true
-                }
-                AskOutcome::GrantedAlways => {
-                    decision = "granted-always".to_string();
-                    let _ = policy::remember_always(workspace.as_deref(), call);
-                    true
-                }
-                AskOutcome::Declined => {
-                    decision = "declined".to_string();
-                    false
-                }
-                AskOutcome::TimedOut => {
-                    decision = "timed-out".to_string();
-                    false
-                }
-                AskOutcome::Aborted => {
-                    decision = "aborted".to_string();
-                    false
-                }
-            }
+            match_ask_verdict(
+                app, state, &request_id, tool, call.summary(), true, workspace.as_deref(),
+                call, &mut decision, &interrupt,
+            )
+            .await
+        }
+        policy::Verdict::AskFolderDelete { request_id, detail } => {
+            match_ask_verdict(
+                app, state, &request_id, tool, detail.clone(), false, workspace.as_deref(),
+                call, &mut decision, &interrupt,
+            )
+            .await
         }
     };
     if !allowed {
@@ -568,6 +552,59 @@ pub(crate) fn audit(
     }
 }
 
+/// Resolve a policy-`Ask` verdict into a bool (allowed?) by prompting the user
+/// and applying decision memory. When `remember` is true, a session/always
+/// grant is persisted (skipping later prompts); the high-risk folder-delete
+/// path passes `false` so it is never auto-unlocked.
+async fn match_ask_verdict(
+    app: &AppHandle,
+    state: &ToolState,
+    request_id: &str,
+    tool: &str,
+    summary: String,
+    remember: bool,
+    workspace: Option<&Path>,
+    call: &ToolCall,
+    decision: &mut String,
+    interrupt: &CancellationToken,
+) -> bool {
+    match ask_approval(app, state, request_id, tool, summary, interrupt).await {
+        AskOutcome::GrantedOnce => {
+            *decision = "granted".to_string();
+            true
+        }
+        AskOutcome::GrantedSession => {
+            *decision = "granted-session".to_string();
+            if remember {
+                policy::remember_session(state, call);
+                // policy.rs inserts directly into `session_allow`; persist the
+                // resulting set so grants survive app restarts.
+                state.save_session_allow();
+            }
+            true
+        }
+        AskOutcome::GrantedAlways => {
+            *decision = "granted-always".to_string();
+            if remember {
+                let _ = policy::remember_always(workspace, call);
+            }
+            true
+        }
+        AskOutcome::Declined => {
+            *decision = "declined".to_string();
+            false
+        }
+        AskOutcome::TimedOut => {
+            *decision = "timed-out".to_string();
+            false
+        }
+        AskOutcome::Aborted => {
+            *decision = "aborted".to_string();
+            false
+        }
+    }
+}
+
 /// Emit a `agent://permission-request` and wait for the user's decision.
 async fn ask_approval(
     app: &AppHandle,
@@ -766,6 +803,7 @@ Command: {command_summary}\n"
     let request = crate::engine::InferenceRequest {
         prompt,
         messages: None,
+        images: None,
         max_tokens: 48,
         temperature: Some(0.1),
         top_p: Some(0.9),
@@ -1203,6 +1241,8 @@ struct SemChunk {
     start_line: usize,
     /// TF vector of token → count within the window.
     tf: HashMap<String, usize>,
+    /// The raw window text (used by the post-cosine rerank pass).
+    text: String,
 }
 
 /// Cached TF-IDF index for semantic search. Invalidated when the workspace
@@ -1334,6 +1374,7 @@ async fn semantic_search_codebase(
                             path: rel.clone(),
                             start_line: start + 1,
                             tf,
+                            text: window,
                         });
                     }
                     if end == lines.len() {
@@ -1451,9 +1492,16 @@ async fn semantic_search_codebase(
     const SEM_MAX_RESULTS: usize = 25;
     const WINDOW_LINES: usize = 40;
     let total = scored.len();
-    let k = top_k.min(SEM_MAX_RESULTS).min(total);
+    // Refine the top cosine matches with the overlap reranker before slicing —
+    // this reorders near-ties by how many query terms the window actually
+    // contains, cutting TF-IDF false positives. (`None` = deterministic local
+    // rerank; a future LLM reranker can plug in via the hint param.)
+    let texts: Vec<String> = chunks_owned.iter().map(|c| c.text.clone()).collect();
+    let k_full = total.min(SEM_MAX_RESULTS);
+    let ranked = rerank_results(&query, scored.into_iter().take(k_full).collect(), &texts, None);
+    let k = top_k.min(SEM_MAX_RESULTS).min(ranked.len());
     let mut out = String::new();
-    for (rank, (score, ci)) in scored.iter().take(k).enumerate() {
+    for (rank, (score, ci)) in ranked.iter().take(k).enumerate() {
         let c = &chunks_owned[*ci];
         out.push_str(&format!(
             "{:>2}. {:.2}  {}:{}:{}\n",

@@ -33,9 +33,10 @@ use super::{
     ToolCall, ToolResult, ToolState,
 };
 use crate::engine::{
-    ChatTurn, EnginePool, InferenceDone, InferenceRequest, StepStat, SubtaskStat, TextGenerator,
-    WorkerEvent,
+    ChatTurn, EnginePool, GenerationOutcome, InferenceDone, InferenceRequest, ModelInfo,
+    PoolGenerator, ProviderRole, RuntimeRouter, StepStat, SubtaskStat, TextGenerator, WorkerEvent,
 };
+use crate::remote::{ProviderRegistry, RemoteGenerator};
 
 /// Default ceiling on tool-call feedback rounds per task.
 const DEFAULT_MAX_STEPS: usize = 6;
@@ -61,6 +62,14 @@ const MAX_TODO_NUDGES: usize = 2;
 const MAX_TOOL_USE_ENFORCEMENT: usize = 2;
 /// Short label cap for subagent group titles so the timeline stays readable.
 const SUBAGENT_TITLE_CHARS: usize = 48;
+/// How many times a single task may LLM-summarize its oldest working-history
+/// block (stage-3 compaction) instead of dropping it. Bounded because each
+/// pass costs a generation.
+const MAX_SUMMARIZATIONS: usize = 2;
+/// Max messages folded into one summary block.
+const SUMMARY_BLOCK_MAX_MSGS: usize = 6;
+/// Max chars of source text fed to the summarizer (protect the token budget).
+const SUMMARY_BLOCK_MAX_CHARS: usize = 12_000;
 
 /// Detect common model refusal patterns. Returns `true` when the response text
 /// contains a refusal even if tool calls are also present.
@@ -164,6 +173,17 @@ pub struct AgentTaskRequest {
     /// loop stops early once cumulative output tokens exceed this limit.
     #[serde(default)]
     pub token_budget: Option<u64>,
+    /// Active user-defined agent mode (`.ai/modes/*.md`) when the task was
+    /// started from a mode. Its `system_prompt` is already folded into the
+    /// frontend system prompt; here it gates which tools the parent loop may
+    /// call (a mode with no `allowedTools` is unrestricted).
+    #[serde(default)]
+    pub agent_mode: Option<String>,
+    /// Base64 image attachments (vision-capable remote providers). Carried so
+    /// the plain-stream path can inject multimodal blocks; the agent loop
+    /// surfaces them as a textual marker since the context stream is text-only.
+    #[serde(default)]
+    pub images: Option<Vec<crate::engine::ImageAttachment>>,
 }
 
 /// A single unit of work produced by the decomposition phase.
@@ -291,6 +311,13 @@ struct SubResult {
     chars: u64,
 }
 
+/// Whether an agent-mode run should short-circuit to a canned greeting reply
+/// instead of burning a model round-trip. Plan and decompose phases always run
+/// for real; only ordinary (flat) agent turns on trivial small talk qualify.
+fn should_shortcut_smalltalk(request: &AgentTaskRequest) -> bool {
+    !request.plan_mode && !request.decompose && super::smalltalk::is_smalltalk(&request.prompt)
+}
+
 /// Pool version of the agent loop: the caller holds an [`EnginePool`]
 /// (several worker threads, each owning its own generator) instead of one
 /// `&mut dyn TextGenerator`. Sequential phases use a handle to worker 0; a
@@ -308,6 +335,8 @@ pub fn run_agent_loop_pool(
     context_messages: &[ContextMessage],
     request: &AgentTaskRequest,
     context_budget: usize,
+    role_registry: Option<crate::remote::ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<AgentOutcome, String> {
     let max_steps = request
         .max_steps
@@ -315,6 +344,17 @@ pub fn run_agent_loop_pool(
         .clamp(1, ABSOLUTE_MAX_STEPS);
     let mut messages: Vec<ContextMessage> = context_messages.to_vec();
     let working_budget = (context_budget as f32 * super::context::EVICTION_THRESHOLD) as usize;
+
+    // Runtime role router (P0 architecture gap 3): lets plan phases run on a
+    // different (cheaper) provider while the pool's model does the editing.
+    // `None` when no provider registry is available (today's behaviour).
+    let mut router = role_registry
+        .clone()
+        .map(|reg| RuntimeRouter::new(pool, reg, tx.clone()));
+
+    // Reborrow the registry (if any) so scoped child threads can capture a
+    // Copy reference instead of moving the owned registry.
+    let role_registry = role_registry.as_ref();
 
     // One current-thread runtime for the sequential phases (tool dispatch).
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -339,6 +379,53 @@ pub fn run_agent_loop_pool(
 
     let started = Instant::now();
 
+    // Greeting short-circuit: skip the model/tool round-trip for trivial small
+    // talk in agent mode, answering with a canned reply (mirrors the plain-chat
+    // path in `stream_inference`). Planner/decompose modes always run for real.
+    if should_shortcut_smalltalk(request) {
+        let reply = super::smalltalk::reply_for(&request.prompt);
+        let _ = tx.send(WorkerEvent::Token {
+            session_id,
+            delta: reply.clone(),
+        });
+        let _ = tx.send(WorkerEvent::Done {
+            session_id,
+            done: InferenceDone {
+                total_tokens: 0,
+                generated_chars: reply.chars().count() as u64,
+                tokens_per_sec: 0.0,
+                elapsed_ms: 0,
+                stop_reason: "completed".to_string(),
+                outcome: "completed".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            },
+        });
+        crate::logging::info(
+            Some(session_id),
+            "llm.smalltalk",
+            "agent-mode greeting short-circuited; no model round-trip",
+        );
+        return Ok(AgentOutcome {
+            done: InferenceDone {
+                total_tokens: 0,
+                generated_chars: reply.chars().count() as u64,
+                tokens_per_sec: 0.0,
+                elapsed_ms: 0,
+                stop_reason: "completed".to_string(),
+                outcome: "completed".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            },
+        });
+    }
+
     let mut total_tokens = 0u64;
     let mut input_tokens = 0u64;
     let mut cache_read_tokens = 0u64;
@@ -353,8 +440,16 @@ pub fn run_agent_loop_pool(
              tools and do NOT modify any files — the plan will be reviewed and \
              approved before execution."
             .to_string();
+        let mut routed = router
+            .as_mut()
+            .map(|r| r.resolve(ProviderRole::Planner))
+            .transpose()?;
+        let plan_gen: &mut dyn TextGenerator = match &mut routed {
+            Some(g) => g,
+            None => &mut primary,
+        };
         let outcome = run_focused_steps(
-            &mut primary,
+            plan_gen,
             tool_state,
             app,
             interrupt,
@@ -369,6 +464,9 @@ pub fn run_agent_loop_pool(
             "Plan",
             Some(pool),
             false,
+            role_registry,
+            tokenizer.clone(),
+            None,
         )?;
         total_tokens += outcome.total_tokens;
         input_tokens += outcome.input_tokens;
@@ -396,8 +494,16 @@ pub fn run_agent_loop_pool(
     // ---- Sub-task decomposition. Parallel when there are spare workers;
     // otherwise sequential (identical semantics to the single-gen loop).
     if request.decompose {
+        let mut routed = router
+            .as_mut()
+            .map(|r| r.resolve(ProviderRole::Planner))
+            .transpose()?;
+        let plan_gen: &mut dyn TextGenerator = match &mut routed {
+            Some(g) => g,
+            None => &mut primary,
+        };
         if let Some(subtasks) = plan_subtasks(
-            &mut primary,
+            plan_gen,
             app,
             interrupt,
             tx,
@@ -405,6 +511,7 @@ pub fn run_agent_loop_pool(
             &mut messages,
             request,
             working_budget,
+            tokenizer.clone(),
         )? {
             if !subtasks.is_empty() {
                 let workers = pool.len();
@@ -413,14 +520,17 @@ pub fn run_agent_loop_pool(
                 if parallel {
                     let results = std::thread::scope(|s| -> Result<Vec<SubResult>, String> {
                         let messages_ref: &Vec<ContextMessage> = &messages;
+                        let pool_model = pool.info().name;
                         let mut handles = Vec::with_capacity(subtasks.len());
                         for (i, sub) in subtasks.iter().enumerate() {
                             let mut gen = pool.handle(i);
+                            let pool_model = pool_model.clone();
                             let group =
                                 format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title);
                             let instruction = sub.instruction.clone();
                             let title = sub.title.clone();
                             let total = subtasks.len();
+                            let tok_for_thread = tokenizer.clone();
                             handles.push(s.spawn(move || -> Result<SubResult, String> {
                                 let sub_rt = tokio::runtime::Builder::new_current_thread()
                                     .enable_all()
@@ -433,9 +543,13 @@ pub fn run_agent_loop_pool(
                                         total,
                                         title: title.clone(),
                                         status: "running".into(),
+                                        model: Some(pool_model.clone()),
+                                        elapsed_ms: 0,
+                                        tool: None,
                                     },
                                 });
                                 let mut sub_messages = messages_ref.to_vec();
+                                let sub_started = Instant::now();
                                 let r = run_focused_steps(
                                     &mut gen,
                                     tool_state,
@@ -452,6 +566,9 @@ pub fn run_agent_loop_pool(
                                     &group,
                                     None,
                                     false,
+                                    role_registry,
+                                    tok_for_thread.clone(),
+                                    None,
                                 );
                                 let (success, out, inp, cache_r, cache_w, reas, chars) = match r {
                                     Ok(o) if o.reason != "stuck" => (
@@ -482,6 +599,9 @@ pub fn run_agent_loop_pool(
                                         total,
                                         title,
                                         status: status.into(),
+                                        model: Some(pool_model.clone()),
+                                        elapsed_ms: sub_started.elapsed().as_millis() as u64,
+                                        tool: None,
                                     },
                                 });
                                 Ok(SubResult {
@@ -536,6 +656,7 @@ pub fn run_agent_loop_pool(
                         &mut messages,
                         request,
                         working_budget,
+                        tokenizer.clone(),
                     )?;
                     total_tokens += summary.total_tokens;
                     input_tokens += summary.input_tokens;
@@ -562,7 +683,9 @@ pub fn run_agent_loop_pool(
 
                 // Sequential fallback (single worker or single subtask).
                 let mut failed = 0usize;
+                let pool_model = pool.info().name;
                 for (i, sub) in subtasks.iter().enumerate() {
+                    let sub_started = Instant::now();
                     let _ = tx.send(WorkerEvent::Subtask {
                         session_id,
                         subtask: SubtaskStat {
@@ -570,6 +693,9 @@ pub fn run_agent_loop_pool(
                             total: subtasks.len(),
                             title: sub.title.clone(),
                             status: "running".into(),
+                            model: Some(pool_model.clone()),
+                            elapsed_ms: 0,
+                            tool: None,
                         },
                     });
                     match run_focused_steps(
@@ -588,6 +714,9 @@ pub fn run_agent_loop_pool(
                         &format!("Subtask {}/{} · {}", i + 1, subtasks.len(), sub.title),
                         None,
                         false,
+                        role_registry,
+                        tokenizer.clone(),
+                        None,
                     ) {
                         Ok(outcome) => {
                             total_tokens += outcome.total_tokens;
@@ -606,6 +735,9 @@ pub fn run_agent_loop_pool(
                                     total: subtasks.len(),
                                     title: sub.title.clone(),
                                     status: "done".into(),
+                                    model: Some(pool_model.clone()),
+                                    elapsed_ms: sub_started.elapsed().as_millis() as u64,
+                                    tool: None,
                                 },
                             });
                         }
@@ -618,6 +750,9 @@ pub fn run_agent_loop_pool(
                                     total: subtasks.len(),
                                     title: sub.title.clone(),
                                     status: "failed".into(),
+                                    model: Some(pool_model.clone()),
+                                    elapsed_ms: sub_started.elapsed().as_millis() as u64,
+                                    tool: None,
                                 },
                             });
                             messages.push(ContextMessage {
@@ -641,6 +776,7 @@ pub fn run_agent_loop_pool(
                     &mut messages,
                     request,
                     working_budget,
+                    tokenizer.clone(),
                 )?;
                 total_tokens += summary.total_tokens;
                 input_tokens += summary.input_tokens;
@@ -669,8 +805,18 @@ pub fn run_agent_loop_pool(
     }
 
     // ---- Flat (default) mode: one continuous generate → act → feedback loop.
+    // Dual-model Architect: when an Editor-routed provider is configured, the
+    // edit loop runs on it (which may differ from the model that planned).
+    let mut editor_routed = router
+        .as_mut()
+        .map(|r| r.resolve(ProviderRole::Editor))
+        .transpose()?;
+    let exec_gen: &mut dyn TextGenerator = match &mut editor_routed {
+        Some(g) => g,
+        None => &mut primary,
+    };
     let outcome = run_focused_steps(
-        &mut primary,
+        exec_gen,
         tool_state,
         app,
         interrupt,
@@ -685,6 +831,9 @@ pub fn run_agent_loop_pool(
         "Execute",
         Some(pool),
         false,
+        role_registry,
+        tokenizer.clone(),
+        None,
     )?;
     total_tokens += outcome.total_tokens;
     input_tokens += outcome.input_tokens;
@@ -704,8 +853,16 @@ pub fn run_agent_loop_pool(
             "budget_exceeded".into(),
         );
     }
+    let mut routed = router
+        .as_mut()
+        .map(|r| r.resolve(ProviderRole::Planner))
+        .transpose()?;
+    let memory_gen: &mut dyn TextGenerator = match &mut routed {
+        Some(g) => g,
+        None => &mut primary,
+    };
     maybe_extract_memory(
-        &mut primary,
+        memory_gen,
         tool_state,
         interrupt,
         tx,
@@ -793,6 +950,9 @@ pub(crate) fn run_focused_steps(
     group: &str,
     spare: Option<&EnginePool>,
     is_child: bool,
+    role_registry: Option<&ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
+    mut subtask: Option<&mut SubtaskReporter>,
 ) -> Result<FocusOutcome, String> {
     let mut total_tokens = 0u64;
     let mut input_tokens = 0u64;
@@ -806,6 +966,7 @@ pub(crate) fn run_focused_steps(
     let mut todo_nudges = 0usize;
     let mut tool_use_enforcements = 0usize;
     let mut verify_passes = 0usize;
+    let mut summarize_count = 0usize;
     // Track previous prompt token count for KV-cache prefix reuse.
     let mut prev_prompt_tokens: Option<usize> = None;
 
@@ -838,7 +999,20 @@ pub(crate) fn run_focused_steps(
             });
         }
 
-        let dropped = trim_working_history(messages, working_budget);
+        // Stage-3 compaction: when we're already over budget, fold the oldest
+        // working-history block into a pinned model summary before the stage-2
+        // eviction below has to drop it outright.
+        let over_budget: usize = messages
+            .iter()
+            .map(|m| tok_count(&tokenizer, &m.content))
+            .sum();
+        if over_budget > working_budget && summarize_count < MAX_SUMMARIZATIONS {
+            if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+                summarize_count += 1;
+            }
+        }
+
+        let dropped = trim_working_history(messages, working_budget, &tokenizer);
         if dropped > 0 {
             let half = messages.len() / 2;
             if dropped > half {
@@ -864,6 +1038,7 @@ pub(crate) fn run_focused_steps(
             // Structured turns let the engine render through the model's own
             // chat template; the flat `prompt` stays as the fallback path.
             messages: Some(chat_turns(messages, focus)),
+            images: request.images.clone(),
             max_tokens: request.max_tokens.max(1),
             temperature: request.temperature,
             top_p: request.top_p,
@@ -1044,6 +1219,8 @@ pub(crate) fn run_focused_steps(
                 rt,
                 request,
                 working_budget,
+                role_registry,
+                tokenizer.clone(),
                 max_steps,
             ) {
                 Ok(pr) => {
@@ -1102,6 +1279,8 @@ pub(crate) fn run_focused_steps(
                 session_id,
                 request,
                 working_budget,
+                role_registry,
+                tokenizer.clone(),
                 &task_calls,
             );
             for (call, result) in task_calls.iter().zip(results) {
@@ -1130,13 +1309,87 @@ pub(crate) fn run_focused_steps(
 
         // Dispatch all tool calls concurrently (read-only fan-out + independent
         // writes share one round-trip; ordering is preserved in `results`).
-        let results = rt.block_on(async {
-            let futs: Vec<_> = calls
+        // Parallelism is capped: a reply hammering out dozens of calls must not
+        // blow the context in a single step, and when the working history is
+        // already over the eviction budget we drop to fully sequential so tool
+        // output cannot double the deficit.
+        if let Some(r) = &mut subtask {
+            let names: Vec<&str> = calls.iter().map(|c| c.name()).collect();
+            let joined = names.join(", ");
+            r.set_tool(if names.is_empty() || names.len() > 3 {
+                None
+            } else {
+                Some(&joined)
+            });
+        }
+        let batch = fanout_batch_size(calls.len(), over_budget > working_budget);
+        let results: Vec<Result<ToolResult, String>> = {
+            // Custom-mode enforcement: when the task runs under a user-defined
+            // mode with a declared `allowedTools` list, calls outside that list
+            // are replaced with a denied result instead of reaching the tools.
+            let denied: Vec<Option<ToolResult>> = calls
                 .iter()
-                .map(|call| tools::dispatch(app, tool_state, call, interrupt.clone()))
+                .map(|call| {
+                    request.agent_mode.as_ref().and_then(|mode| {
+                        if subagent::tool_allowed(mode, call.name()) {
+                            None
+                        } else {
+                            Some(ToolResult::err(
+                                call.name(),
+                                "mode restriction".into(),
+                                format!(
+                                    "Tool `{}` is not in the allowed set of agent mode `{}`. \
+                                     Finish the current task and switch modes if you need it.",
+                                    call.name(),
+                                    mode,
+                                ),
+                            ))
+                        }
+                    })
+                })
                 .collect();
-            futures_util::future::join_all(futs).await
-        });
+            let any_denied = denied.iter().any(Option::is_some);
+            let mut out: Vec<Result<ToolResult, String>> = Vec::with_capacity(calls.len());
+            for start in (0..calls.len()).step_by(batch) {
+                let chunk = &calls[start..(start + batch).min(calls.len())];
+                let chunk_results: Vec<Result<ToolResult, String>> = if any_denied {
+                    rt.block_on(async {
+                        let mut out =
+                            vec![Ok(ToolResult::err("", String::new(), String::new())); chunk.len()];
+                        let mut futs: Vec<_> = Vec::new();
+                        let mut slots: Vec<usize> = Vec::new();
+                        for (j, call) in chunk.iter().enumerate() {
+                            match &denied[start + j] {
+                                Some(d) => out[j] = Ok(d.clone()),
+                                None => {
+                                    slots.push(j);
+                                    futs.push(tools::dispatch(app, tool_state, call, interrupt.clone()));
+                                }
+                            }
+                        }
+                        let joined = futures_util::future::join_all(futs).await;
+                        for (j, res) in slots.into_iter().zip(joined) {
+                            out[j] = res;
+                        }
+                        out
+                    })
+                } else {
+                    rt.block_on(async {
+                        let futs: Vec<_> = chunk
+                            .iter()
+                            .map(|call| tools::dispatch(app, tool_state, call, interrupt.clone()))
+                            .collect();
+                        futures_util::future::join_all(futs).await
+                    })
+                };
+                out.extend(chunk_results);
+            }
+            out
+        };
+
+        if let Some(r) = &mut subtask {
+            r.set_tool(None);
+        }
 
         let mut edited_files: Vec<String> = Vec::new();
         let mut failed_in_step = 0usize;
@@ -1321,11 +1574,16 @@ fn run_subagents(
     session_id: u64,
     request: &AgentTaskRequest,
     working_budget: usize,
+    role_registry: Option<&ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
     task_calls: &[&ToolCall],
 ) -> Vec<ToolResult> {
     let total = task_calls.len();
     let batch_started = Instant::now();
     let started_at = now_ms();
+    // Model the spawned subagents actually run on (the shared pool's model,
+    // shown per-row in the subagent status panel).
+    let pool_model = spare.map(|p| p.info().name).unwrap_or_default();
 
     // ---- resolve profiles up front; invalid names fail without leasing.
     enum Job {
@@ -1412,17 +1670,37 @@ fn run_subagents(
                     continue;
                 };
                 let model_override = model_override.clone();
-                let Some(lease) = lease_worker(tool_state, pool.len()) else {
-                    results[i] = Some(ToolResult::err(
-                        "task",
-                        "`task` failed".into(),
-                        format!(
-                            "All {} spare engine worker(s) are busy with other subagents. \
-                             Run fewer `task` calls per reply, or retry next step.",
-                            pool.len().saturating_sub(1)
-                        ),
-                    ));
-                    continue;
+                // A modelOverride that names a registered remote provider
+                // routes the child to a dedicated remote generator and skips
+                // the worker lease entirely (it never touches the local pool).
+                let prepared = subgen_for_override(role_registry, model_override.as_deref())
+                    .ok()
+                    .flatten()
+                    .map(|gen| {
+                        let label = model_override.clone().unwrap_or_default();
+                        (gen, label)
+                    });
+                let (sub_gen, model_label, lease_opt) = match prepared {
+                    Some((gen, label)) => (Some(gen), label, None),
+                    None => {
+                        let Some(lease) = lease_worker(tool_state, pool.len()) else {
+                            results[i] = Some(ToolResult::err(
+                                "task",
+                                "`task` failed".into(),
+                                format!(
+                                    "All {} spare engine worker(s) are busy with other subagents. \
+                                     Run fewer `task` calls per reply, or retry next step.",
+                                    pool.len().saturating_sub(1)
+                                ),
+                            ));
+                            continue;
+                        };
+                        (
+                            Some(SubGen::Pool(pool.handle(lease.idx))),
+                            pool_model.clone(),
+                            Some(lease),
+                        )
+                    }
                 };
                 let _ = tx.send(WorkerEvent::Subtask {
                     session_id,
@@ -1431,6 +1709,9 @@ fn run_subagents(
                         total,
                         title: title.clone(),
                         status: "running".into(),
+                        model: Some(model_label.clone()),
+                        elapsed_ms: 0,
+                        tool: None,
                     },
                 });
                 let app = app.clone();
@@ -1439,24 +1720,36 @@ fn run_subagents(
                 let mut child_request = request.clone();
                 child_request.prompt = task.clone();
                 child_request.max_steps = Some(profile.max_steps);
+                let tok_for_thread = tokenizer.clone();
                 handles.push((
                     i,
                     scope.spawn(move || {
-                        let worker_idx = lease.idx;
-                        let _lease = lease;
+                        let _lease = lease_opt;
+                        let mut reporter = SubtaskReporter {
+                            session_id,
+                            index: i + 1,
+                            total,
+                            title: title.clone(),
+                            model: Some(model_label),
+                            started: Instant::now(),
+                            tx: tx.clone(),
+                            current_tool: None,
+                        };
                         drive_subagent(
                             &app,
                             tool_state,
-                            pool,
                             &interrupt,
                             &tx,
                             session_id,
                             &child_request,
                             working_budget,
+                            role_registry,
+                            tok_for_thread.clone(),
                             profile,
                             group.clone(),
-                            worker_idx,
-                            model_override.clone(),
+                            sub_gen.expect("prepared generator"),
+                            model_override,
+                            &mut reporter,
                         )
                         .unwrap_or_else(|e| ToolResult::err("task", "`task` failed".into(), e))
                     }),
@@ -1505,6 +1798,9 @@ fn run_subagents(
                     total,
                     title: title.clone(),
                     status: if ok { "done" } else { "failed" }.into(),
+                    model: Some(pool_model.clone()),
+                    elapsed_ms: result.duration_ms,
+                    tool: None,
                 },
             });
         }
@@ -1535,6 +1831,111 @@ fn run_subagents(
     merged
 }
 
+/// Tracks one first-class subagent's live status so the UI can render a
+/// per-row progress line (model + elapsed + currently executing tool). Owned
+/// by the scoped child thread; `set_tool` re-broadcasts a "running" update
+/// only when the active tool actually changes, keeping the event stream light.
+struct SubtaskReporter {
+    session_id: u64,
+    index: usize,
+    total: usize,
+    title: String,
+    model: Option<String>,
+    started: Instant,
+    tx: Sender<WorkerEvent>,
+    current_tool: Option<String>,
+}
+
+impl SubtaskReporter {
+    fn report(&self) {
+        let _ = self.tx.send(WorkerEvent::Subtask {
+            session_id: self.session_id,
+            subtask: SubtaskStat {
+                index: self.index,
+                total: self.total,
+                title: self.title.clone(),
+                status: "running".into(),
+                model: self.model.clone(),
+                elapsed_ms: self.started.elapsed().as_millis() as u64,
+                tool: self.current_tool.clone(),
+            },
+        });
+    }
+
+    fn set_tool(&mut self, tool: Option<&str>) {
+        let next = tool.map(str::to_string);
+        if next != self.current_tool {
+            self.current_tool = next;
+            self.report();
+        }
+    }
+}
+
+/// Owner of a subagent's generation. Either the leased pool worker, or — when
+/// `modelOverride` names a registered remote provider — a dedicated remote
+/// generator that never touches the local pool.
+pub enum SubGen {
+    Pool(PoolGenerator),
+    Remote(Box<dyn TextGenerator>),
+}
+
+impl TextGenerator for SubGen {
+    fn info(&self) -> ModelInfo {
+        match self {
+            SubGen::Pool(g) => g.info(),
+            SubGen::Remote(g) => g.info(),
+        }
+    }
+
+    fn generate(
+        &mut self,
+        request: &InferenceRequest,
+        session_id: u64,
+        interrupt: &CancellationToken,
+        tx: &Sender<WorkerEvent>,
+    ) -> Result<GenerationOutcome, String> {
+        match self {
+            SubGen::Pool(g) => g.generate(request, session_id, interrupt, tx),
+            SubGen::Remote(g) => g.generate(request, session_id, interrupt, tx),
+        }
+    }
+}
+
+/// Build a specialised generator for a `modelOverride` when it names a
+/// registered remote provider (case-insensitive model/id/name match). Unknown
+/// names, local models, or a misconfigured provider all fall back to `None`,
+/// which keeps the child on the pooled local worker.
+fn subgen_for_override(
+    role_registry: Option<&ProviderRegistry>,
+    model_override: Option<&str>,
+) -> Result<Option<SubGen>, String> {
+    let Some(name) = model_override.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(provider) = role_registry.and_then(|reg| reg.find_best_remote_provider(name)) else {
+        return Ok(None);
+    };
+    let remote_cfg = provider.to_remote_model_config()?;
+    match RemoteGenerator::new(remote_cfg) {
+        Ok(gen) => {
+            crate::logging::info(
+                None,
+                "subagent.multimodel",
+                &format!("modelOverride `{name}` routed to remote provider `{}`.", provider.id),
+            );
+            Ok(Some(SubGen::Remote(Box::new(gen))))
+        }
+        Err(e) => {
+            crate::logging::info(
+                None,
+                "subagent.multimodel",
+                &format!("modelOverride `{name}` fell back to the pool: {e}"),
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Drive ONE subagent loop end-to-end on the calling (scoped child) thread:
 /// depth-guarded entry, own tokio runtime, leased worker generator, minimal
 /// seeded context, then a distilled report extracted from the final turn.
@@ -1542,16 +1943,18 @@ fn run_subagents(
 fn drive_subagent(
     app: &AppHandle,
     tool_state: &ToolState,
-    pool: &EnginePool,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
     session_id: u64,
     child_request: &AgentTaskRequest,
     working_budget: usize,
+    role_registry: Option<&ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
     profile: &'static SubagentProfile,
     group: String,
-    worker_idx: usize,
+    mut gen: SubGen,
     model_override: Option<String>,
+    subtask: &mut SubtaskReporter,
 ) -> Result<ToolResult, String> {
     let started = Instant::now();
 
@@ -1563,9 +1966,9 @@ fn drive_subagent(
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to start subagent runtime: {e}"))?;
-    // Generation happens on this child's leased worker (exclusivity is
-    // guaranteed by the lease the caller moved in with us).
-    let mut gen = pool.handle(worker_idx);
+    // Generation happens on this child's generator, which the caller moved in
+    // with us — either the leased pool worker (its exclusivity is guaranteed by
+    // the lease that bridged the thread boundary) or a remote override.
 
     // Minimal seed context: mission + the tools THIS child may call + report
     // contract. No parent history, rules or skills leak into the child.
@@ -1581,7 +1984,12 @@ fn drive_subagent(
     };
     let model_note = match model_override {
         Some(ref m) => format!("\nNote: the parent requested this subagent run on model `{m}`."),
-        None => String::new(),
+        None => match subagent::current_mode_model_override() {
+            Some(ref m) => {
+                format!("\nNote: the `{}` mode requires running on model `{m}`.", profile.name)
+            }
+            None => String::new(),
+        },
     };
     let system = format!(
         "{}{}{}\n\n## Tools you may use\nEmit each tool call as an <execute_tool> block \
@@ -1613,6 +2021,9 @@ fn drive_subagent(
         &group,
         None,
         true,
+        role_registry,
+        tokenizer,
+        Some(subtask),
     );
 
     let elapsed = started.elapsed().as_millis() as u64;
@@ -1686,6 +2097,8 @@ pub(crate) fn execute_plan(
     rt: &tokio::runtime::Runtime,
     request: &AgentTaskRequest,
     working_budget: usize,
+    role_registry: Option<&ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
     max_steps: usize,
 ) -> Result<PlanRun, String> {
     {
@@ -1705,6 +2118,8 @@ pub(crate) fn execute_plan(
         rt,
         request,
         working_budget,
+        role_registry,
+        tokenizer,
         max_steps,
     );
     *tool_state.plan_executing.lock().unwrap() = false;
@@ -1723,6 +2138,8 @@ fn execute_plan_inner(
     rt: &tokio::runtime::Runtime,
     request: &AgentTaskRequest,
     working_budget: usize,
+    role_registry: Option<&ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
     max_steps: usize,
 ) -> Result<PlanRun, String> {
     let workspace = tool_state.workspace.blocking_lock().clone();
@@ -1833,6 +2250,9 @@ fn execute_plan_inner(
             &group,
             None,
             false,
+            role_registry,
+            tokenizer.clone(),
+            None,
         );
         let (ok, error) = match outcome {
             Ok(o) => {
@@ -1991,21 +2411,30 @@ fn plan_subtasks(
     messages: &mut Vec<ContextMessage>,
     request: &AgentTaskRequest,
     working_budget: usize,
+    tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<Option<Vec<Subtask>>, String> {
-    let dropped = trim_working_history(messages, working_budget);
-    if dropped > messages.len() / 2 {
-        use tauri::Emitter;
-        let _ = app.emit(
-            "agent://context-trimmed",
-            ContextTrimmedEvent {
-                session_id,
-                dropped,
-                remaining: messages.len(),
-            },
-        );
-    }
-    let mut prompt = build_prompt(messages, &request.prompt);
-    const DECOMPOSE_INSTRUCTION: &str =
+// Stage-3 compaction before the stage-2 eviction pass below.
+        if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+            crate::logging::info(
+                Some(session_id),
+                "llm.summarize",
+                "pre-decompose history compacted",
+            );
+        }
+        let dropped = trim_working_history(messages, working_budget, &tokenizer);
+        if dropped > messages.len() / 2 {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "agent://context-trimmed",
+                ContextTrimmedEvent {
+                    session_id,
+                    dropped,
+                    remaining: messages.len(),
+                },
+            );
+        }
+        let mut prompt = build_prompt(messages, &request.prompt);
+        const DECOMPOSE_INSTRUCTION: &str =
         "## Decomposition\nBreak the user's request into a JSON array of independent \
          subtasks, exactly this shape:\n[{\"title\": \"short title\", \"instruction\": \
          \"single self-contained directive\"}]\nEach instruction must be small enough to \
@@ -2023,6 +2452,7 @@ fn plan_subtasks(
             });
             turns
         }),
+        images: None,
         max_tokens: request.max_tokens.clamp(1, 1024),
         temperature: request.temperature,
         top_p: request.top_p,
@@ -2055,21 +2485,30 @@ fn run_summary(
     messages: &mut Vec<ContextMessage>,
     request: &AgentTaskRequest,
     working_budget: usize,
+    tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<FocusOutcome, String> {
-    let dropped = trim_working_history(messages, working_budget);
-    if dropped > messages.len() / 2 {
-        use tauri::Emitter;
-        let _ = app.emit(
-            "agent://context-trimmed",
-            ContextTrimmedEvent {
-                session_id,
-                dropped,
-                remaining: messages.len(),
-            },
-        );
-    }
-    let mut prompt = build_prompt(messages, &request.prompt);
-    const SUMMARY_INSTRUCTION: &str =
+// Stage-3 compaction before the stage-2 eviction pass below.
+        if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+            crate::logging::info(
+                Some(session_id),
+                "llm.summarize",
+                "pre-summary history compacted",
+            );
+        }
+        let dropped = trim_working_history(messages, working_budget, &tokenizer);
+        if dropped > messages.len() / 2 {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "agent://context-trimmed",
+                ContextTrimmedEvent {
+                    session_id,
+                    dropped,
+                    remaining: messages.len(),
+                },
+            );
+        }
+        let mut prompt = build_prompt(messages, &request.prompt);
+        const SUMMARY_INSTRUCTION: &str =
         "## Final summary\nWrite a concise plain-text final report of everything \
          accomplished in this task: files created or edited (with paths), commands run, \
          and verification results. Do NOT call any tools; output plain text only.";
@@ -2086,6 +2525,7 @@ fn run_summary(
             });
             turns
         }),
+        images: None,
         max_tokens: request.max_tokens.max(1),
         temperature: request.temperature,
         top_p: request.top_p,
@@ -2184,6 +2624,7 @@ fn maybe_extract_memory(
             role: "user".into(),
             content: format!("{debug}\n{EXTRACT_INSTRUCTION}"),
         }]),
+        images: None,
         max_tokens: 256,
         temperature: request.temperature,
         top_p: request.top_p,
@@ -2224,6 +2665,26 @@ fn maybe_extract_memory(
     }
 }
 
+/// Max tools dispatched in a single parallel batch. A reply hammering out more
+/// calls than this runs them in successive batches so one step cannot blow the
+/// whole context budget with tool output.
+const MAX_PARALLEL_FANOUT: usize = 6;
+
+/// How many of `num_calls` may dispatch in parallel in one step. When the
+/// working history is already over the eviction budget we fall back to fully
+/// sequential execution (one call per batch) so tool results cannot push the
+/// deficit further; otherwise the batch is capped at [`MAX_PARALLEL_FANOUT`].
+fn fanout_batch_size(num_calls: usize, over_budget: bool) -> usize {
+    if num_calls == 0 {
+        return 0;
+    }
+    if over_budget {
+        1
+    } else {
+        num_calls.min(MAX_PARALLEL_FANOUT)
+    }
+}
+
 /// Cheap estimated token count (chars/4 heuristic, mirrors context.rs).
 fn est_tokens(text: &str) -> usize {
     let chars = text.chars().count();
@@ -2231,6 +2692,19 @@ fn est_tokens(text: &str) -> usize {
         1
     } else {
         chars.div_ceil(4)
+    }
+}
+
+/// Token-aware count for compaction: use the registered HF tokenizer for exact
+/// counts when one is available (it is threaded down from the ContextManager on
+/// model load), otherwise fall back to the chars/4 heuristic.
+fn tok_count(tokenizer: &Option<tokenizers::Tokenizer>, text: &str) -> usize {
+    match tokenizer {
+        Some(t) => t
+            .encode(text, false)
+            .map(|e| e.get_ids().len())
+            .unwrap_or_else(|_| est_tokens(text)),
+        None => est_tokens(text),
     }
 }
 
@@ -2277,11 +2751,15 @@ fn compress_large_messages(messages: &mut [ContextMessage], max_chars: usize) ->
 ///
 /// Returns the number of messages dropped by stage 2 (used by callers to decide
 /// whether to surface the `agent://context-trimmed` notice).
-fn trim_working_history(messages: &mut Vec<ContextMessage>, budget: usize) -> usize {
+fn trim_working_history(
+    messages: &mut Vec<ContextMessage>,
+    budget: usize,
+    tokenizer: &Option<tokenizers::Tokenizer>,
+) -> usize {
     compress_large_messages(messages, super::context::COMPACT_DEFAULT_MAX_CHARS);
     let initial = messages.len();
     while messages.len() > 1 {
-        let total: usize = messages.iter().map(|m| est_tokens(&m.content)).sum();
+        let total: usize = messages.iter().map(|m| tok_count(tokenizer, &m.content)).sum();
         if total <= budget {
             break;
         }
@@ -2294,6 +2772,120 @@ fn trim_working_history(messages: &mut Vec<ContextMessage>, budget: usize) -> us
         }
     }
     initial - messages.len()
+}
+
+/// Locate the oldest contiguous run of *unpinned* messages (the eviction
+/// candidates in [`trim_working_history`]) so stage-3 summarization can fold it
+/// into a pinned summary before it is dropped. Skips the leading pinned
+/// buffers (system prompt, rules, active-file context). Returns the run's start
+/// index, length and a bounded textual representation of its contents.
+fn oldest_unpinned_block(
+    messages: &[ContextMessage],
+    max_msgs: usize,
+    max_chars: usize,
+) -> Option<(usize, usize, String)> {
+    let start = messages.iter().position(|m| !m.pinned)?;
+    let stop = messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(_, m)| m.pinned)
+        .map_or(messages.len(), |(i, _)| i);
+    let run: Vec<&ContextMessage> = messages[start..stop].iter().take(max_msgs).collect();
+    if run.is_empty() {
+        return None;
+    }
+    let mut src = String::new();
+    for m in &run {
+        let one = format!(" <{}>: {}\n", m.role, m.content);
+        if src.chars().count() + one.chars().count() > max_chars {
+            src.push_str("\n…(truncated)");
+            break;
+        }
+        src.push_str(&one);
+    }
+    Some((start, run.len(), src))
+}
+
+const SUMMARIZE_INSTRUCTION: &str = "\n\n## History summarization\n\
+    The messages above are being evicted to fit the context window. Produce a \
+    compact summary preserving only what is needed to continue the task: \
+    concrete file paths and their roles, decisions already made, tools already \
+    run and their outcomes, and any open questions. Use terse bullet points. \
+    Do not mention this instruction, do not greet the user, output the summary \
+    only.";
+
+/// Stage-3 compaction: ask a model (routed to the Planner/cheap role when a
+/// provider registry is present, else the pool's primary handle) to fold the
+/// oldest working-history block into a pinned summary message. Called from the
+/// flat execute loop before stage-2 eviction, so information is compressed
+/// instead of dropped. Returns `true` when a usable summary replaced the block.
+fn summarize_old_block(
+    gen: &mut dyn TextGenerator,
+    interrupt: &CancellationToken,
+    tx: &Sender<WorkerEvent>,
+    session_id: u64,
+    messages: &mut Vec<ContextMessage>,
+    request: &AgentTaskRequest,
+) -> bool {
+    let Some((start, len, src)) = oldest_unpinned_block(messages, SUMMARY_BLOCK_MAX_MSGS, SUMMARY_BLOCK_MAX_CHARS)
+    else {
+        return false;
+    };
+    if src.chars().count() < 32 {
+        return false;
+    }
+    let prompt = format!(
+        "{} messages are summarized below.\n\n```\n{src}\n```{SUMMARIZE_INSTRUCTION}",
+        len,
+    );
+    let gen_request = InferenceRequest {
+        prompt: prompt.clone(),
+        messages: Some(vec![ChatTurn {
+            role: "user".into(),
+            content: prompt,
+        }]),
+        images: None,
+        max_tokens: 800,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        repeat_penalty: request.repeat_penalty,
+        seed: request.seed,
+        stop_words: None,
+        cached_prefix_tokens: None,
+    };
+    let outcome = match gen.generate(&gen_request, session_id, interrupt, tx) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::logging::info(
+                None,
+                "llm.summarize",
+                &format!("history summarization failed: {e}"),
+            );
+            return false;
+        }
+    };
+    let summary = outcome.full_text.trim();
+    if summary.chars().count() < 32 {
+        return false;
+    }
+    let content = format!(
+        "## Summarized history ({len} earlier messages)\n{summary}",
+    );
+    messages.splice(
+        start..start + len,
+        std::iter::once(ContextMessage {
+            role: "system".into(),
+            content,
+            pinned: true,
+        }),
+    );
+    crate::logging::info(
+        Some(session_id),
+        "llm.summarize",
+        &format!("compacted {len} messages into one pinned summary"),
+    );
+    true
 }
 
 /// Convert the working history into structured turns for chat-template
@@ -2483,6 +3075,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fanout_caps_parallel_batches_and_falls_back_sequential_over_budget() {
+        // Zero calls -> zero batches.
+        assert_eq!(fanout_batch_size(0, false), 0);
+        // Small sets dispatch at once when the budget is fine.
+        assert_eq!(fanout_batch_size(1, false), 1);
+        assert_eq!(fanout_batch_size(4, false), 4);
+        assert_eq!(fanout_batch_size(6, false), 6);
+        // Large sets are capped, then chunked.
+        assert_eq!(fanout_batch_size(12, false), 6);
+        assert_eq!(fanout_batch_size(8, false), 6);
+        // Over-budget history forces sequential execution regardless of size.
+        assert_eq!(fanout_batch_size(3, true), 1);
+        assert_eq!(fanout_batch_size(20, true), 1);
+    }
+
+    #[test]
     fn builds_plain_prompt_from_messages() {
         let msgs = vec![
             ContextMessage {
@@ -2544,7 +3152,7 @@ mod tests {
                 pinned: false,
             },
         ];
-        trim_working_history(&mut msgs, 30);
+        trim_working_history(&mut msgs, 30, &None);
         // Pinned system prompt survives; the final message survives; the bulky
         // middle messages are dropped oldest-first.
         assert_eq!(msgs[0].role, "system");
@@ -2605,11 +3213,179 @@ mod tests {
                 pinned: false,
             },
         ];
-        let dropped = trim_working_history(&mut msgs, 4000);
+        let dropped = trim_working_history(&mut msgs, 4000, &None);
         assert_eq!(dropped, 0, "compression should avoid eviction here");
         assert_eq!(msgs.len(), 3);
         assert!(msgs[1].content.contains("[Content compressed"));
         assert!(msgs[2].content.contains("[Content compressed"));
+    }
+
+    #[test]
+    fn oldest_unpinned_block_skips_pinned_buffers_and_bounds_length() {
+        let msgs = vec![
+            ContextMessage {
+                role: "system".into(),
+                content: "SYS".into(),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "context".into(),
+                content: "FILE".into(),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "first ask".into(),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "reply".into(),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "system".into(),
+                content: "pinned summary".into(),
+                pinned: true,
+            },
+        ];
+        let (start, len, src) =
+            oldest_unpinned_block(&msgs, SUMMARY_BLOCK_MAX_MSGS, SUMMARY_BLOCK_MAX_CHARS)
+                .expect("oldest unpinned block exists");
+        assert_eq!(start, 2);
+        assert_eq!(len, 2);
+        assert!(src.contains("first ask") && src.contains("reply"));
+    }
+
+    #[test]
+    fn oldest_unpinned_block_none_when_everything_pinned() {
+        let msgs = vec![
+            ContextMessage {
+                role: "system".into(),
+                content: "SYS".into(),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                pinned: true,
+            },
+        ];
+        assert!(oldest_unpinned_block(&msgs, 4, 4000).is_none());
+    }
+
+    #[test]
+    fn summarize_old_block_inlines_pinned_summary_in_place() {
+        struct FakeGen;
+        impl crate::engine::TextGenerator for FakeGen {
+            fn info(&self) -> crate::engine::ModelInfo {
+                unimplemented!("not exercised by this test")
+            }
+            fn generate(
+                &mut self,
+                _req: &crate::engine::InferenceRequest,
+                _sid: u64,
+                _interrupt: &tokio_util::sync::CancellationToken,
+                _tx: &crossbeam_channel::Sender<crate::engine::WorkerEvent>,
+            ) -> Result<crate::engine::GenerationOutcome, String> {
+                Ok(crate::engine::GenerationOutcome {
+                    done: crate::engine::InferenceDone {
+                        total_tokens: 1,
+                        generated_chars: 40,
+                        tokens_per_sec: 0.0,
+                        elapsed_ms: 0,
+                        stop_reason: "complete".into(),
+                        outcome: "completed".into(),
+                        input_tokens: 1,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    full_text: "- kept src/lib/ipc.ts\n- pending: finish wiring".into(),
+                })
+            }
+        }
+        let mut msgs = vec![
+            ContextMessage {
+                role: "system".into(),
+                content: "SYS".into(),
+                pinned: true,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "old turn".into(),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "old reply".into(),
+                pinned: false,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "latest".into(),
+                pinned: true,
+            },
+        ];
+        let interrupt = tokio_util::sync::CancellationToken::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let req = AgentTaskRequest {
+            prompt: "do the task".into(),
+            max_tokens: 2048,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+                        repeat_penalty: Some(1.0),
+            seed: None,
+            max_steps: None,
+            stop_words: None,
+            plan_mode: false,
+            verify: false,
+            decompose: false,
+            token_budget: None,
+            agent_mode: None,
+            images: None,
+        };
+        let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs, &req);        assert!(ok, "summary generation returns true");
+        // The two oldest unpinned turns collapse into one pinned system summary.
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[1].pinned);
+        assert!(msgs[1].content.contains("Summarized history (2 earlier messages)"));
+        assert!(msgs[1].content.contains("src/lib/ipc.ts"));
+        assert_eq!(msgs[2].content, "latest");
+    }
+
+    #[test]
+    fn smalltalk_shortcut_guards_modes_and_greetings() {
+        let base = || AgentTaskRequest {
+            prompt: "hi".into(),
+            max_tokens: 2048,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            repeat_penalty: Some(1.0),
+            seed: None,
+            max_steps: None,
+            stop_words: None,
+            plan_mode: false,
+            verify: false,
+            decompose: false,
+            token_budget: None,
+            agent_mode: None,
+            images: None,
+        };
+        assert!(should_shortcut_smalltalk(&base()), "greeting qualifies");
+
+        let mut plan = base();
+        plan.plan_mode = true;
+        assert!(!should_shortcut_smalltalk(&plan), "plan mode runs for real");
+
+        let mut dec = base();
+        dec.decompose = true;
+        assert!(!should_shortcut_smalltalk(&dec), "decompose runs for real");
+
+        let mut task = base();
+        task.prompt = "refactor the auth module".into();
+        assert!(!should_shortcut_smalltalk(&task), "real task reaches the model");
     }
 
     #[test]

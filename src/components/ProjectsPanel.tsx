@@ -151,6 +151,7 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
           <button
             onClick={(e) => removeChat(e, p.name, chat.id)}
             title="Delete chat"
+            aria-label={`Delete chat ${chat.title}`}
             className="hidden rounded px-1 text-[9px] text-zinc-400 hover:text-red-600 group-hover:block"
           >
             ✕
@@ -234,6 +235,7 @@ export default function ProjectsPanel(props: ProjectsPanelProps) {
                         onOpenProject(p.name);
                       }}
                       title={`Open ${baseName(p.name)} as workspace`}
+                      aria-label={`Open ${baseName(p.name)} as workspace`}
                       className="hidden rounded px-1 text-[10px] text-zinc-400 hover:text-cyan-700 group-hover:block"
                     >
                       📂

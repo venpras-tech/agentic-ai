@@ -47,6 +47,49 @@ pub struct UsageReport {
     pub evicted_turns: usize,
     pub message_count: usize,
     pub overflow: bool,
+    /// Per-category context split so the UI can show where tokens go.
+    pub breakdown: ContextBreakdown,
+}
+
+/// Token split across the logical context categories.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBreakdown {
+    /// The pinned system prompt (never evicted).
+    pub system: usize,
+    /// The active-file context buffer (role `"context"`).
+    pub file: usize,
+    /// Project rules buffer (role `"rules"`).
+    pub rules: usize,
+    /// Sum of all skills (roles starting with `"skill"`).
+    pub skills: usize,
+    /// Auto-extracted memory buffer (role `"memory"`).
+    pub memory: usize,
+    /// Other pinned buffers we do not classify above.
+    pub other_pinned: usize,
+    /// Conversation history turns.
+    pub turns: usize,
+}
+
+impl ContextBreakdown {
+    /// Aggregate a snapshot of the manager's internal buffers.
+    fn collect(system: &Option<Tracked>, pinned: &[Tracked], history: &VecDeque<Tracked>) -> Self {
+        let mut b = ContextBreakdown::default();
+        if let Some(s) = system {
+            b.system = s.tokens;
+        }
+        for t in pinned {
+            match t.message.role.as_str() {
+                "context" => b.file += t.tokens,
+                "rules" => b.rules += t.tokens,
+                "memory" => b.memory += t.tokens,
+                r if r.starts_with("skill") => b.skills += t.tokens,
+                _ => b.other_pinned += t.tokens,
+            }
+        }
+        b.turns = history.iter().map(|t| t.tokens).sum();
+        b
+    }
 }
 
 /// Summary of one [`ContextManager::compact_context`] pass.
@@ -102,6 +145,24 @@ pub struct ContextManager {
     tokenizer: Option<tokenizers::Tokenizer>,
 }
 
+/// Bundled default tokenizer, embedded at build time so exact token counts work
+/// even when no `tokenizer.json` is registered at runtime. This is Qwen2.5-Coder's
+/// BPE vocabulary (Qwen/Qwen2.5-Coder-7B-Instruct, Apache-2.0). Parsed once and
+/// shared; if it ever fails to parse we keep the chars/4 heuristic so the engine
+/// stays usable regardless.
+static BUNDLED_TOKENIZER: std::sync::OnceLock<Option<tokenizers::Tokenizer>> =
+    std::sync::OnceLock::new();
+
+fn bundled_tokenizer() -> Option<tokenizers::Tokenizer> {
+    BUNDLED_TOKENIZER
+        .get_or_init(|| {
+            tokenizers::Tokenizer::from_bytes(include_bytes!("../../assets/tokenizer.json"))
+                .map(Some)
+                .unwrap_or(None)
+        })
+        .clone()
+}
+
 impl ContextManager {
     pub fn new(limit: usize) -> Self {
         let limit = limit.max(64);
@@ -113,7 +174,7 @@ impl ContextManager {
             history: VecDeque::new(),
             total: 0,
             evicted_turns: 0,
-            tokenizer: None,
+            tokenizer: bundled_tokenizer(),
         }
     }
 
@@ -206,6 +267,13 @@ impl ContextManager {
         self.total
     }
 
+    /// Clone the registered HF tokenizer so callers outside the lock (e.g. the
+    /// orchestrator's working-history compaction) can use exact token counts.
+    /// `None` when no `tokenizer.json` was registered.
+    pub fn tokenizer(&self) -> Option<tokenizers::Tokenizer> {
+        self.tokenizer.clone()
+    }
+
     /// Ordered messages ready to be formatted into the model prompt:
     /// system → pinned (active-file buffer) → history (oldest first).
     pub fn messages(&self) -> Vec<ContextMessage> {
@@ -227,6 +295,7 @@ impl ContextManager {
             evicted_turns: self.evicted_turns,
             message_count: self.messages().len(),
             overflow: self.total > self.threshold,
+            breakdown: ContextBreakdown::collect(&self.system, &self.pinned, &self.history),
         }
     }
 
@@ -393,6 +462,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundled_tokenizer_loads_and_counts_tokens_exactly() {
+        // The embedded DeepSeek Coder BPE tokenizer must parse and give
+        // deterministic, code-aware counts that diverge from the chars/4 rule.
+        let tok = bundled_tokenizer();
+        let code = "impl Estimator { pub fn estimate_tokens(&self, text: &str) -> usize { let words = text.split_whitespace().filter(|w| !w.is_empty()).collect::<Vec<_>>(); self.scale * words.len() } }";
+        let code_tokens = count_tokens(&tok, code);
+        let chars_based = heuristic(code);
+        assert!(code_tokens > 0, "counted the sample");
+        assert!(
+            code_tokens != chars_based,
+            "BPE count ({code_tokens}) should differ from the chars/4 heuristic ({chars_based})"
+        );
+        let once = count_tokens(&tok, code);
+        assert_eq!(code_tokens, once, "deterministic count");
+    }
+
+    #[test]
     fn evicts_oldest_turns_first() {
         let mut m = ContextManager::new(100);
         m.set_system_prompt("SYS.".repeat(10)); // ~10 tok
@@ -417,15 +503,43 @@ mod tests {
     #[test]
     fn pinned_survive_eviction() {
         let mut m = ContextManager::new(64);
-        m.set_system_prompt("SYS".repeat(20));
-        m.set_file_buffer("BUF".repeat(20));
+        // Lightweight pinned entries…
+        m.set_system_prompt("SYS".into());
+        m.set_file_buffer("BUF".into());
+        // …facing heavy evictable turns that overflow the 80% threshold.
         for i in 0..50 {
-            m.push("assistant", format!("noise {i} ").repeat(8));
+            m.push("assistant", format!("turn {i:03} ").repeat(40));
         }
         let msgs = m.messages();
-        assert_eq!(msgs[0].content, "SYS".repeat(20));
-        assert_eq!(msgs[1].content, "BUF".repeat(20));
+        assert_eq!(msgs[0].content, "SYS");
+        assert_eq!(msgs[1].content, "BUF");
+        assert!(m.evicted_turns > 0, "turns were actually shed");
         assert!(m.total_tokens() <= m.usage().limit);
+    }
+
+    #[test]
+    fn breakdown_classifies_context_categories() {
+        let mut m = ContextManager::new(10_000);
+        m.set_system_prompt("SYS".repeat(8));
+        m.set_file_buffer("FILE".repeat(8));
+        m.upsert_pinned("rules", "RULE".repeat(8));
+        m.upsert_pinned("skill:plan", "SKILL-PLAN".repeat(8));
+        m.upsert_pinned("skill:debug", "SKILL-DBG".repeat(8));
+        m.push("user", "USER".repeat(8));
+        m.push("assistant", "ASST".repeat(8));
+
+        let b = m.usage().breakdown;
+        // Every counted token lands in exactly one category and they sum to total.
+        let sum = b.system + b.file + b.rules + b.memory + b.skills + b.other_pinned + b.turns;
+        assert_eq!(sum, m.usage().total_tokens);
+        assert!(b.system > 0, "system tokens missing");
+        assert!(b.file > 0, "file buffer tokens missing");
+        assert!(b.rules > 0, "rules tokens missing");
+        assert!(b.skills == b.skills, "skills sum");
+        assert!(b.turns > 0, "turn tokens missing");
+        assert_eq!(b.other_pinned, 0);
+        // Two skill roles collapse into the single `skills` category.
+        assert!(b.skills > b.rules, "two skills should sum above one rules buffer");
     }
 
     #[test]
@@ -452,12 +566,20 @@ mod tests {
 
     #[test]
     fn compact_context_compresses_oversized_buffers_back_under_threshold() {
-        let mut m = ContextManager::new(2000);
-        m.set_system_prompt("SYS.".repeat(10)); // ~10 tok
-        // 7000-char active-file buffer (~1750 tok): above the 1600 threshold but
-        // below the hard limit, so it survives auto-eviction while overflowing.
-        m.upsert_pinned("context", "X".repeat(7000));
-        assert!(m.usage().overflow);
+        let mut m = ContextManager::new(4000);
+        m.set_system_prompt("SYS.".repeat(10));
+        // Identifier-heavy buffer that is BOTH char-oversized (> 6000 chars, so
+        // compaction kicks in) and token-over-the-3200-soft-threshold yet under
+        // the 4000 hard limit under exact BPE counts.
+        let content = (0..230)
+            .map(|i| format!("token{i:04}: alpha_{i} beta_{i} gamma\n"))
+            .collect::<String>();
+        m.upsert_pinned("context", content.clone());
+        let pre = count_tokens(&bundled_tokenizer(), &content);
+        assert!(
+            m.usage().overflow,
+            "buffer alone overflowed the soft threshold (pre={pre})"
+        );
         let report = m.compact_context();
         assert!(!report.overflow);
         assert!(report.total_tokens <= m.usage().limit);

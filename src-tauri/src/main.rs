@@ -7,6 +7,7 @@ mod engine;
 mod hub;
 mod logging;
 mod remote;
+mod terminal;
 mod watcher;
 
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ use agent::{PermissionDecision, ToolCall, ToolResult, ToolState};
 use crossbeam_channel::{bounded, Sender};
 use engine::{
     EnginePool, InferenceDone, InferenceRequest, LoadProgressEvent, LocalGenerator, ModelInfo,
-    ModelInitParams, TextGenerator, WorkerEvent,
+    ModelInitParams, RuntimeRouter, TextGenerator, WorkerEvent,
 };
 use remote::{
     ProviderConfig, ProviderKind, ProviderRegistry, ProviderRole, RemoteGenerator,
@@ -351,6 +352,12 @@ async fn install_local_model(
     let app_for_load = app.clone();
     let path_for_event = path.clone();
     let path_for_state = path.display().to_string();
+    // Peek for a sibling `tokenizer.json` before `path` is moved into the
+    // load task so we can register it below for exact-count compaction.
+    let tokenizer_candidate = path
+        .parent()
+        .map(|d| d.join("tokenizer.json"))
+        .filter(|p| p.is_file());
     let pool = tokio::task::spawn_blocking(move || {
         build_local_pool(&path, &params, event_tx, &app_for_load)
     })
@@ -391,6 +398,24 @@ async fn install_local_model(
         .lock()
         .await
         .set_limit(info.context_size as usize);
+
+    // If a `tokenizer.json` ships next to the model, register it so the
+    // orchestrator compacts its working history with exact token counts (it
+    // falls back to the chars/4 heuristic when absent).
+    if let Some(tok_path) = tokenizer_candidate {
+        match context_state.inner.lock().await.load_tokenizer(&tok_path) {
+            Ok(()) => logging::info(
+                None,
+                "context.tokenizer",
+                &format!("registered `{}`", tok_path.display()),
+            ),
+            Err(e) => logging::info(
+                None,
+                "context.tokenizer",
+                &format!("tokenizer load failed: {e}"),
+            ),
+        }
+    }
 
     // Keep the API server's view of the engine in sync.
     if let Some(api) = api {
@@ -803,7 +828,17 @@ async fn hf_download_model(
         .await;
         registry.lock().await.remove(&key);
         match result {
-            Ok(_) => {}
+            Ok(_) => {
+                // Best-effort companion fetch: pull the repo's `tokenizer.json`
+                // alongside the weights so exact token counting engages on load.
+                if hub::download_tokenizer(&models_dir, &repo).await {
+                    logging::info(
+                        None,
+                        "hub.tokenizer",
+                        &format!("fetched tokenizer for `{repo}`"),
+                    );
+                }
+            }
             Err(e) if e == "__cancelled__" => {
                 let _ = app.emit(
                     "hf-download-progress",
@@ -892,7 +927,7 @@ struct AppSettings {
     params: Option<GenParamsSettings>,
     /// Last-used remote endpoint config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    remote: Option<Value>,
+    remote: Option<RemoteModelConfig>,
     /// Last workspace root (hydrated on startup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_workspace: Option<String>,
@@ -901,10 +936,20 @@ struct AppSettings {
     last_workspaces: Option<Vec<String>>,
     /// Last active chat pointer `{project, chatId}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_chat: Option<Value>,
+    last_chat: Option<LastChatPointer>,
     /// Any other keys (keep the file format backwards-compatible).
     #[serde(flatten)]
     extra: std::collections::HashMap<String, Value>,
+}
+
+/// Persisted `{project, chatId}` pointer — the chat reopened on the last
+/// launch (mirrors `src/types.ts` `LastChatPointer`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LastChatPointer {
+    project: String,
+    #[serde(default)]
+    chat_id: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -1304,12 +1349,16 @@ async fn stream_inference(
 async fn agent_run_task(
     app: AppHandle,
     state: State<'_, InferenceState>,
+    providers: State<'_, ProviderRegistryState>,
     interrupt_state: State<'_, InterruptState>,
     context_state: State<'_, ContextState>,
     tool_state: State<'_, std::sync::Arc<ToolState>>,
     request: agent::orchestrator::AgentTaskRequest,
 ) -> Result<u64, String> {
     let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+    // Snapshot the role→provider registry so the worker thread can route
+    // plan/memory phases to a different provider at runtime (P0 hand-off).
+    let role_registry = providers.0.lock().await.clone();
 
     let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
@@ -1332,6 +1381,44 @@ async fn agent_run_task(
         ),
     );
 
+    // Greeting short-circuit: skip the model/tool round-trip for trivial
+    // small talk, answering with a canned reply (see `agent/smalltalk.rs`).
+    if crate::agent::smalltalk::is_smalltalk(&request.prompt) {
+        let reply = crate::agent::smalltalk::reply_for(&request.prompt);
+        let tx = state
+            .worker_tx
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| spawn_emitter(app.clone()));
+        let _ = tx.send(crate::engine::WorkerEvent::Token {
+            session_id,
+            delta: reply.clone(),
+        });
+        let _ = tx.send(crate::engine::WorkerEvent::Done {
+            session_id,
+            done: crate::engine::InferenceDone {
+                total_tokens: 0,
+                generated_chars: reply.chars().count() as u64,
+                tokens_per_sec: 0.0,
+                elapsed_ms: 0,
+                stop_reason: "completed".to_string(),
+                outcome: "completed".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            },
+        });
+        logging::info(
+            Some(session_id),
+            "llm.smalltalk",
+            "short-circuited greeting; no model round-trip",
+        );
+        return Ok(session_id);
+    }
+
     let tx = state
         .worker_tx
         .lock()
@@ -1342,6 +1429,9 @@ async fn agent_run_task(
     let tool_state_arc = std::sync::Arc::clone(&tool_state);
 
     let context_snapshot = context_state.inner.lock().await.messages();
+    // Share the ContextManager's registered HF tokenizer (if any) so the
+    // orchestrator compacts its working history with exact token counts.
+    let context_tokenizer = context_state.inner.lock().await.tokenizer();
     let app_for_thread = app.clone();
     let tx_clone = tx.clone();
     let context_budget = pool.info().context_size as usize;
@@ -1358,6 +1448,8 @@ async fn agent_run_task(
             &context_snapshot,
             &request,
             context_budget,
+            Some(role_registry),
+            context_tokenizer,
         );
         let _ = tx_clone.send(match result {
             Ok(outcome) => WorkerEvent::Done {
@@ -1384,6 +1476,73 @@ struct StartedEvent {
 // Background tasks (P2-12)
 // ---------------------------------------------------------------------------
 
+/// Monaco inline AI completion: given the code before the cursor (`prefix`)
+/// and optionally the text after it (`suffix`), generate a short fill-in
+/// snippet. Routed through the `Autocomplete` provider role when one is
+/// configured (falls back to the local pool). Runs non-streaming with
+/// session id 0 so it never renders into a chat stream.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutocompleteRequest {
+    prefix: String,
+    suffix: Option<String>,
+    language: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+#[tauri::command]
+async fn autocomplete_generate(
+    state: State<'_, InferenceState>,
+    providers: State<'_, ProviderRegistryState>,
+    request: AutocompleteRequest,
+) -> Result<String, String> {
+    let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+    let role_registry = providers.0.lock().await.clone();
+    // Throwaway sender: completions are invisible to the UI event bus.
+    let (tx, _) = crossbeam_channel::unbounded();
+
+    // Fill-in-the-middle style instruction tuned for code completion. For
+    // local models we keep it minimal; the model just continues the code.
+    let mut prompt = String::new();
+    if let Some(suffix) = request.suffix.as_deref().filter(|s| !s.trim().is_empty()) {
+        prompt.push_str(&format!(
+            "Complete the following code. Insert exactly the missing middle (return only the inserted text, no explanation, no wrapping backticks).\n\n<fim_prefix>{prefix}<fim_suffix>{suffix}<fim_middle>",
+            prefix = request.prefix,
+            suffix = suffix
+        ));
+    } else {
+        prompt.push_str(&format!(
+            "Complete the following code. Return only the continuation (the missing text right after the cursor), no explanation and no enclosing code fences.\n\n{prefix}",
+            prefix = request.prefix
+        ));
+    }
+
+    let max_tokens = request.max_tokens.unwrap_or(128).clamp(16, 512);
+    let gen_request = InferenceRequest {
+        prompt,
+        messages: None,
+        images: None,
+        max_tokens,
+        temperature: Some(0.2),
+        top_p: Some(0.9),
+        repeat_penalty: Some(1.05),
+        seed: None,
+        stop_words: Some(vec![
+            "<|endoftext|>".into(),
+            "<|fim_middle|>".into(),
+            "\n\n".into(),
+        ]),
+        cached_prefix_tokens: None,
+    };
+
+    let interrupt = CancellationToken::new();
+    let mut router = RuntimeRouter::new(&pool, role_registry, tx.clone());
+    let mut gen = router.resolve(ProviderRole::Autocomplete)?;
+    // Session id 0 keeps the completion off the chat stream.
+    let outcome = gen.generate(&gen_request, 0, &interrupt, &tx)?;
+    Ok(outcome.full_text.trim().to_string())
+}
+
 /// Start an agent task that runs in the background, independent of the
 /// foreground chat. The task gets its own cancellation token and is tracked
 /// in `ToolState.background_tasks` until completion or abort.
@@ -1391,12 +1550,14 @@ struct StartedEvent {
 async fn agent_run_background(
     app: AppHandle,
     state: State<'_, InferenceState>,
+    providers: State<'_, ProviderRegistryState>,
     interrupt_state: State<'_, InterruptState>,
     context_state: State<'_, ContextState>,
     tool_state: State<'_, std::sync::Arc<ToolState>>,
     request: agent::orchestrator::AgentTaskRequest,
 ) -> Result<u64, String> {
     let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+    let role_registry = providers.0.lock().await.clone();
     let tx = state
         .worker_tx
         .lock()
@@ -1405,6 +1566,9 @@ async fn agent_run_background(
         .unwrap_or_else(|| spawn_emitter(app.clone()));
     let context_snapshot = context_state.inner.lock().await.messages();
     let context_budget = pool.info().context_size as usize;
+    // Share the registered HF tokenizer so the orchestrator compacts history
+    // with exact token counts (falls back to the chars/4 heuristic when absent).
+    let context_tokenizer = context_state.inner.lock().await.tokenizer();
 
     agent::background::start_background_task(
         pool,
@@ -1415,6 +1579,8 @@ async fn agent_run_background(
         &request,
         &context_snapshot,
         context_budget,
+        Some(role_registry),
+        context_tokenizer,
     )
 }
 
@@ -1458,6 +1624,48 @@ async fn abort_background_task(
 async fn cancel_inference(state: State<'_, InterruptState>) -> Result<(), String> {
     state.trigger();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Interactive terminal (persistent shell sessions)
+// ---------------------------------------------------------------------------
+
+/// Spawn a persistent interactive shell and stream output via
+/// `agent://terminal-output` events. Returns the terminal id.
+#[tauri::command]
+async fn terminal_spawn(
+    app: AppHandle,
+    sessions: State<'_, std::sync::Arc<terminal::TerminalSessions>>,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    sessions.spawn(&app, cwd)
+}
+
+/// Write one line (plus newline) to a terminal's stdin.
+#[tauri::command]
+async fn terminal_write(
+    sessions: State<'_, std::sync::Arc<terminal::TerminalSessions>>,
+    id: String,
+    line: String,
+) -> Result<(), String> {
+    sessions.write(&id, &line)
+}
+
+/// Terminate a terminal session (kills the process tree).
+#[tauri::command]
+async fn terminal_kill(
+    sessions: State<'_, std::sync::Arc<terminal::TerminalSessions>>,
+    id: String,
+) -> Result<(), String> {
+    sessions.kill(&id)
+}
+
+/// List live terminal sessions (id + cwd).
+#[tauri::command]
+async fn terminal_list(
+    sessions: State<'_, std::sync::Arc<terminal::TerminalSessions>>,
+) -> Result<Vec<terminal::TerminalInfo>, String> {
+    Ok(sessions.list())
 }
 
 /// Emergency abort for any running job (LLM generation, terminal sub-process,
@@ -1656,6 +1864,7 @@ async fn agent_set_workspace(
     state.workspace.lock().await.clear();
     state.workspace.lock().await.push(p.clone());
     let config_dir = app_config_dir(&app);
+    sync_modes(&p);
     let _ = knowledge_state.scan(&p, &config_dir);
     sync_knowledge(&context_state, &knowledge_state).await;
     let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
@@ -1688,6 +1897,7 @@ async fn agent_add_workspace(
     }
     let workspaces: Vec<String> = guard.iter().map(|w| w.to_string_lossy().into_owned()).collect();
     drop(guard);
+    sync_modes(&p);
     let config_dir = app_config_dir(&app);
     let _ = knowledge_state.scan(&p, &config_dir);
     sync_knowledge(&context_state, &knowledge_state).await;
@@ -1899,6 +2109,61 @@ async fn sync_knowledge(context_state: &ContextState, knowledge: &KnowledgeState
     } else {
         inner.upsert_pinned("skill", skills);
     }
+    let memory = knowledge.memory_content(&knowledge.workspace());
+    if memory.trim().is_empty() {
+        inner.remove_pinned("memory");
+    } else {
+        let labeled = format!("### Memory (auto-extracted)\n{}\n\n", memory.trim());
+        inner.upsert_pinned("memory", labeled);
+    }
+}
+
+/// Load custom agent modes (`.ai/modes/*.md`) from `workspace` into the global
+/// thread-local registry so tool-call enforcement sees them. Registered data is
+/// `'static` (leaked) on purpose — see [`subagent::register_modes`] and
+/// [`subagent::build_mode_profile`]. Returns the loaded modes.
+fn sync_modes(workspace: &std::path::Path) -> Vec<agent::subagent::Mode> {
+    let modes = agent::subagent::load_modes(workspace);
+    agent::subagent::register_modes(&modes);
+    if !modes.is_empty() {
+        logging::info(
+            None,
+            "agent.modes",
+            &format!("{} custom mode(s) registered from {}", modes.len(), workspace.display()),
+        );
+    }
+    modes
+}
+
+/// List the custom agent modes available in the active workspace
+/// (`.ai/modes/*.md`). The registry is refreshed on every call so editing a
+/// mode file takes effect without restarting the app.
+#[tauri::command]
+async fn agent_modes(
+    state: State<'_, std::sync::Arc<ToolState>>,
+) -> Result<Vec<agent::subagent::Mode>, String> {
+    let workspace = state.primary_workspace().await.unwrap_or_default();
+    let mut modes = agent::subagent::builtin_modes();
+    modes.extend(sync_modes(&workspace));
+    Ok(modes)
+}
+
+/// List the user-defined workflows available in the active workspace
+/// (`.ai/workflows/*.md`) as a `/command` picker catalog.
+#[tauri::command]
+async fn agent_workflows(
+    state: State<'_, std::sync::Arc<ToolState>>,
+) -> Result<Vec<agent::workflows::Workflow>, String> {
+    let workspace = state.primary_workspace().await.unwrap_or_default();
+    Ok(agent::workflows::load_workflows(&workspace))
+}
+
+/// Activate a workflow's tool allow-list for the current run scope so
+/// `allowedTools:` enforcement applies to the invoking session.
+#[tauri::command]
+async fn workflow_enforce_tools(name: String, allowed_tools: Vec<String>) -> Result<(), String> {
+    agent::subagent::register_workflow_tools(&name, allowed_tools);
+    Ok(())
 }
 
 fn knowledge_report(knowledge: &KnowledgeState) -> KnowledgeReport {
@@ -2589,14 +2854,53 @@ async fn session_delete_chat(
     Ok(())
 }
 
+/// One conversation record in a project chat's JSONL session log (camelCase
+/// over the wire, `{app_data}/sessions/…`). Only the fields the backend itself
+/// touches are carved out; everything else is preserved verbatim in `rest`, so
+/// an append→load round trip never drops client-side payload (the log is
+/// append-only and replay-safe by `turnId`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRecord {
+    /// Client-generated turn UUID; makes [`session_append`] idempotent (a
+    /// replay carrying the same `turnId` is a no-op instead of a duplicate).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    turn_id: String,
+    /// All other record fields (role, content, ts, done, kind, …), preserved
+    /// byte-for-byte across the model boundary.
+    #[serde(flatten)]
+    rest: std::collections::HashMap<String, Value>,
+}
+
+/// True if any JSONL line in `text` already carries the given client turn id.
+/// Used by [`session_append`] to make replays idempotent: a retried write for a
+/// turn the backend already recorded is a no-op instead of a duplicate.
+fn log_has_turn_id(text: &str, turn_id: &str) -> bool {
+    for line in text.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.get("turnId").and_then(|x| x.as_str()) == Some(turn_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Append one conversation record to the project+chat JSONL session log.
+/// Records carrying a client `turnId` are deduplicated: appending the same turn
+/// again is a no-op, so retried / replayed writes can never duplicate a turn.
 #[tauri::command]
 async fn session_append(
     app: AppHandle,
     project: String,
-    record: Value,
+    record: SessionRecord,
     chat_id: Option<String>,
 ) -> Result<(), String> {
+    let turn_id = if record.turn_id.is_empty() {
+        None
+    } else {
+        Some(record.turn_id.clone())
+    };
     let dir = app_data_dir(&app).join("sessions");
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
     let safe = session_key(&project);
@@ -2606,6 +2910,13 @@ async fn session_append(
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| e.to_string())?;
+    }
+    if let Some(tid) = &turn_id {
+        if let Ok(text) = tokio::fs::read_to_string(&file).await {
+            if log_has_turn_id(&text, tid) {
+                return Ok(());
+            }
+        }
     }
     let mut line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     line.push('\n');
@@ -2625,7 +2936,7 @@ async fn session_load(
     app: AppHandle,
     project: String,
     chat_id: Option<String>,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<SessionRecord>, String> {
     let dir = app_data_dir(&app).join("sessions");
     let file = session_file(&dir, &project, chat_id.as_deref());
     let Ok(text) = tokio::fs::read_to_string(&file).await else {
@@ -2633,7 +2944,7 @@ async fn session_load(
     };
     let mut out = Vec::new();
     for line in text.lines() {
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
+        if let Ok(v) = serde_json::from_str::<SessionRecord>(line) {
             out.push(v);
         }
     }
@@ -2800,6 +3111,7 @@ pub fn run() {
         .manage(ContextState::default())
         .manage(watcher::WatcherState::new())
         .manage(knowledge)
+        .manage(std::sync::Arc::new(terminal::TerminalSessions::new()))
         .setup(|app| {
             // Route every [BE]/[LLM] log line into (a) the rolling file
             // appender under the app-data `logs/` dir and (b) the in-app
@@ -2863,8 +3175,13 @@ pub fn run() {
             unload_model,
             model_status,
             stream_inference,
+            autocomplete_generate,
             cancel_inference,
             abort_agent_execution,
+            terminal_spawn,
+            terminal_write,
+            terminal_kill,
+            terminal_list,
             agent_run_task,
             agent_run_background,
             list_background_tasks,
@@ -2893,6 +3210,9 @@ pub fn run() {
             skill_set_active,
             skill_install,
             skill_uninstall,
+            agent_modes,
+            agent_workflows,
+            workflow_enforce_tools,
             agent_respond_permission,
             agent_respond_question,
             agent_audit_log,
@@ -2931,7 +3251,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_key, session_file, session_key};
+    use super::{chat_key, log_has_turn_id, session_file, session_key};
 
     #[test]
     fn session_key_matches_legacy_sanitization() {
@@ -2968,5 +3288,24 @@ mod tests {
             session_file(dir, "D:\\ai", Some("chat-1")),
             dir.join("D__ai").join("chat-1.jsonl")
         );
+    }
+
+    #[test]
+    fn turn_id_dedup_detects_replays() {
+        let log = concat!(
+            r#"{"role":"user","content":"hi","turnId":"turn-1"}"#,
+            "\n",
+            r#"{"role":"assistant","content":"hello","turnId":"turn-1"}"#,
+            "\n",
+            r#"{"role":"user","content":"second"}"#,
+            "\n",
+        );
+        assert!(log_has_turn_id(log, "turn-1"));
+        assert!(!log_has_turn_id(log, "turn-2"));
+        // Legacy records without a turn id never collide.
+        let legacy = r#"{"role":"user","content":"hi"}\n"#;
+        assert!(!log_has_turn_id(legacy, "turn-1"));
+        // No panic on a broken/unparseable line.
+        assert!(!log_has_turn_id("{{{not json\n{\"role\":\"user\"}\n", "turn-1"));
     }
 }

@@ -122,6 +122,55 @@ pub fn dest_path(models_dir: &Path, repo_id: &str, file_name: &str) -> PathBuf {
         .join(file_name.replace(['/', '\\'], "_"))
 }
 
+/// Destination folder for a repo under `models_dir`
+/// (`{models_dir}/{author}--{repo}/`), mirroring [`dest_path`]'s flat slug.
+pub fn repo_dir(models_dir: &Path, repo_id: &str) -> PathBuf {
+    let slug = repo_id.replace(['/', '\\'], "--");
+    models_dir.join(slug)
+}
+
+/// Best-effort fetch of a repo's `tokenizer.json` into its folder so the
+/// orchestrator can register exact token counts for a downloaded model.
+/// Tolerant: GGUF repos that do not ship a tokenizer (they inherit the base
+/// model's tokenizer) simply 404 and this returns `false` rather than failing
+/// the model download. Returns `true` when the tokenizer is on disk.
+pub async fn download_tokenizer(models_dir: &Path, repo_id: &str) -> bool {
+    let dest = repo_dir(models_dir, repo_id).join("tokenizer.json");
+    if dest.is_file() {
+        return true;
+    }
+    let url = format!("{HF_API_BASE}/{repo_id}/resolve/main/tokenizer.json");
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let resp = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) if !b.is_empty() => b,
+        _ => return false,
+    };
+    // tokenizer.json is a few MB at most; guard against a misrouted URL.
+    if bytes.len() > 50 * 1024 * 1024 {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(repo_dir(models_dir, repo_id));
+    match tokio::fs::write(&dest, &bytes).await {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// Progress callback payload handed to `download_file`.
 pub struct DownloadProgress {
     pub received: u64,

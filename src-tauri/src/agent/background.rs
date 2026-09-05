@@ -15,10 +15,12 @@ use super::orchestrator::{run_agent_loop_pool, AgentTaskRequest};
 use super::{BackgroundTaskEvent, ToolState};
 use crate::engine::{EnginePool, WorkerEvent};
 use crate::logging;
+use crate::remote::ProviderRegistry;
 
 /// Start a background agent task. The task runs on a dedicated native thread
 /// with its own cancellation token, completely independent of the foreground
-/// interrupt state. Returns the session id.
+/// interrupt state. Returns the session id. `role_registry` is an optional
+/// provider snapshot for runtime role routing (same as foreground tasks).
 pub fn start_background_task(
     pool: std::sync::Arc<EnginePool>,
     tool_state: &std::sync::Arc<ToolState>,
@@ -28,6 +30,8 @@ pub fn start_background_task(
     request: &AgentTaskRequest,
     context_messages: &[ContextMessage],
     context_budget: usize,
+    role_registry: Option<ProviderRegistry>,
+    tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<u64, String> {
     let session_id = interrupt_state.next_session();
     let label: String = request.prompt.chars().take(48).collect();
@@ -77,6 +81,8 @@ pub fn start_background_task(
             &context_snapshot,
             &request_clone,
             context_budget,
+            role_registry,
+            tokenizer,
         );
 
         match result {

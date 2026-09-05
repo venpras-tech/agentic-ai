@@ -2,24 +2,32 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 
 import type {
+  AgentMode,
   AgentToolEvent,
   ChatMessage,
   ContextUsage,
+  ImageAttachment,
   InferenceDone,
   QuestionRequest,
   StepTimelineStep,
   TodoUpdateEvent,
+  Workflow,
 } from "../types";
 import DiffView from "./DiffView";
 import MarkdownRenderer from "./MarkdownRenderer";
 import StatusIndicator from "./StatusIndicator";
 import { api } from "../lib/ipc";
 import type { ChatStatus } from "../lib/chatStatus";
+import { HANDOFF_OPTIONS, type HandoffChain } from "../lib/handoffChain";
 
 export interface SendOptions {
   planMode?: boolean;
   verify?: boolean;
   decompose?: boolean;
+  /** Base64 image attachments attached to this turn (vision providers). */
+  images?: ImageAttachment[];
+  /** Optional mode handoff chain (Plan→Act→Review auto-continuation). */
+  handoff?: HandoffChain;
 }
 
 interface ChatPanelProps {
@@ -35,11 +43,22 @@ interface ChatPanelProps {
   modelName: string | null;
   agentMode: boolean;
   onAgentModeChange: (v: boolean) => void;
+  /** User-defined agent modes (`.ai/modes/*.md`) for the current workspace. */
+  customModes?: AgentMode[];
+  /** Name of the active custom mode, or null for the default built-in mode. */
+  activeCustomMode?: string | null;
+  onCustomModeChange?: (name: string | null) => void;
+  /** User-defined workflows (`.ai/workflows/*.md`) invoked via `/name`. */
+  workflows?: Workflow[];
+  /** Build+enforce a workflow prompt; returns the effective text or null. */
+  onWorkflowInvoke?: (name: string, goal: string) => Promise<string | null>;
   onSend: (text: string, opts?: SendOptions) => void;
   onCancel: () => void;
   onClear: () => void;
   currentStep: number | null;
-  currentSubtask: { index: number; total: number; title: string } | null;
+  currentSubtask: import("../stores/agentRunStore").SubtaskRun | null;
+  /** Number of messages waiting to run after the current turn (queued while busy). */
+  queuedCount?: number;
   verify: boolean;
   onVerifyChange: (v: boolean) => void;
   /** YOLO sub-mode (Bionic §3.3): ROUTINE shell commands skip approval. */
@@ -71,6 +90,13 @@ interface ChatPanelProps {
   contextUsage?: ContextUsage | null;
   /** Called when files are dropped onto the chat panel. */
   onDropFiles?: (paths: string[]) => void;
+  /** Record a per-diff accept/reject decision in the chat store (shared with
+   *  the Changes panel so both views stay in sync). */
+  onDiffResolve: (
+    messageIndex: number,
+    diffIndex: number,
+    status: "accepted" | "rejected",
+  ) => void;
 }
 
 const SLASH_HINTS: { cmd: string; hint: string }[] = [
@@ -84,7 +110,104 @@ const SLASH_HINTS: { cmd: string; hint: string }[] = [
   { cmd: "/commit", hint: "checkpoint git commit" },
   { cmd: "/skills", hint: "open knowledge panel" },
   { cmd: "/clear", hint: "clear conversation" },
+  { cmd: "/bg", hint: "run a task in the background" },
+  { cmd: "/fork", hint: "fork this conversation into a background task" },
 ];
+
+/** Modes surfaced as a dropdown next to the composer. The selected mode
+ *  stamps the next message with the matching [`SendOptions`], replacing the
+ *  need to type `/plan`, `/act`, etc. */
+type SendMode =
+  | "general"
+  | "plan"
+  | "act"
+  | "decompose"
+  | "debug"
+  | "fix"
+  | "bug"
+  | "review"
+  | "test"
+  | "commit";
+
+const MODE_OPTIONS: { value: SendMode; label: string; title: string }[] = [
+  { value: "general", label: "General", title: "Plain conversation (no mode)" },
+  { value: "plan", label: "Plan", title: "Draft a plan, then approve to execute" },
+  { value: "act", label: "Act", title: "Execute a task with tools" },
+  { value: "decompose", label: "Decompose", title: "Break a large task into subtasks, then execute" },
+  { value: "debug", label: "Debug", title: "Find and fix a bug" },
+  { value: "fix", label: "Fix", title: "Diagnose, fix and verify" },
+  { value: "bug", label: "Bug", title: "Analyze a bug descriptor and propose a fix" },
+  { value: "review", label: "Review", title: "Review a file or diff for issues" },
+  { value: "test", label: "Test", title: "Run tests and fix failures" },
+  { value: "commit", label: "Commit", title: "Checkpoint git commit" },
+];
+
+/** Build [`SendOptions`] for a mode, honoring the current verify setting. */
+function optionsForMode(mode: SendMode, verify: boolean): SendOptions {
+  switch (mode) {
+    case "plan":
+      return { planMode: true };
+    case "act":
+      return { verify };
+    case "decompose":
+      return { decompose: true, verify };
+    case "debug":
+    case "fix":
+    case "bug":
+    case "test":
+      return { verify: true };
+    case "review":
+    case "commit":
+    case "general":
+    default:
+      return {};
+  }
+}
+
+/** Expand a mode into the actual prompt text sent to the model. */
+function promptForMode(mode: SendMode, arg: string): string {
+  switch (mode) {
+    case "act":
+      return arg || "Proceed with the approved plan.";
+    case "decompose":
+      return arg || "Decompose the approved task and complete it.";
+    case "fix":
+      return arg
+        ? `Diagnose and fix: ${arg}`
+        : "Diagnose the current state of the workspace and fix any problems you find.";
+    case "bug":
+      return (
+        "Investigate the reported bug carefully and produce a structured analysis. " +
+        "Trace the symptom to its root cause, identify the exact failing file(s)/line(s), " +
+        "explain the mechanism, then propose and apply a fix (use `analyze_bug` if available), " +
+        "and verify it. Bug report:\n" +
+        (arg || "A bug has been reported in the workspace — find it and fix it.")
+      );
+    case "debug":
+      return (
+        "Act as a debugger. Investigate the following as a potential defect, trace it to its " +
+        "root cause with concrete evidence, then propose and apply a fix and verify it. Report:\n" +
+        (arg || "A defect may exist in the workspace — investigate and fix it.")
+      );
+    case "review":
+      return (
+        "Perform a thorough code review of the target and report issues by severity: " +
+        "correctness, concurrency, error-handling, security, performance and style. " +
+        "Quote the relevant code, explain each finding, and suggest concrete fixes. " +
+        "Target:\n" +
+        (arg || "Review the workspace's most recently changed file(s).")
+      );
+    case "test":
+      return arg
+        ? `Run the test suite and fix any failures: ${arg}`
+        : "Run the project's test suite, then diagnose and fix any failures, then re-run to verify.";
+    case "commit":
+      return arg || "Create a git commit with a descriptive message summarizing the current uncommitted changes.";
+    case "plan":
+    default:
+      return arg;
+  }
+}
 
 const MAX_INPUT_CHARS = 1_000_000;
 
@@ -337,17 +460,37 @@ function QuestionCard({
   onRespond: (requestId: string, answer: string) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const copyTimer = useRef<number | null>(null);
 
   useEffect(() => {
     setDraft("");
     inputRef.current?.focus();
   }, [request.requestId]);
 
+  useEffect(
+    () => () => {
+      if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+
   const submit = () => {
     const text = draft.trim();
     if (!text) return;
     onRespond(request.requestId, text);
+  };
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(request.question);
+      setCopied(true);
+      if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // clipboard denied/unavailable — nothing sensible to do
+    }
   };
 
   return (
@@ -359,13 +502,22 @@ function QuestionCard({
         <span className="font-semibold uppercase tracking-wider text-zinc-400">
           The agent has a question
         </span>
-        <button
-          onClick={() => onRespond(request.requestId, "[no answer]")}
-          className="ml-auto shrink-0 rounded border border-border px-1.5 py-px text-[10px] font-medium text-zinc-400 hover:text-zinc-600"
-          title="Skip — the agent proceeds with its best judgment"
-        >
-          Skip
-        </button>
+        <div className="ml-auto flex shrink-0 gap-1">
+          <button
+            onClick={onCopy}
+            title="Copy question"
+            className="rounded border border-border px-1.5 py-px text-[10px] font-medium text-zinc-400 hover:text-zinc-600"
+          >
+            {copied ? "copied ✓" : "copy"}
+          </button>
+          <button
+            onClick={() => onRespond(request.requestId, "[no answer]")}
+            className="shrink-0 rounded border border-border px-1.5 py-px text-[10px] font-medium text-zinc-400 hover:text-zinc-600"
+            title="Skip — the agent proceeds with its best judgment"
+          >
+            Skip
+          </button>
+        </div>
       </div>
       <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-ink">
         {request.question}
@@ -416,22 +568,29 @@ function QuestionCard({
  *  file diffs. While `live`, the trailing text carries a pulsing caret. */
 function AssistantTurn({
   message,
+  index,
   live,
   liveText,
   pendingPlan,
   onApprovePlan,
   onRejectPlan,
+  onDiffResolve,
 }: {
   message: ChatMessage;
+  index: number;
   live: boolean;
   liveText: string;
   pendingPlan: { sessionId: number; planText: string } | null;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
+  onDiffResolve: (
+    messageIndex: number,
+    diffIndex: number,
+    status: "accepted" | "rejected",
+  ) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
-  const [bulkResolved, setBulkResolved] = useState<"accepted" | "rejected" | null>(null);
   const isError = message.role === "error";
   const { segments, unanchored } = useMemo(
     () =>
@@ -478,17 +637,16 @@ function AssistantTurn({
       <div className="mb-0.5 flex items-center gap-2 text-[10px] uppercase tracking-wider text-zinc-400">
         <span>{isError ? "error" : "assistant"}</span>
         {message.done && !isError && <OutcomeBadge outcome={message.done.outcome} />}
-        {(turnText.trim().length > 0 || live) && (
-          <div className="ml-auto flex shrink-0 gap-1">
-            <button
-              onClick={onCopy}
-              title="Copy response"
-              className="rounded border border-border px-1.5 py-px text-[9px] normal-case tracking-normal text-zinc-400 hover:text-zinc-600"
-            >
-              {copied ? "copied ✓" : "copy"}
-            </button>
-          </div>
-        )}
+        <div className="ml-auto flex shrink-0 gap-1">
+          <button
+            onClick={onCopy}
+            disabled={turnText.trim().length === 0}
+            title={turnText.trim().length === 0 ? "Nothing to copy" : "Copy response"}
+            className="rounded border border-border px-1.5 py-px text-[9px] normal-case tracking-normal text-zinc-400 hover:text-zinc-600 disabled:cursor-not-allowed disabled:text-zinc-300 disabled:hover:text-zinc-300"
+          >
+            {copied ? "copied ✓" : "copy"}
+          </button>
+        </div>
       </div>
       <div className="space-y-1.5">
         {segments.map((seg, i) =>
@@ -541,46 +699,71 @@ function AssistantTurn({
       )}
       {!isError && message.diffs && message.diffs.length > 0 && (
         <div className="mt-2 space-y-1">
-          {message.diffs.length > 1 && bulkResolved == null && (
-            <div className="flex items-center gap-1.5 rounded border border-border bg-panel-2/60 px-2 py-1">
-              <span className="text-[10px] text-zinc-400">Apply to all {message.diffs.length} files:</span>
-              <button
-                onClick={() => setBulkResolved("accepted")}
-                className="rounded bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-600 hover:bg-emerald-500/25"
-              >
-                Accept All
-              </button>
-              <button
-                onClick={(e) => {
-                  const diffs = message.diffs ?? [];
-                  void (async () => {
-                    for (const d of diffs) {
-                      if (!d.before) continue;
-                      try {
-                        await api.revertFile(d.path, d.before);
-                      } catch {}
-                    }
-                    setBulkResolved("rejected");
-                  })();
-                  e.currentTarget.blur();
-                }}
-                className="rounded bg-red-500/15 px-2 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-500/25"
-              >
-                Reject All
-              </button>
-            </div>
-          )}
-          {bulkResolved != null ? (
-            <p className="rounded border border-border bg-panel-2/60 px-2 py-1 text-[10px] text-zinc-500">
-              {bulkResolved === "accepted"
-                ? `Accepted all ${message.diffs.length} file diff${message.diffs.length !== 1 ? "s" : ""}.`
-                : `Reverted all ${message.diffs.length} file diff${message.diffs.length !== 1 ? "s" : ""}.`}
-            </p>
-          ) : (
-            message.diffs.map((d, di) => (
-              <DiffView key={`${d.path}-${di}`} path={d.path} diff={d.diff ?? ""} before={d.before} />
-            ))
-          )}
+          {(() => {
+            const all = message.diffs ?? [];
+            const pending = all.some((d) => !d.resolved);
+            const accepted = all.filter((d) => d.resolved === "accepted").length;
+            if (all.length > 1 && pending) {
+              return (
+                <div className="flex items-center gap-1.5 rounded border border-border bg-panel-2/60 px-2 py-1">
+                  <span className="text-[10px] text-zinc-400">
+                    Apply to all {all.length} files:
+                  </span>
+                  <button
+                    onClick={() => {
+                      all.forEach((_, di) =>
+                        onDiffResolve(index, di, "accepted"),
+                      );
+                    }}
+                    className="rounded bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-600 hover:bg-emerald-500/25"
+                  >
+                    Accept All
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      void (async () => {
+                        for (const d of all) {
+                          if (!d.before || d.resolved === "rejected") continue;
+                          try {
+                            await api.revertFile(d.path, d.before);
+                          } catch {}
+                        }
+                        all.forEach((_, di) =>
+                          onDiffResolve(index, di, "rejected"),
+                        );
+                      })();
+                      e.currentTarget.blur();
+                    }}
+                    className="rounded bg-red-500/15 px-2 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-500/25"
+                  >
+                    Reject All
+                  </button>
+                </div>
+              );
+            }
+            if (all.every((d) => d.resolved)) {
+              return (
+                <p className="rounded border border-border bg-panel-2/60 px-2 py-1 text-[10px] text-zinc-500">
+                  {accepted === all.length
+                    ? `Accepted all ${all.length} file diff${all.length !== 1 ? "s" : ""}.`
+                    : `${accepted}/${all.length} diff${all.length !== 1 ? "s" : ""} accepted — ${all.length - accepted} reverted.`}
+                </p>
+              );
+            }
+            return null;
+          })()}
+          {message.diffs.map((d, di) => (
+            <DiffView
+              key={`${d.path}-${di}`}
+              path={d.path}
+              diff={d.diff ?? ""}
+              before={d.before}
+              resolved={d.resolved ?? "pending"}
+              onResolved={(ok) =>
+                onDiffResolve(index, di, ok ? "accepted" : "rejected")
+              }
+            />
+          ))}
         </div>
       )}
       {message.done && (
@@ -619,13 +802,19 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
     status,
     lastDone,
     modelName,
-    agentMode,
-    onAgentModeChange,
+agentMode,
+  onAgentModeChange,
+  customModes,
+  activeCustomMode,
+  onCustomModeChange,
+  workflows,
+  onWorkflowInvoke,
     onSend,
     onCancel,
     onClear,
     currentStep,
     currentSubtask,
+    queuedCount = 0,
     verify,
     onVerifyChange,
     yolo = false,
@@ -648,15 +837,19 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
     onExportFormatChange,
     contextUsage,
     onDropFiles,
+    onDiffResolve,
   } = props;
   const [input, setInput] = useState("");
   const [inputError, setInputError] = useState<string | null>(null);
+  const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
   const scrollRef = useRef<VirtuosoHandle>(null);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const sendingRef = useRef(false);
   const historyRef = useRef<string[]>([]);
   const historyIdxRef = useRef<number>(-1);
+  const [mode, setMode] = useState<SendMode>("general");
+  const [handoff, setHandoff] = useState<HandoffChain>("none");
 
   const streamingText = activeSessionId != null ? (streams.get(activeSessionId) ?? "") : "";
   const totalLen =
@@ -688,9 +881,31 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
     };
   }, [onDropFiles]);
 
+  // --- context auto-suggest -------------------------------------------------
+  // The composer mode flips itself based on what the user is doing, but always
+  // yields to an explicit manual choice (we compare against the current value,
+  // so anything the user picked is left alone).
+  useEffect(() => {
+    if (mode !== "general") return;
+    const buggy =
+      /\b(bug|crash|panic|stack ?trace|segfault|exception|fails?|throw|error|broken|dumps)\b/i.test(
+        input,
+      );
+    setMode(buggy ? "debug" : "general");
+  }, [input, mode]);
+
+  useEffect(() => {
+    // A plan is on screen awaiting approval → the natural next step is to
+    // execute it, so suggest "Act" (never override an explicit choice).
+    setMode((cur) => (pendingPlan != null && cur === "general" ? "act" : cur));
+  }, [pendingPlan]);
+
   const submit = () => {
     const raw = input.trim();
-    if (!raw || isStreaming || sendingRef.current) return;
+    // Sending while the agent is busy is fine: `App.sendPrompt` queues the
+    // message and runs it once the current turn finishes (queued/steer).
+    // `sendingRef` only guards against double-submits within the same tick.
+    if (!raw || sendingRef.current) return;
     if (raw.length > MAX_INPUT_CHARS) {
       setInputError(
         `Message is too long (${raw.length.toLocaleString()} chars; max ${MAX_INPUT_CHARS.toLocaleString()}). Shorten it and try again.`,
@@ -771,15 +986,43 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
           onClear();
           setInput("");
           return;
-        default:
+        default: {
+          // User-defined workflows (`.ai/workflows/*.md`): `/name <goal>`.
+          if (onWorkflowInvoke && workflows && workflows.some((w) => w.name === cmd)) {
+            return void (async () => {
+              const goal = arg || "Execute the workflow on the current workspace.";
+              const prompt = await onWorkflowInvoke(cmd, goal);
+              if (prompt != null) {
+                onSend(prompt, { verify });
+              }
+              historyRef.current.push(raw);
+              historyIdxRef.current = -1;
+              setInput("");
+            })();
+          }
           break;
+        }
       }
     }
 
-    onSend(text, opts);
+    // When no slash command was recognised, stamp the send with the dropdown
+    // mode (except "general", which is a plain conversation). This is what lets
+    // users pick Plan/Act/Decompose/… from the composer instead of typing `/…`.
+    if (!opts && mode !== "general") {
+      text = promptForMode(mode, raw);
+      opts = optionsForMode(mode, verify);
+    }
+
+    // Attach any pasted images to this turn.
+    const images = pendingImages;
+    setPendingImages([]);
+    onSend(text, images.length ? { ...opts, images, ...(handoff !== "none" ? { handoff } : {}) } : { ...opts, ...(handoff !== "none" ? { handoff } : {}) });
     historyRef.current.push(raw);
     historyIdxRef.current = -1;
     setInput("");
+    // Reset the dropdown to General once the message is off — the next send is
+    // treated as a fresh, un-stamped turn unless the user (or context) re-picks.
+    setMode("general");
     // Reset dedup guard after a tick so the UI state can propagate.
     setTimeout(() => { sendingRef.current = false; }, 0);
   };
@@ -850,8 +1093,9 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
 
   return (
     <aside
-      className="flex h-full min-h-0 min-w-0 shrink-0 flex-col overflow-hidden border-l border-border bg-panel"
-      style={width != null ? { width, minWidth: 300, maxWidth: 720 } : undefined}
+      aria-label="Assistant chat"
+      className="flex h-full min-h-0 min-w-0 shrink flex-col overflow-hidden border-l border-border bg-panel"
+      style={width != null ? { width, flexBasis: width, minWidth: 300, maxWidth: 720 } : undefined}
     >
       <header className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-border px-3 py-1">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -883,6 +1127,21 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
             >
               YOLO
             </button>
+          )}
+          {customModes && customModes.length > 0 && (
+            <select
+              value={activeCustomMode ?? ""}
+              onChange={(e) => onCustomModeChange?.(e.target.value || null)}
+              title="Custom agent mode from .ai/modes/*.md — sets the system prompt and restricts tool access"
+              className="max-w-36 rounded border border-border bg-bg px-1.5 py-0.5 text-[10px] font-semibold text-zinc-600"
+            >
+              <option value="">Default</option>
+              {customModes.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name}
+                </option>
+              ))}
+            </select>
           )}
           <button
             onClick={() => onAgentModeChange(!agentMode)}
@@ -928,6 +1187,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
               <button
                 onClick={onExport}
                 title={`Export chat as ${exportFormat.toUpperCase()}`}
+                aria-label={`Export chat as ${exportFormat.toUpperCase()}`}
                 className="rounded border border-border px-1.5 py-0.5 text-[10px] text-zinc-500 hover:border-accent/50 hover:text-accent"
               >
                 ⤓ export
@@ -938,7 +1198,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
       </header>
 
       {messages.length === 0 && !isStreaming && (
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2 text-[12.5px]">
+        <div className="min-h-0 flex-1 overflow-y-auto py-2 pl-3 pr-6 text-[12.5px]">
           <p className="mt-6 text-center text-[11px] leading-relaxed text-zinc-400">
             Load a model and ask it anything.
             <br />
@@ -957,12 +1217,16 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
         <Virtuoso
           ref={scrollRef}
           data={messages}
-          className="min-h-0 flex-1 px-3 py-2 text-[12.5px]"
+          // Screen readers announce new turns as they stream into the log.
+          role="log"
+          aria-live="polite"
+          aria-label="Conversation"
+          className="min-h-0 flex-1 py-2 pl-3 pr-6 text-[12.5px]"
           followOutput={() => isAtBottom}
           atBottomStateChange={(isBottom) => setIsAtBottom(isBottom)}
           itemContent={(i, m) =>
             m.role === "user" ? (
-              <div key={i} className="group mb-2 flex justify-end">
+              <div key={i} className="group mb-2 mr-2 flex justify-end">
                 <div className="flex max-w-[85%] items-end gap-1">
                   <div
                     className={`whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-left text-zinc-800 ${
@@ -985,6 +1249,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
                         });
                       }}
                       title="Edit & resubmit"
+                      aria-label="Edit and resubmit this message"
                       className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-zinc-400 opacity-0 transition-opacity hover:border-border hover:text-zinc-600 group-hover:opacity-100"
                     >
                       ✎
@@ -997,6 +1262,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
                         setInput("");
                       }}
                       title="Cancel edit"
+                      aria-label="Cancel edit"
                       className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-red-400 hover:border-border hover:text-red-600"
                     >
                       ✕
@@ -1008,6 +1274,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
               <AssistantTurn
                 key={i}
                 message={m}
+                index={i}
                 live={isStreaming && m.sessionId === activeSessionId}
                 liveText={m.sessionId === activeSessionId ? streamingText : ""}
                 pendingPlan={
@@ -1017,6 +1284,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
                 }
                 onApprovePlan={onApprovePlan}
                 onRejectPlan={onRejectPlan}
+                onDiffResolve={onDiffResolve}
               />
             )
           }
@@ -1092,7 +1360,10 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
         )}
         {showingHints && (
           <div className="mb-1.5 flex flex-wrap gap-1">
-            {SLASH_HINTS.map((s) => (
+            {[
+              ...SLASH_HINTS,
+              ...(workflows ?? []).map((w) => ({ cmd: `/${w.name}`, hint: w.description })),
+            ].map((s) => (
               <button
                 key={s.cmd}
                 onClick={() => setInput(s.cmd + " ")}
@@ -1104,12 +1375,64 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
             ))}
           </div>
         )}
+        <div className="mb-1.5 flex items-center gap-1.5">
+          <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
+            Mode
+          </label>
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as SendMode)}
+            title="Stamps the next message with a mode — no need to type /plan, /act, …"
+            className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
+          >
+            {MODE_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value} title={o.title}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="mb-1.5 flex items-center gap-1.5">
+          <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
+            Handoff
+          </label>
+          <select
+            value={handoff}
+            onChange={(e) => setHandoff(e.target.value as HandoffChain)}
+            title="Automatically chain phases: plan → execute → review"
+            className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
+          >
+            {HANDOFF_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value} title={o.title}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <textarea
           value={input}
           maxLength={MAX_INPUT_CHARS}
           onChange={(e) => {
             setInput(e.target.value);
             if (inputError) setInputError(null);
+          }}
+          onPaste={(e) => {
+            const files = Array.from(e.clipboardData?.files ?? []);
+            const imgs = files.filter((f) => f.type.startsWith("image/"));
+            if (imgs.length === 0) return;
+            e.preventDefault();
+            for (const f of imgs) {
+              const reader = new FileReader();
+              reader.onload = () => {
+                if (typeof reader.result === "string") {
+                  setPendingImages((prev) => [
+                    ...prev,
+                    { dataUrl: reader.result as string, alt: f.name },
+                  ]);
+                }
+              };
+              reader.readAsDataURL(f);
+            }
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -1149,7 +1472,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
             editingIndex != null
               ? "Editing message… Enter to resubmit"
               : isStreaming
-                ? "Generating…"
+                ? "Generating… (Enter to queue the next message)"
                 : modelName
                   ? "Ask the model… (try /plan)"
                   : "Load a model first…"
@@ -1158,9 +1481,45 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
           disabled={!modelName}
           className="w-full resize-none rounded-md border border-border bg-panel-2 px-2.5 py-2 text-[12.5px] text-ink outline-none placeholder:text-zinc-500 focus:border-accent/60 disabled:opacity-50"
         />
+        {pendingImages.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {pendingImages.map((img, i) => (
+              <span
+                key={i}
+                className="group relative h-14 w-14 overflow-hidden rounded border border-border"
+                title={img.alt}
+              >
+                <img
+                  src={img.dataUrl}
+                  alt={img.alt ?? "pasted image"}
+                  className="h-full w-full object-cover"
+                />
+                <button
+                  onClick={() =>
+                    setPendingImages((prev) => prev.filter((_, idx) => idx !== i))
+                  }
+                  aria-label="Remove image"
+                  className="absolute right-0.5 top-0.5 hidden h-4 w-4 items-center justify-center rounded-full bg-black/60 text-[9px] leading-none text-white group-hover:flex"
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+            <span className="text-[10px] text-zinc-400">
+              {pendingImages.length} image{pendingImages.length === 1 ? "" : "s"} attached
+            </span>
+          </div>
+        )}
         {inputError && (
           <p className="mt-1 rounded border border-amber-400/40 bg-amber-50 px-2 py-1 text-[10px] leading-snug text-amber-700">
             {inputError}
+          </p>
+        )}
+        {queuedCount > 0 && (
+          <p className="mt-1 flex items-center gap-1 text-[10px] text-cyan-700">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-500" />
+            {queuedCount} message{queuedCount === 1 ? "" : "s"} queued — will run
+            when the current turn finishes
           </p>
         )}
         <div className="mt-2 flex items-center justify-between">
@@ -1168,6 +1527,7 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
             <button
               onClick={onAttachClick}
               title="Attach a text file for semantic search (RAG)"
+              aria-label="Attach a text file for semantic search"
               className="mr-1 rounded border border-border px-1.5 py-0.5 text-[11px] text-zinc-500 hover:border-accent/50 hover:text-accent"
             >
               📎
@@ -1176,6 +1536,13 @@ export default function ChatPanel(props: ChatPanelProps) {  const {
           <button
             onClick={() => void toggleDictation()}
             disabled={transcribing}
+            aria-label={
+              transcribing
+                ? "Transcribing"
+                : recording
+                  ? "Stop recording and transcribe"
+                  : "Dictate (requires local whisper and ffmpeg)"
+            }
             title={
               transcribing
                 ? "Transcribing…"

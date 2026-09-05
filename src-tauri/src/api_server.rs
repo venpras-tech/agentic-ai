@@ -187,6 +187,7 @@ fn complete(
     let request = crate::engine::InferenceRequest {
         prompt: prompt.to_string(),
         messages: None,
+        images: None,
         max_tokens,
         temperature: None,
         top_p: None,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import TitleBar from "./components/TitleBar";
 import MenuBar from "./components/MenuBar";
@@ -6,6 +6,7 @@ import ModelBar from "./components/ModelBar";
 import FileExplorer from "./components/FileExplorer";
 import ProjectsPanel from "./components/ProjectsPanel";
 import EditorPane from "./components/EditorPane";
+import type { PendingDiffSection } from "./components/HunkDecorations";
 import ChatPanel from "./components/ChatPanel";
 import StatusBar from "./components/StatusBar";
 import Tabs from "./components/Tabs";
@@ -14,9 +15,18 @@ import PermissionModal from "./components/PermissionModal";
 import KnowledgePanel from "./components/KnowledgePanel";
 import SettingsModal from "./components/SettingsModal";
 import ConsolePanel from "./components/ConsolePanel";
+import TerminalPanel from "./components/TerminalPanel";
 import ResizeHandle from "./components/ResizeHandle";
 import BackgroundTasks from "./components/BackgroundTasks";
+import ChangesPanel from "./components/ChangesPanel";
+import SessionResumePanel from "./components/SessionResumePanel";
+import ThreadsPanel from "./components/ThreadsPanel";
+import CommandPalette, {
+  type PaletteAction,
+  type PaletteSkill,
+} from "./components/CommandPalette";
 import type { ConsoleEntry } from "./components/ConsolePanel";
+import ExecutionGraphPanel from "./components/ExecutionGraphPanel";
 
 import { useEngineEvents } from "./hooks/useEngineEvents";
 import { useTokenStream } from "./hooks/useTokenStream";
@@ -28,34 +38,40 @@ import {
 } from "./lib/consoleBus";
 import { listen } from "@tauri-apps/api/event";
 import { EVT_CONTEXT_TRIMMED } from "./lib/events";
-import {
-  initialChatStatus,
-  reduceChatStatus,
-} from "./lib/chatStatus";
-import { api, isTauriRuntime } from "./lib/ipc";
+import { api, isTauriRuntime, type SessionAppendRecord } from "./lib/ipc";
 import { exportConversation } from "./lib/exportChat";
-import { AGENT_SYSTEM_PROMPT } from "./lib/prompt";
 import { recordsToMessages } from "./lib/session";
+import { useCustomModes } from "./stores/customModes";
+import { useModelStore } from "./stores/modelStore";
+import { usePolicyStore } from "./stores/policyStore";
+import { currentOpenFiles, useFilesStore } from "./stores/filesStore";
+import { runStreaming, useAgentRunStore } from "./stores/agentRunStore";
+import { useChatStatusStore } from "./stores/chatStatusStore";
+import { useExecGraphStore } from "./stores/execGraphStore";
+import { useTranscriptStore } from "./stores/transcriptStore";
+import {
+  handoffPrompt,
+  nextChainStep,
+  stepNeedsApproval,
+  type HandoffChain,
+} from "./lib/handoffChain";
 import type {
   BackgroundTaskInfo,
-  ChatMessage,
   ContextUsage,
   FileChangedEvent,
   GenParams,
-  InferenceDone,
+  ImageAttachment,
   KnowledgeReport,
   LedgerEntry,
-  ModelInfo,
-  OpenFile,
   PermissionRequest,
   PlanStepEvent,
-  PolicySnapshot,
   QuestionRequest,
   RemoteModelConfig,
   StepEvent,
   SubtaskEvent,
   TodoUpdateEvent,
   ToolOutputEvent,
+  Workflow,
 } from "./types";
 
 const DEFAULT_PARAMS: GenParams = {
@@ -68,31 +84,113 @@ const DEFAULT_PARAMS: GenParams = {
   maxTokens: 1024,
 };
 
+/**
+ * Client-generated turn UUID. Both halves of a turn (user prompt + assistant
+ * answer / error) share one id; the backend uses it to make `sessionAppend`
+ * idempotent, so a retried write never duplicates a recorded turn.
+ */
+function newTurnId(): string {
+  const g = globalThis as { crypto?: { randomUUID?: () => string } };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export default function App() {
   const { streams, append, clearStream, clearAll } = useTokenStream();
   const streamsRef = useRef(streams);
   streamsRef.current = streams;
 
-  const [model, setModel] = useState<ModelInfo | null>(null);
+  // ---- model state (Zustand store, see ./stores/modelStore.ts) ----
+  const model = useModelStore((s) => s.model);
+  const setModel = useModelStore((s) => s.setModel);
   // GGUF path currently loaded (shown next to the Load/Unload button), plus
   // the most recent local path so it stays visible while no model is loaded.
-  const [modelPath, setModelPath] = useState<string | null>(null);
-  const [lastLocalPath, setLastLocalPath] = useState<string | null>(null);
-  const [modelLoading, setModelLoading] = useState(false);
-  const [loadProgress, setLoadProgress] = useState<number | null>(null);
-  const [workspaces, setWorkspaces] = useState<string[]>([]);
-  const workspaceRoot = workspaces[0] ?? null;
-  const [files, setFiles] = useState<OpenFile[]>([]);
-  const filesRef = useRef(files);
-  filesRef.current = files;
-  const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const modelPath = useModelStore((s) => s.modelPath);
+  const setModelPath = useModelStore((s) => s.setModelPath);
+  const lastLocalPath = useModelStore((s) => s.lastPath);
+  const setLastLocalPath = useModelStore((s) => s.setLastPath);
+  const modelLoading = useModelStore((s) => s.loading);
+  const setModelLoading = useModelStore((s) => s.setLoading);
+  const loadProgress = useModelStore((s) => s.progress);
+  const setLoadProgress = useModelStore((s) => s.setProgress);
+  const recentModels = useModelStore((s) => s.recentModels);
+  const setRecentModels = useModelStore((s) => s.setRecentModels);
+  const pushRecentModel = useModelStore((s) => s.pushRecentModel);
+const [workspaces, setWorkspaces] = useState<string[]>([]);
+const workspaceRoot = workspaces[0] ?? null;
+/** User-defined agent modes for the current workspace (`.ai/modes/*.md`) —
+ *  owned by the `useCustomModes` Zustand slice. */
+const customModes = useCustomModes((s) => s.customModes);
+const activeCustomMode = useCustomModes((s) => s.activeCustomMode);
+const modeAwareSystemPrompt = useCustomModes((s) => s.modeAwareSystemPrompt);
+const applyCustomMode = useCustomModes((s) => s.applyCustomMode);
+
+/** User-defined workflows (`.ai/workflows/*.md`) invoked via `/name`. */
+const [workflows, setWorkflows] = useState<Workflow[]>([]);
+
+/** Reload custom modes whenever the workspace changes. */
+useEffect(() => {
+  void useCustomModes.getState().syncWithWorkspace(workspaceRoot);
+  if (!isTauriRuntime() || !workspaceRoot) {
+    setWorkflows([]);
+    return;
+  }
+  api
+    .workflowsLoad()
+    .then(setWorkflows)
+    .catch(() => setWorkflows([]));
+}, [workspaceRoot]);
+
+/**
+ * Invoke a user workflow (`/name <goal>`): enforce its `allowedTools:`
+ * allow-list on the backend, then build the effective prompt (directive +
+ * goal) so the agent runs scoped to the workflow's tools.
+ */
+const invokeWorkflow = useCallback(
+  async (name: string, goal: string) => {
+    const wf = workflows.find((w) => w.name === name);
+    if (!wf) return null;
+    if (isTauriRuntime() && wf.allowedTools.length > 0) {
+      await api.workflowEnforceTools(wf.name, wf.allowedTools).catch(() => {});
+    }
+    const directive =
+      wf.systemPrompt.trim() ||
+      `You are executing the \`${wf.name}\` workflow. Follow the workflow's steps carefully, verify after each change, and report what you did.`;
+    return `${directive}\n\nGoal: ${goal}`;
+  },
+  [workflows],
+);
+  const files = useFilesStore((s) => s.files);
+  const filesStoreOpen = useFilesStore((s) => s.openFile);
+  const filesStoreNew = useFilesStore((s) => s.newFile);
+  const filesStoreClose = useFilesStore((s) => s.closeFile);
+  const filesUpdateContent = useFilesStore((s) => s.updateContent);
+  const filesSyncSaved = useFilesStore((s) => s.syncSaved);
+  const filesMarkSavedAs = useFilesStore((s) => s.markSavedAs);
+  const filesMarkSaved = useFilesStore((s) => s.markSaved);
+  const filesSetActive = useFilesStore((s) => s.setActive);
+  const activeKey = useFilesStore((s) => s.activeKey);
+  // Per-hunk resolution for authored diffs in Monaco: map of hunk key ->
+  // whether it should be kept (applied). Absent keys default to "kept".
+  const [hunkResolution, setHunkResolution] = useState<Record<string, boolean>>({});
+  // Chat transcript, execution graph and turn-lifecycle state each live in a
+  // pure reducer hosted by a Zustand store (lib/chatReducer.ts, lib/execGraph.ts,
+  // lib/chatStatus.ts), so every event-handler transition is testable and the
+  // UI never mutates state inline. Selectors subscribe only to slices they use.
+  const messages = useTranscriptStore((s) => s.messages);
+  const ledger = useTranscriptStore((s) => s.ledger);
+  const dispatchTranscript = useTranscriptStore((s) => s.dispatch);
+  const execGraph = useExecGraphStore((s) => s.graph);
+  const dispatchExecGraph = useExecGraphStore((s) => s.dispatch);
   // Latest messages for event handlers (avoids stale-closure session lookups).
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [lastDone, setLastDone] = useState<InferenceDone | null>(null);
+  const activeSessionId = useAgentRunStore((s) => s.activeSessionId);
+  const setActiveSessionId = useAgentRunStore((s) => s.setActiveSessionId);
+  const isStreaming = useAgentRunStore((s) => s.isStreaming);
+  const setIsStreaming = useAgentRunStore((s) => s.setIsStreaming);
+  const lastDone = useAgentRunStore((s) => s.lastDone);
+  const setLastDone = useAgentRunStore((s) => s.setLastDone);
   const [genParams, setGenParams] = useState<GenParams>(DEFAULT_PARAMS);
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
@@ -100,33 +198,36 @@ export default function App() {
   const [permissionReq, setPermissionReq] = useState<PermissionRequest | null>(null);
   const [questionReq, setQuestionReq] = useState<QuestionRequest | null>(null);
   const [fileChangeNotice, setFileChangeNotice] = useState(false);
-  const [policy, setPolicy] = useState<PolicySnapshot | null>(null);
+  const policy = usePolicyStore((s) => s.policy);
   const [knowledge, setKnowledge] = useState<KnowledgeReport | null>(null);
   const [showKnowledge, setShowKnowledge] = useState(false);
   const [savedRemote, setSavedRemote] = useState<RemoteModelConfig | null>(null);
-  const [currentStep, setCurrentStep] = useState<number | null>(null);
-  const [currentSubtask, setCurrentSubtask] = useState<{
-    index: number;
-    total: number;
-    title: string;
-  } | null>(null);
+  const currentStep = useAgentRunStore((s) => s.currentStep);
+  const setCurrentStep = useAgentRunStore((s) => s.setCurrentStep);
+  const currentSubtask = useAgentRunStore((s) => s.currentSubtask);
+  const setCurrentSubtask = useAgentRunStore((s) => s.setCurrentSubtask);
+  const runningSubtasks = useAgentRunStore((s) => s.runningSubtasks);
+  const upsertSubtask = useAgentRunStore((s) => s.upsertSubtask);
+  const removeSubtask = useAgentRunStore((s) => s.removeSubtask);
   const [verify, setVerify] = useState(true);
   const [yolo, setYolo] = useState(false);
   const [attachments, setAttachments] = useState<
     { path: string; chunkCount: number }[]
   >([]);
   const [explorerRefresh, setExplorerRefresh] = useState(0);
-  const [recentModels, setRecentModels] = useState<string[]>([]);
   const [pendingPlan, setPendingPlan] = useState<{
     sessionId: number;
     planText: string;
   } | null>(null);
-  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [checkpoints, setCheckpoints] = useState<
     { hash: string; subject: string; relative: string }[]
   >([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showConsole, setShowConsole] = useState(false);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [showGraph, setShowGraph] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteMode, setPaletteMode] = useState<"commands" | "files">("commands");
   // Adjustable pane sizes (drag the separator strips). Defaults mirror the
   // old fixed classes: sidebar w-60, chat w-96, console h-48.
   const [sidebarW, setSidebarW] = useState(240);
@@ -138,17 +239,20 @@ export default function App() {
   // BN-11 projects/chats sidebar: which left-rail view is active and which
   // chat (per project) the composer writes into. null chat id = the default
   // (legacy) chat log.
-  const [leftView, setLeftView] = useState<"files" | "chats">("files");
+  const [leftView, setLeftView] = useState<
+    "files" | "chats" | "changes" | "resume" | "threads"
+  >("files");
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [chatsRefresh, setChatsRefresh] = useState(0);
   // Chat turn lifecycle for the animated status line (lib/chatStatus.ts).
-  const [chatStatus, dispatchChatStatus] = useReducer(
-    reduceChatStatus,
-    initialChatStatus,
-  );
+  const chatStatus = useChatStatusStore((s) => s.status);
+  const dispatchChatStatus = useChatStatusStore((s) => s.dispatch);
   // P2-12: background tasks running independently of the foreground chat.
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskInfo[]>([]);
   const bgSessionIdsRef = useRef(new Set<number>());
+  // Messages submitted while the agent is busy are queued in agentRunStore and
+  // flushed serially once a turn ends.
+  const queuedCount = useAgentRunStore((s) => s.queuedCount);
   const [isSwitching, setIsSwitching] = useState(false);
   const [contextTrimNotice, setContextTrimNotice] = useState(false);
   const settingsSaveTimerRef = useRef<number | null>(null);
@@ -159,13 +263,27 @@ export default function App() {
   agentModeRef.current = agentMode;
   const verifyRef = useRef(verify);
   verifyRef.current = verify;
-  const isStreamingRef = useRef(isStreaming);
-  isStreamingRef.current = isStreaming;
   const planSessionRef = useRef<number | null>(null);
   const planPromptRef = useRef<string | null>(null);
+  /** Active mode-handoff chains, keyed by the session id of the phase that is
+   *  currently executing. On that phase's `onDone` we auto-advance to the next
+   *  phase (Plan→Act→Review), carrying the prior phase's result. */
+  const handoffRef = useRef<
+    Map<number, { chain: HandoffChain; index: number; basePrompt: string }>
+  >(new Map());
+  /** Chain context for a Plan phase awaiting "Approve & Execute" approval. */
+  const pendingHandoffRef = useRef<{
+    chain: HandoffChain;
+    index: number;
+    basePrompt: string;
+  } | null>(null);
   const sessionStartRef = useRef<Map<number, number>>(new Map());
   const sessionLabelRef = useRef<Map<number, string>>(new Map());
   const sessionHasStepsRef = useRef<Map<number, boolean>>(new Map());
+  /** Maps a backend session id to the client turn UUID it belongs to, so the
+   * assistant-answer record can carry the same `turnId` as its user prompt.
+   * (This is what makes `sessionAppend` replays idempotent on the backend.) */
+  const sessionTurnRef = useRef<Map<number, string>>(new Map());
 
   const refreshUsage = useCallback(() => {
     api
@@ -174,37 +292,33 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  const refreshPolicy = useCallback(() => {
-    api
-      .agentPolicySnapshot()
-      .then(setPolicy)
-      .catch(() => {});
-  }, []);
+  const refreshPolicy = usePolicyStore((s) => s.refreshPolicy);
 
   // Editor sync: when the agent writes/diffs a file that is currently open,
   // re-read it from disk so the Monaco editor shows the agent's changes.
   const syncAgentFile = useCallback(
     (e: FileChangedEvent) => {
       const path = e.path.replaceAll("\\", "/");
-      if (!filesRef.current.some((f) => f.path && f.path.replaceAll("\\", "/") === path)) {
+      if (
+        !currentOpenFiles().some((f) => f.path && f.path.replaceAll("\\", "/") === path)
+      ) {
         return;
       }
       void api
         .readTextFile(e.path)
         .then((data) => {
-          setFiles((cur) =>
-            cur.map((f) =>
-              f.path &&
-              f.path.replaceAll("\\", "/") === path &&
-              f.content !== data.content
-                ? { ...f, content: data.content, saved: true }
-                : f,
-            ),
-          );
+          const id = currentOpenFiles().find(
+            (f) => f.path && f.path.replaceAll("\\", "/") === path,
+          )?.id;
+          if (!id) return;
+          const cur = currentOpenFiles().find((f) => f.id === id);
+          if (cur && cur.content !== data.content) {
+            filesSyncSaved(id, data.content);
+          }
         })
         .catch(() => {});
     },
-    [],
+    [filesSyncSaved],
   );
 
   useEngineEvents({
@@ -228,49 +342,59 @@ export default function App() {
       setCurrentStep(null);
       sessionStartRef.current.set(e.sessionId, performance.now());
       dispatchChatStatus({ type: "started", sessionId: e.sessionId, at: performance.now() });
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "", sessionId: e.sessionId },
-      ]);
+      dispatchTranscript({
+        type: "push",
+        message: { role: "assistant", content: "", sessionId: e.sessionId },
+      });
     },
     onDone: (e) => {
       if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const text = streamsRef.current.get(e.sessionId) ?? "";
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.sessionId === e.sessionId
-            ? { ...m, content: text, done: e.done, ts: Date.now() }
-            : m,
-        ),
-      );
+      const turnId = sessionTurnRef.current.get(e.sessionId);
+      sessionTurnRef.current.delete(e.sessionId);
+      dispatchTranscript({
+        type: "mergeById",
+        sessionId: e.sessionId,
+        patch: { content: text, done: e.done, ts: Date.now(), ...(turnId ? { turnId } : {}) },
+      });
       clearStream(e.sessionId);
       setActiveSessionId(null);
       setIsStreaming(false);
       setCurrentStep(null);
       setLastDone(e.done);
-      setLedger((prev) => {
-        const start = sessionStartRef.current.get(e.sessionId);
-        const label = sessionLabelRef.current.get(e.sessionId) ?? "task";
-        const hasSteps = sessionHasStepsRef.current.get(e.sessionId) ?? false;
-        sessionStartRef.current.delete(e.sessionId);
-        sessionLabelRef.current.delete(e.sessionId);
-        sessionHasStepsRef.current.delete(e.sessionId);
-        const existing = prev.find((l) => l.sessionId === e.sessionId);
-        const stepTokens = existing?.tokens ?? 0;
-        const entry: LedgerEntry = {
-          sessionId: e.sessionId,
-          label,
-          tokens: hasSteps ? stepTokens : e.done.totalTokens,
-          toolCalls: existing?.toolCalls ?? 0,
-          elapsedMs: start != null ? Math.round(performance.now() - start) : e.done.elapsedMs,
-        };
-        return existing
-          ? prev.map((l) => (l.sessionId === e.sessionId ? entry : l))
-          : [...prev, entry];
-      });
+      const start = sessionStartRef.current.get(e.sessionId);
+      const label = sessionLabelRef.current.get(e.sessionId) ?? "task";
+      const hasSteps = sessionHasStepsRef.current.get(e.sessionId) ?? false;
+      sessionStartRef.current.delete(e.sessionId);
+      sessionLabelRef.current.delete(e.sessionId);
+      sessionHasStepsRef.current.delete(e.sessionId);
+      const entry: LedgerEntry = {
+        sessionId: e.sessionId,
+        label,
+        tokens: hasSteps ? (ledger.find((l) => l.sessionId === e.sessionId)?.tokens ?? 0) : e.done.totalTokens,
+        toolCalls: ledger.find((l) => l.sessionId === e.sessionId)?.toolCalls ?? 0,
+        elapsedMs: start != null ? Math.round(performance.now() - start) : e.done.elapsedMs,
+      };
+      dispatchTranscript({ type: "ledgerSet", entry });
       if (planSessionRef.current === e.sessionId) {
         planSessionRef.current = null;
         setPendingPlan({ sessionId: e.sessionId, planText: text });
+      }
+      // Mode-handoff: a completing phase may auto-continue to the next phase.
+      const handoffEntry = handoffRef.current.get(e.sessionId);
+      if (handoffEntry) {
+        handoffRef.current.delete(e.sessionId);
+        const next = nextChainStep(handoffEntry.chain, handoffEntry.index);
+        // Plan steps require explicit user approval (handled by the plan
+        // approval flow) — only auto-advance to non-plan phases here.
+        if (next && !stepNeedsApproval(next)) {
+          const nextOpts =
+            next === "review" ? { verify: true, handoff: handoffEntry.chain } : { handoff: handoffEntry.chain };
+          void runAgentTaskRef.current(
+            handoffPrompt(handoffEntry.basePrompt, text),
+            nextOpts,
+          );
+        }
       }
       api
         .contextPushTurn("assistant", text)
@@ -282,6 +406,7 @@ export default function App() {
           content: text,
           ts: Date.now(),
           done: e.done,
+          ...(turnId ? { turnId } : {}),
         }, activeChatId)
         .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
@@ -291,24 +416,25 @@ export default function App() {
       if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const text = streamsRef.current.get(e.sessionId) ?? "";
       const body = `${text}${text ? "\n" : ""}⚠ ${e.message}`;
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.sessionId === e.sessionId
-            ? { ...m, content: body, role: "error" as const, ts: Date.now() }
-            : m,
-        ),
-      );
+      const turnId = sessionTurnRef.current.get(e.sessionId);
+      sessionTurnRef.current.delete(e.sessionId);
+      dispatchTranscript({
+        type: "mergeById",
+        sessionId: e.sessionId,
+        patch: { content: body, role: "error", ts: Date.now(), ...(turnId ? { turnId } : {}) },
+      });
       clearStream(e.sessionId);
       setActiveSessionId(null);
       setIsStreaming(false);
       setError(e.message);
       dispatchChatStatus({ type: "error", message: e.message, at: performance.now() });
-      // Persist the failed turn too so restored chats show what went wrong.
+// Persist the failed turn too so restored chats show what went wrong.
       api
         .sessionAppend(workspaceRoot ?? "default", {
           role: "error",
           content: body,
           ts: Date.now(),
+          ...(turnId ? { turnId } : {}),
         }, activeChatId)
         .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
@@ -335,41 +461,31 @@ export default function App() {
       })();
       if (targetSessionId == null) return;
       const sid = targetSessionId;
-      setLedger((prev) => {
-        const idx = prev.findIndex((l) => l.sessionId === sid);
-        const entry: LedgerEntry = {
-          sessionId: sid,
-          label: sessionLabelRef.current.get(sid) ?? "task",
-          tokens: idx >= 0 ? prev[idx].tokens : 0,
-          toolCalls: (idx >= 0 ? prev[idx].toolCalls : 0) + 1,
-          elapsedMs: idx >= 0 ? prev[idx].elapsedMs : 0,
-        };
-        return idx >= 0
-          ? prev.map((l) => (l.sessionId === sid ? entry : l))
-          : [...prev, entry];
+      dispatchTranscript({
+        type: "ledgerTool",
+        sessionId: sid,
+        label: sessionLabelRef.current.get(sid) ?? "task",
       });
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.sessionId === sid
-            ? {
-                ...m,
-                tools: (m.tools ?? []).some((t) => t.id === e.id)
-                  ? (m.tools ?? []).map((t) =>
-                      t.id === e.id ? { ...t, ...e, output: t.output } : t,
-                    )
-                  : [
-                      ...(m.tools ?? []),
-                      {
-                        ...e,
-                        // Anchor the call at the current end of the streamed
-                        // text so the UI can interleave it inline.
-                        atChar: (streamsRef.current.get(sid) ?? "").length,
-                      },
-                    ],
-              }
-            : m,
-        ),
-      );
+      dispatchTranscript({
+        type: "tool",
+        sessionId: sid,
+        tool: {
+          ...e,
+          // Anchor the call at the current end of the streamed text so the
+          // UI can interleave it inline.
+          atChar: (streamsRef.current.get(sid) ?? "").length,
+        },
+      });
+      // Mirror the call into the live execution graph for the active run.
+      if (sid === activeSessionId) {
+        dispatchExecGraph({
+          type: "tool",
+          id: e.id,
+          name: e.tool,
+          status: e.status,
+          summary: e.summary,
+        });
+      }
     },
     onStep: (e: StepEvent) => {
       if (bgSessionIdsRef.current.has(e.sessionId)) return;
@@ -382,39 +498,26 @@ export default function App() {
         group: e.step.group,
         at: performance.now(),
       });
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.sessionId === e.sessionId
-            ? {
-                ...m,
-                steps: [
-                  ...(m.steps ?? []),
-                  {
-                    step: e.step.step,
-                    group: e.step.group,
-                    tokens: e.step.tokens,
-                    elapsedMs: e.step.elapsedMs,
-                    toolCalls: e.step.toolCalls,
-                  },
-                ],
-              }
-            : m,
-        ),
-      );
-      setLedger((prev) => {
-        const sid = e.sessionId;
-        const idx = prev.findIndex((l) => l.sessionId === sid);
-        const entry: LedgerEntry = {
-          sessionId: sid,
-          label: sessionLabelRef.current.get(sid) ?? "task",
-          tokens: (idx >= 0 ? prev[idx].tokens : 0) + e.step.tokens,
-          toolCalls: idx >= 0 ? prev[idx].toolCalls : 0,
-          elapsedMs: idx >= 0 ? prev[idx].elapsedMs : 0,
-        };
-        return idx >= 0
-          ? prev.map((l) => (l.sessionId === sid ? entry : l))
-          : [...prev, entry];
+      dispatchTranscript({
+        type: "appendStep",
+        sessionId: e.sessionId,
+        step: {
+          step: e.step.step,
+          group: e.step.group,
+          tokens: e.step.tokens,
+          elapsedMs: e.step.elapsedMs,
+          toolCalls: e.step.toolCalls,
+        },
       });
+      dispatchTranscript({
+        type: "ledgerTokens",
+        sessionId: e.sessionId,
+        label: sessionLabelRef.current.get(e.sessionId) ?? "task",
+        tokens: e.step.tokens,
+      });
+      if (e.sessionId === activeSessionId) {
+        dispatchExecGraph({ type: "step", group: e.step.group });
+      }
     },
     onSubtask: (e: SubtaskEvent) => {
       dispatchChatStatus({
@@ -425,37 +528,50 @@ export default function App() {
         status: e.subtask.status,
         at: performance.now(),
       });
+      dispatchExecGraph({
+        type: "subtask",
+        index: e.subtask.index,
+        total: e.subtask.total,
+        title: e.subtask.title,
+        status: e.subtask.status,
+      });
       if (e.subtask.status === "running") {
-        setCurrentSubtask({
-          index: e.subtask.index,
-          total: e.subtask.total,
-          title: e.subtask.title,
-        });
+        const { index, total, title, model, tool } = e.subtask;
+        const prev = useAgentRunStore.getState().currentSubtask;
+        const same =
+          prev != null &&
+          prev.index === index &&
+          prev.total === total &&
+          prev.title === title;
+        const startedAt =
+          same && prev.startedAt != null
+            ? prev.startedAt
+            : Date.now() - (e.subtask.elapsedMs ?? 0);
+        setCurrentSubtask({ index, total, title, model, tool, startedAt });
+        upsertSubtask({ index, total, title, model, tool, startedAt });
       } else {
         setCurrentSubtask(null);
+        removeSubtask(e.subtask.index, e.subtask.total);
       }
     },
     onPlanStep: (e: PlanStepEvent) => {
       if (activeSessionId == null) return;
       if (bgSessionIdsRef.current.has(e.sessionId)) return;
       const sid = activeSessionId;
-      setMessages((prev) =>
-        prev.map((m) => {
-          if (m.sessionId !== sid) return m;
-          const group = `Plan · ${e.title}`;
-          const existing = m.steps ?? [];
-          if (e.status === "in_progress") {
-            return {
-              ...m,
-              steps: [
-                ...existing,
-                { step: existing.length + 1, group, tokens: 0, elapsedMs: 0, toolCalls: 0 },
-              ],
-            };
-          }
-          return m;
-        }),
-      );
+      if (e.status === "in_progress") {
+        dispatchTranscript({
+          type: "appendPlanStep",
+          sessionId: sid,
+          group: `Plan · ${e.title}`,
+        });
+      }
+      dispatchExecGraph({
+        type: "planStep",
+        planId: e.planId,
+        itemIndex: e.itemIndex,
+        title: e.title,
+        status: e.status,
+      });
     },
     onTodoUpdate: (e: TodoUpdateEvent) => {
       setTodos(e);
@@ -488,40 +604,13 @@ export default function App() {
       const sid = activeSessionId;
       if (bgSessionIdsRef.current.has(sid)) return;
       if (e.tool !== "execute_terminal_command" && e.tool !== "run_tests") return;
-      setMessages((prev) =>
-        prev.map((m) => {
-          if (m.sessionId !== sid) return m;
-          const tools = m.tools ?? [];
-          const idx = tools.findIndex(
-            (t) =>
-              t.status === "running" &&
-              (t.tool === "execute_terminal_command" || t.tool === "run_tests"),
-          );
-          if (idx < 0) return m;
-          const next = tools.map((t, i) => {
-            if (i !== idx) return t;
-            const merged = `${t.output ?? ""}${e.chunk}\n`;
-            return {
-              ...t,
-              output: merged.length > 4000 ? merged.slice(-4000) : merged,
-            };
-          });
-          return { ...m, tools: next };
-        }),
-      );
+      dispatchTranscript({ type: "appendToolOutput", sessionId: sid, chunk: e.chunk });
     },
     onFileChanged: (e: FileChangedEvent) => {
       syncAgentFile(e);
       setExplorerRefresh((n) => n + 1);
       if (e.diff && activeSessionId != null && !bgSessionIdsRef.current.has(activeSessionId)) {
-        const sid = activeSessionId;
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.sessionId === sid
-              ? { ...m, diffs: [...(m.diffs ?? []), e] }
-              : m,
-          ),
-        );
+        dispatchTranscript({ type: "appendDiff", sessionId: activeSessionId, diff: e });
       }
     },
     onSkillsChanged: () => {
@@ -559,7 +648,7 @@ export default function App() {
       // External filesystem change detected — refresh the file explorer.
       setExplorerRefresh((n) => n + 1);
       // Show a subtle notice when files change during an active agent task.
-      if (isStreamingRef.current) {
+      if (runStreaming()) {
         setFileChangeNotice(true);
         if (fileChangeTimerRef.current != null) {
           window.clearTimeout(fileChangeTimerRef.current);
@@ -655,14 +744,14 @@ export default function App() {
           if (info) {
             setModel(info);
             api
-              .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+              .contextSetSystemPrompt(modeAwareSystemPrompt())
               .then(setUsage)
               .catch(() => {});
             refreshUsage();
           }
         } else {
           api
-            .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+            .contextSetSystemPrompt(modeAwareSystemPrompt())
             .then(setUsage)
             .catch(() => {});
         }
@@ -671,11 +760,9 @@ export default function App() {
     api
       .settingsLoad()
       .then((s) => {
-        const params = s["params"] as Partial<GenParams> | undefined;
-        if (params) setGenParams((prev) => ({ ...prev, ...params }));
-        const remote = s["remote"] as RemoteModelConfig | undefined;
-        if (remote) setSavedRemote(remote);
-        const rm = s["recentModels"];
+        if (s.params) setGenParams((prev) => ({ ...prev, ...s.params }));
+        if (s.remote) setSavedRemote(s.remote);
+        const rm = s.recentModels;
         if (Array.isArray(rm)) setRecentModels(rm);
       })
       .catch(() => {});
@@ -699,10 +786,10 @@ export default function App() {
     api
       .settingsLoad()
       .then((s) => {
-        const ws = s["lastWorkspace"];
-        if (typeof ws !== "string" || !ws) return;
+        const ws = s.lastWorkspace;
+        if (!ws) return;
         // Restore multi-root workspaces if saved, otherwise just the primary.
-        const savedAll = s["lastWorkspaces"];
+        const savedAll = s.lastWorkspaces;
         const restoreAll = Array.isArray(savedAll) && savedAll.length > 0
           ? savedAll
           : [ws];
@@ -719,10 +806,8 @@ export default function App() {
             setWorkspaces(all);
           })
           .then(() => {
-            const chat = s["lastChat"] as
-              | { project?: string; chatId?: string | null }
-              | undefined;
-            if (chat?.chatId && chat.project === ws && !isStreamingRef.current) {
+            const chat = s.lastChat;
+            if (chat?.chatId && chat.project === ws && !runStreaming()) {
               clearChat();
               setActiveChatId(chat.chatId);
               loadSessionIntoView(ws, chat.chatId);
@@ -748,7 +833,7 @@ export default function App() {
         .then((s) =>
           api.settingsSave({
             ...s,
-            lastWorkspace: workspaceRoot ?? s["lastWorkspace"],
+            lastWorkspace: workspaceRoot ?? s.lastWorkspace,
             lastWorkspaces: workspaces,
             lastChat: { project: workspaceRoot ?? "default", chatId: activeChatId },
             params: genParams,
@@ -770,7 +855,7 @@ export default function App() {
             .then((s) =>
               api.settingsSave({
                 ...s,
-                lastWorkspace: workspaceRoot ?? s["lastWorkspace"],
+                lastWorkspace: workspaceRoot ?? s.lastWorkspace,
                 lastWorkspaces: workspaces,
                 lastChat: { project: workspaceRoot ?? "default", chatId: activeChatId },
                 params: genParams,
@@ -798,17 +883,15 @@ export default function App() {
         setModel(info);
         const p = await api.loadedModelPath().catch(() => null);
         if (p) {
-          setRecentModels((prev) => {
-            const next = [p, ...prev.filter((x) => x !== p)].slice(0, 10);
+          pushRecentModel(p, (next) =>
             api.settingsLoad().then((s) =>
               api.settingsSave({ ...s, recentModels: next }),
-            ).catch(() => {});
-            return next;
-          });
+            ).catch(() => {}),
+          );
         }
       }
       api
-        .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+        .contextSetSystemPrompt(modeAwareSystemPrompt())
         .then(setUsage)
         .catch(() => {});
       refreshUsage();
@@ -818,7 +901,7 @@ export default function App() {
       setModelLoading(false);
       setLoadProgress(null);
     }
-  }, [genParams, modelLoading, refreshUsage]);
+  }, [genParams, modelLoading, refreshUsage, pushRecentModel]);
 
   const unloadModel = useCallback(async () => {
     if (messages.length > 0) {
@@ -831,7 +914,7 @@ export default function App() {
       await api.unloadModel();
       setModel(null);
       setModelPath(null);
-      setMessages([]);
+      dispatchTranscript({ type: "clearMessages" });
       setLastDone(null);
     } catch (e) {
       setError(String(e));
@@ -849,16 +932,13 @@ export default function App() {
       const info = await api.loadModelFromPath(newPath);
       if (info) {
         setModel(info);
-        setRecentModels((prev) => {
-          const next = [newPath, ...prev.filter((p) => p !== newPath)].slice(0, 10);
-          // Persist to settings.
+        pushRecentModel(newPath, (next) =>
           api.settingsLoad().then((s) =>
             api.settingsSave({ ...s, recentModels: next }),
-          ).catch(() => {});
-          return next;
-        });
+          ).catch(() => {}),
+        );
       }
-      api.contextSetSystemPrompt(AGENT_SYSTEM_PROMPT).then(setUsage).catch(() => {});
+      api.contextSetSystemPrompt(modeAwareSystemPrompt()).then(setUsage).catch(() => {});
       refreshUsage();
     } catch (e) {
       setError(String(e));
@@ -866,7 +946,7 @@ export default function App() {
       setModelLoading(false);
       setLoadProgress(null);
     }
-  }, [model, refreshUsage]);
+  }, [model, refreshUsage, pushRecentModel]);
 
   // Keep the displayed GGUF path in sync with the backend's load state.
   useEffect(() => {
@@ -884,7 +964,7 @@ export default function App() {
     try {
       const info = await api.configureRemoteModel(config);
       setModel(info);
-      setMessages([]);
+      dispatchTranscript({ type: "clearMessages" });
       setLastDone(null);
       const persisted: RemoteModelConfig = {
         provider: config.provider,
@@ -898,7 +978,7 @@ export default function App() {
         .then((s) => api.settingsSave({ ...s, remote: persisted }))
         .catch(() => {});
       api
-        .contextSetSystemPrompt(AGENT_SYSTEM_PROMPT)
+        .contextSetSystemPrompt(modeAwareSystemPrompt())
         .then(setUsage)
         .catch(() => {});
       refreshUsage();
@@ -967,10 +1047,7 @@ export default function App() {
       const text = r.success
         ? `Checkpoint created.`
         : `Checkpoint failed: ${r.error ?? r.summary}`;
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: text },
-      ]);
+      dispatchTranscript({ type: "push", message: { role: "assistant", content: text } });
     } catch (e) {
       setError(String(e));
     }
@@ -989,7 +1066,7 @@ export default function App() {
         const text = r.success
           ? `Reverted to checkpoint ${hash.slice(0, 8)}. Open files may be stale — save/reload to see the restored state.`
           : `Revert failed: ${r.error ?? r.summary}`;
-        setMessages((prev) => [...prev, { role: "assistant", content: text }]);
+        dispatchTranscript({ type: "push", message: { role: "assistant", content: text } });
       } catch (e) {
         setError(String(e));
       }
@@ -1002,47 +1079,39 @@ export default function App() {
     async (path: string) => {
       const existing = files.find((f) => f.path === path);
       if (existing) {
-        setActiveKey(existing.id);
+        filesSetActive(existing.id);
         return;
       }
       try {
         const data = await api.readTextFile(path);
         const name = path.split(/[\\/]/).pop() ?? path;
-        setFiles((prev) => [
-          ...prev,
-          { id: path, path, name, content: data.content, saved: true },
-        ]);
-        setActiveKey(path);
+        filesStoreOpen({ id: path, path, name, content: data.content, saved: true });
       } catch (e) {
         setError(String(e));
       }
     },
-    [files],
+    [files, filesSetActive, filesStoreOpen],
   );
 
   const newFile = useCallback(() => {
     const id = `new:${Date.now()}`;
     const name = `untitled-${files.length + 1}`;
-    setFiles((prev) => [...prev, { id, path: null, name, content: "", saved: false }]);
-    setActiveKey(id);
-  }, [files.length]);
+    filesStoreNew({ id, path: null, name, content: "", saved: false });
+  }, [files.length, filesStoreNew]);
 
   const closeFile = useCallback(
     (id: string) => {
-      setFiles((prev) => {
-        const idx = prev.findIndex((f) => f.id === id);
-        const next = prev.filter((f) => f.id !== id);
-        if (activeKey === id) {
-          const neighbor = idx > 0 ? next[idx - 1] : next[idx];
-          // Defer setActiveKey to avoid calling setState inside another
-          // setState updater (React anti-pattern that can cause incorrect
-          // state selection).
-          queueMicrotask(() => setActiveKey(neighbor ? neighbor.id : null));
-        }
-        return next;
-      });
+      const target = files.find((f) => f.id === id);
+      // Unsaved-changes guard: closing a dirty file discards unsaved edits.
+      if (target && !target.saved) {
+        const ok = window.confirm(
+          `Close "${target.name}" without saving?\n\nUnsaved changes will be lost.`,
+        );
+        if (!ok) return;
+      }
+      filesStoreClose(id);
     },
-    [activeKey],
+    [files, filesStoreClose],
   );
 
   const activeFile = useMemo(
@@ -1053,15 +1122,9 @@ export default function App() {
   const updateContent = useCallback(
     (content: string) => {
       if (!activeFile) return;
-      setFiles((prev) =>
-        prev.map((f) =>
-          f.id === activeFile.id
-            ? { ...f, content, saved: f.saved && f.content === content }
-            : f,
-        ),
-      );
+      filesUpdateContent(activeFile.id, content);
     },
-    [activeFile],
+    [activeFile, filesUpdateContent],
   );
 
   const saveActive = useCallback(async () => {
@@ -1071,21 +1134,15 @@ export default function App() {
         const path = await api.saveFileAs(activeFile.content);
         if (!path) return;
         const name = path.split(/[\\/]/).pop() ?? path;
-        setFiles((prev) =>
-          prev.map((f) =>
-            f.id === activeFile.id ? { ...f, path, name, saved: true } : f,
-          ),
-        );
+        filesMarkSavedAs(activeFile.id, path, name);
         return;
       }
       await api.writeTextFile(activeFile.path, activeFile.content);
-      setFiles((prev) =>
-        prev.map((f) => (f.id === activeFile.id ? { ...f, saved: true } : f)),
-      );
+      filesMarkSaved(activeFile.id);
     } catch (e) {
       setError(String(e));
     }
-  }, [activeFile]);
+  }, [activeFile, filesMarkSaved, filesMarkSavedAs]);
 
   const openFilePicker = useCallback(async () => {
     const path = await api.pickTextFile();
@@ -1110,19 +1167,39 @@ export default function App() {
         e.preventDefault();
         setShowConsole((v) => !v);
       }
+      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        toggleTerminal();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key.toLowerCase() === "g") {
+        e.preventDefault();
+        toggleGraph();
+      }
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
         e.preventDefault();
         loadModel();
       }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPaletteMode("commands");
+        setPaletteOpen(true);
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPaletteMode("files");
+        setPaletteOpen(true);
+      }
       if (e.key === "Escape") {
-        if (showSettings || showKnowledge || permissionReq != null) {
+        if (paletteOpen || showSettings || showKnowledge || permissionReq != null || questionReq != null) {
           e.preventDefault();
+          if (paletteOpen) setPaletteOpen(false);
           if (showSettings) setShowSettings(false);
           if (showKnowledge) setShowKnowledge(false);
           if (permissionReq != null) setPermissionReq(null);
+          if (questionReq != null) setQuestionReq(null);
           return;
         }
-        if (isStreamingRef.current) {
+        if (runStreaming()) {
           e.preventDefault();
           void abortAgentExecution();
         }
@@ -1130,7 +1207,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [saveActive, openFilePicker, loadModel, abortAgentExecution, showSettings, showKnowledge, permissionReq]);
+  }, [saveActive, openFilePicker, loadModel, abortAgentExecution, showSettings, showKnowledge, permissionReq, questionReq, paletteOpen]);
 
   /** Replay one project chat's JSONL log into the chat view + model context. */
   const loadSessionIntoView = useCallback(
@@ -1139,8 +1216,8 @@ export default function App() {
       api
         .sessionLoad(project, chatId)
         .then((records) => {
-          const replay = recordsToMessages(records as never[]);
-          setMessages(replay);
+          const replay = recordsToMessages(records);
+          dispatchTranscript({ type: "replaceAll", messages: replay });
           for (const m of replay) {
             api
               .contextPushTurn(m.role, m.content)
@@ -1221,7 +1298,13 @@ export default function App() {
   const runAgentTask = useCallback(
     async (
       text: string,
-      opts?: { planMode?: boolean; verify?: boolean; decompose?: boolean },
+      opts?: {
+        planMode?: boolean;
+        verify?: boolean;
+        decompose?: boolean;
+        images?: ImageAttachment[];
+        handoff?: HandoffChain;
+      },
     ) => {
       if (opts?.planMode) {
         planSessionRef.current = null;
@@ -1238,9 +1321,30 @@ export default function App() {
         planMode: opts?.planMode ?? false,
         verify: opts?.verify ?? verifyRef.current,
         decompose: opts?.decompose ?? false,
+        agentMode: useCustomModes.getState().activeModeRef?.name ?? undefined,
+        images: opts?.images,
       });
       sessionLabelRef.current.set(sessionId, text.slice(0, 48));
       if (opts?.planMode) planSessionRef.current = sessionId;
+      // Register a handoff chain's current phase against this session so the
+      // `onDone` handler can auto-advance. A fresh send starts at index 0.
+      if (opts?.handoff) {
+        if (opts.planMode) {
+          // Plan phase pauses for approval; stash the continuation context.
+          pendingHandoffRef.current = {
+            chain: opts.handoff,
+            index: 0,
+            basePrompt: text,
+          };
+        } else {
+          handoffRef.current.set(sessionId, {
+            chain: opts.handoff,
+            index: 0,
+            basePrompt: text,
+          });
+        }
+      }
+      return sessionId;
     },
     [genParams],
   );
@@ -1248,10 +1352,58 @@ export default function App() {
   const sendPrompt = useCallback(
     async (
       text: string,
-      opts?: { planMode?: boolean; verify?: boolean; decompose?: boolean },
+      opts?: {
+        planMode?: boolean;
+        verify?: boolean;
+        decompose?: boolean;
+        images?: ImageAttachment[];
+        handoff?: HandoffChain;
+      },
     ) => {
       const trimmed = text.trim();
-      if (!trimmed || isStreaming) return;
+      if (!trimmed) return;
+      if (text.startsWith("/fork ")) {
+        // Fork: spin up an independent background task seeded with the CURRENT
+        // conversation (the backend snapshots the whole ContextManager), but
+        // leave the foreground transcript untouched — no user turn, no status
+        // churn. Only a background pill + a marker note appear here.
+        const forkPrompt = text.slice(5).trim();
+        if (!forkPrompt) return;
+        const forkLabel = forkPrompt.slice(0, 48);
+        try {
+          const sessionId = await api.agentRunBackground({
+            prompt: forkPrompt,
+            maxTokens: genParams.maxTokens,
+            temperature: genParams.temperature,
+            topP: genParams.topP,
+            repeatPenalty: genParams.repeatPenalty,
+            maxSteps: 12,
+            stopWords: ["</s>"],
+            planMode: false,
+            verify: verifyRef.current,
+            decompose: false,
+          });
+          sessionLabelRef.current.set(sessionId, forkLabel);
+          bgSessionIdsRef.current.add(sessionId);
+          setBackgroundTasks((prev) => [
+            ...prev,
+            { id: `bg-pending-${sessionId}`, sessionId, label: forkLabel, status: "running", startedAt: Date.now() },
+          ]);
+          dispatchTranscript({
+            type: "push",
+            message: { role: "assistant", content: `Forked conversation into a background task: ${forkLabel}` },
+          });
+        } catch (e) {
+          dispatchChatStatus({ type: "error", message: String(e), at: performance.now() });
+        }
+        return;
+      }
+      if (isStreaming) {
+        // Agent is busy — queue the message and run it once the turn finishes
+        // instead of silently dropping it (queued/steered messages).
+        useAgentRunStore.getState().enqueuePrompt({ text: trimmed, opts });
+        return;
+      }
       dispatchChatStatus({ type: "submit", at: performance.now() });
       setPendingPlan(null);
       setCurrentSubtask(null);
@@ -1270,7 +1422,13 @@ export default function App() {
         }
       }
       const userTs = Date.now();
-      setMessages((prev) => [...prev, { role: "user", content: trimmed, ts: userTs }]);
+      // One turn UUID for both halves (user prompt + assistant answer), so the
+      // backend can dedupe replayed `sessionAppend` writes.
+      const turnId = newTurnId();
+      dispatchTranscript({
+        type: "push",
+        message: { role: "user", content: trimmed, ts: userTs, turnId },
+      });
       api
         .contextPushTurn("user", trimmed)
         .then(setUsage)
@@ -1280,6 +1438,7 @@ export default function App() {
           role: "user",
           content: trimmed,
           ts: userTs,
+          turnId,
         }, activeChatId)
         .catch(() => {});
       try {
@@ -1306,24 +1465,27 @@ export default function App() {
             ...prev,
             { id: `bg-pending-${sessionId}`, sessionId, label: bgLabel, status: "running", startedAt: Date.now() },
           ]);
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: `Background task started: ${bgLabel}` },
-          ]);
+          dispatchTranscript({
+            type: "push",
+            message: { role: "assistant", content: `Background task started: ${bgLabel}` },
+          });
           return;
         }
-        if (agentModeRef.current || opts?.planMode || opts?.decompose) {
-          await runAgentTask(trimmed, opts);
+        let sid: number | undefined;
+        if (agentModeRef.current || opts?.planMode || opts?.decompose || opts?.handoff) {
+          sid = await runAgentTask(trimmed, opts);
         } else {
-          await api.streamInference({
+          sid = await api.streamInference({
             prompt: trimmed,
             maxTokens: genParams.maxTokens,
             temperature: genParams.temperature,
             topP: genParams.topP,
             repeatPenalty: genParams.repeatPenalty,
             stopWords: ["<|endoftext|>", "\n\n---", "User:"],
+            images: opts?.images,
           });
         }
+        if (sid != null) sessionTurnRef.current.set(sid, turnId);
       } catch (e) {
         const message = String(e);
         setError(message);
@@ -1332,6 +1494,21 @@ export default function App() {
     },
     [activeChatId, genParams, isStreaming, runAgentTask, knowledge],
   );
+
+  // Flush one queued message each time the agent transitions back to idle, so
+  // messages submitted while busy run serially instead of being dropped.
+  const sendPromptRef = useRef(sendPrompt);
+  sendPromptRef.current = sendPrompt;
+  // Mode-handoff continuation (onDone) calls through a ref so it always sees
+  // the latest runAgentTask, never a stale render's closure.
+  const runAgentTaskRef = useRef(runAgentTask);
+  runAgentTaskRef.current = runAgentTask;
+  useEffect(() => {
+    if (isStreaming) return;
+    const next = useAgentRunStore.getState().shiftPrompt();
+    if (!next) return;
+    void sendPromptRef.current(next.text, next.opts);
+  }, [isStreaming]);
 
   const approvePlan = useCallback(async () => {
     const prompt = planPromptRef.current;
@@ -1355,14 +1532,78 @@ export default function App() {
   }, []);
 
   const clearChat = useCallback(() => {
-    setMessages([]);
+    dispatchTranscript({ type: "reset" });
+    dispatchExecGraph({ type: "reset" });
     setPendingPlan(null);
     setLastDone(null);
     setCurrentStep(null);
-    setLedger([]);
     setTodos(null);
     dispatchChatStatus({ type: "reset", at: performance.now() });
   }, []);
+
+  /** Record a per-diff accept/reject in the shared transcript store. The
+   *  inline timeline and the Changes panel both dispatch here, so they never
+   *  disagree about what is pending. */
+  const handleDiffResolve = useCallback(
+    (messageIndex: number, diffIndex: number, status: "accepted" | "rejected") => {
+      dispatchTranscript({
+        type: "diffResolved",
+        messageIndex,
+        diffIndex,
+        status,
+      });
+    },
+    [],
+  );
+
+  // Monospace-independent authored-diff sections presented to the editor for
+  // per-hunk keep/revert. Only diffs that are still relevant on this file are
+  // surfaced: pending (unresolved) or accepted (kept) diffs; a diff resolved
+  // as "rejected" means its change was reverted and is no longer in the buffer.
+  const activePath = activeFile?.path?.replaceAll("\\", "/");
+  const pendingSections = useMemo<PendingDiffSection[]>(() => {
+    if (!activePath) return [];
+    const out: PendingDiffSection[] = [];
+    messages.forEach((m, mi) => {
+      (m.diffs ?? []).forEach((d, di) => {
+        if (d.resolved === "rejected") return;
+        if (!d.before || !d.diff) return;
+        if (d.path.replaceAll("\\", "/") !== activePath) return;
+        // Stable key shared with `handleDiffResolve` so per-hunk state survives
+        // when the sections list reorders (e.g. an earlier diff is rejected).
+        out.push({ key: `${mi}-${di}`, before: d.before, diff: d.diff });
+      });
+    });
+    return out;
+  }, [messages, activePath]);
+
+  // Persist a per-hunk toggle: recompute the file content (done by the caller)
+  // and write it to disk, sync the open buffer, and record the new keep state.
+  const handleToggleHunk = useCallback(
+    async (opts: {
+      before: string;
+      diff: string | null;
+      key: string;
+      keep: boolean;
+      content: string;
+    }) => {
+      if (!activeFile?.path) return;
+      setHunkResolution((prev) => ({ ...prev, [opts.key]: opts.keep }));
+      try {
+        await api.writeTextFile(activeFile.path, opts.content);
+        filesSyncSaved(activeFile.id, opts.content);
+      } catch (err) {
+        // Revert the optimistic state if the write failed.
+        setHunkResolution((prev) => {
+          const next = { ...prev };
+          delete next[opts.key];
+          return next;
+        });
+        console.error("Failed to write per-hunk change:", err);
+      }
+    },
+    [activeFile, filesSyncSaved],
+  );
 
   // Edit & resubmit: truncate messages from the edited index, push the
   // updated user message, and re-invoke the agent loop.
@@ -1375,35 +1616,38 @@ export default function App() {
       // Fork: create a new chat branching from the edit point.
       // Messages up to and including messageIndex are preserved in the new branch.
       const forkId = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      setMessages((prev) => {
-        // Take messages up to (and including) the edited message.
-        const forkPrefix = prev.slice(0, messageIndex + 1);
-        // Replace the edited message content.
-        const lastMsg = forkPrefix[forkPrefix.length - 1];
-        if (lastMsg && lastMsg.role === "user") {
-          forkPrefix[forkPrefix.length - 1] = { ...lastMsg, content: trimmed };
-        }
-        // Persist the prefix to the new chat's JSONL.
-        const ws = workspaceRoot ?? "default";
-        for (const msg of forkPrefix) {
-          const record: Record<string, unknown> = {
-            role: msg.role,
-            content: msg.content,
-          };
-          if (msg.ts) record.ts = msg.ts;
-          if (msg.done) record.done = msg.done;
-          api.sessionAppend(ws, record, forkId).catch(() => {});
-        }
-        return forkPrefix;
-      });
+      const forkTurnId = newTurnId();
+      const forkPrefix = messages.slice(0, messageIndex + 1);
+      // Replace the edited message content.
+      const lastMsg = forkPrefix[forkPrefix.length - 1];
+      if (lastMsg && lastMsg.role === "user") {
+        forkPrefix[forkPrefix.length - 1] = {
+          ...lastMsg,
+          content: trimmed,
+          turnId: forkTurnId,
+        };
+      }
+      // Persist the prefix to the new chat's JSONL (outside the state updater).
+      const ws = workspaceRoot ?? "default";
+      for (const msg of forkPrefix) {
+        const record: SessionAppendRecord = {
+          role: msg.role,
+          content: msg.content,
+        };
+        if (msg.ts) record.ts = msg.ts;
+        if (msg.done) record.done = msg.done;
+        if (msg.turnId) record.turnId = msg.turnId;
+        api.sessionAppend(ws, record, forkId).catch(() => {});
+      }
+      dispatchTranscript({ type: "replaceAll", messages: forkPrefix });
       setActiveChatId(forkId);
       setLastDone(null);
       setCurrentStep(null);
 
       // Push the prefix messages into the model context.
       // (We need to re-push since the context was cleared for the fork.)
-      const forkPrefix = messages.slice(0, messageIndex);
-      for (const msg of forkPrefix) {
+      const pushPrefix = messages.slice(0, messageIndex);
+      for (const msg of pushPrefix) {
         api.contextPushTurn(msg.role, msg.content).catch(() => {});
       }
 
@@ -1411,11 +1655,12 @@ export default function App() {
       api.contextPushTurn("user", trimmed).then(setUsage).catch(() => {});
 
       dispatchChatStatus({ type: "submit", at: performance.now() });
+      let sid: number | undefined;
       try {
         if (agentModeRef.current) {
-          await runAgentTask(trimmed);
+          sid = await runAgentTask(trimmed);
         } else {
-          await api.streamInference({
+          sid = await api.streamInference({
             prompt: trimmed,
             maxTokens: genParams.maxTokens,
             temperature: genParams.temperature,
@@ -1424,6 +1669,7 @@ export default function App() {
             stopWords: ["</s>", "\n\n---", "User:"],
           });
         }
+        if (sid != null) sessionTurnRef.current.set(sid, forkTurnId);
       } catch (e) {
         const msg = String(e);
         setError(msg);
@@ -1551,9 +1797,229 @@ export default function App() {
     [knowledge],
   );
 
+  const paletteSkills = useMemo<PaletteSkill[]>(
+    () =>
+      (knowledge?.skills ?? []).map((s) => ({ name: s.name, active: s.active })),
+    [knowledge],
+  );
+
   const handleExportFormatChange = useCallback((fmt: string) => {
     setExportFormat(fmt as "pdf" | "docx" | "csv");
   }, []);
+
+  // Stable UI affordances (memoization-safe; passed to memoized children).
+  const openSettings = useCallback(() => setShowSettings(true), []);
+  const closeSettings = useCallback(() => setShowSettings(false), []);
+  const toggleConsole = useCallback(() => {
+    setShowTerminal(false);
+    setShowConsole((v) => !v);
+  }, []);
+  const clearConsole = useCallback(() => setConsoleEntries([]), []);
+  const toggleTerminal = useCallback(() => {
+    setShowConsole(false);
+    setShowTerminal((v) => !v);
+  }, []);
+  const toggleGraph = useCallback(() => {
+    setShowConsole(false);
+    setShowTerminal(false);
+    setShowGraph((v) => !v);
+  }, []);
+  const clearGraph = useCallback(() => {
+    dispatchExecGraph({ type: "reset" });
+  }, []);
+  const openKnowledge = useCallback(() => setShowKnowledge(true), []);
+  const closeKnowledge = useCallback(() => setShowKnowledge(false), []);
+  const refreshExplorer = useCallback(() => setExplorerRefresh((n) => n + 1), []);
+
+  const paletteActions = useMemo<PaletteAction[]>(
+    () => [
+      {
+        id: "new-chat",
+        label: "New chat",
+        hint: "start a fresh conversation",
+        keywords: "new chat clear conversation reset",
+        run: newChat,
+      },
+      {
+        id: "clear-chat",
+        label: "Clear chat",
+        hint: "reset the current transcript",
+        keywords: "clear chat empty reset",
+        run: clearChat,
+      },
+      {
+        id: "settings",
+        label: "Open settings",
+        hint: "model & generation params",
+        keywords: "settings options preferences",
+        run: openSettings,
+      },
+      {
+        id: "console",
+        label: "Toggle console",
+        hint: "show / hide the console pane",
+        keywords: "console log toggle",
+        run: toggleConsole,
+      },
+      {
+        id: "terminal",
+        label: "Toggle terminal",
+        hint: "open the interactive terminal pane",
+        keywords: "terminal shell command toggle",
+        run: toggleTerminal,
+      },
+      {
+        id: "exec-graph",
+        label: "Toggle execution graph",
+        hint: "show plan · subtask · tool call graph",
+        keywords: "graph execution plan subtask tool visualization",
+        run: toggleGraph,
+      },
+      {
+        id: "clear-graph",
+        label: "Clear execution graph",
+        hint: "reset the live run graph",
+        keywords: "clear graph reset run",
+        run: clearGraph,
+      },
+      {
+        id: "clear-console",
+        label: "Clear console",
+        hint: "empty the console pane",
+        keywords: "clear console log",
+        run: clearConsole,
+      },
+      {
+        id: "knowledge",
+        label: "Open knowledge / skills",
+        hint: "rules, skills, and memory",
+        keywords: "skills knowledge rules memory",
+        run: openKnowledge,
+      },
+      ...(isStreaming
+        ? [
+            {
+              id: "cancel",
+              label: "Cancel inference",
+              hint: "stop the running generation",
+              keywords: "cancel stop abort interrupt",
+              run: () => void cancelInference(),
+              danger: true,
+            },
+          ]
+        : []),
+      {
+        id: "toggle-agent",
+        label: agentMode ? "Disable agent mode" : "Enable agent mode",
+        hint: "agentic tool use on / off",
+        keywords: "agent mode toggle autonomous",
+        run: () => setAgentMode(!agentMode),
+      },
+      {
+        id: "toggle-verify",
+        label: verify ? "Disable verify" : "Enable verify",
+        hint: "auto-verify after changes",
+        keywords: "verify toggle check run tests",
+        run: () => setVerify(!verify),
+      },
+      {
+        id: "toggle-yolo",
+        label: yolo ? "Disable YOLO mode" : "Enable YOLO mode",
+        hint: "auto-approve tool actions",
+        keywords: "yolo auto approve trust skip",
+        run: () => handleYoloChange(!yolo),
+        danger: !yolo,
+      },
+      {
+        id: "open-file",
+        label: "Open file…",
+        hint: "choose a file via dialog",
+        keywords: "open file picker browse",
+        run: () => void openFilePicker(),
+      },
+      {
+        id: "changes-panel",
+        label: "Show file changes",
+        hint: "open the Changes panel (working-tree diffs)",
+        keywords: "changes panel diff source control review accept revert",
+        run: () => setLeftView("changes"),
+      },
+      {
+        id: "resume-session",
+        label: "Resume a session…",
+        hint: "re-open a previous chat across projects",
+        keywords: "resume session restore continue history reopen picker",
+        run: () => setLeftView("resume"),
+      },
+      {
+        id: "threads-panel",
+        label: "Open threads / status",
+        hint: "live agent run + background task status",
+        keywords: "threads tasks sessions status background agent running",
+        run: () => setLeftView("threads"),
+      },
+    ],
+    [
+      newChat, clearChat, openSettings, toggleConsole, clearConsole,
+      toggleTerminal, toggleGraph, clearGraph,
+      openKnowledge, isStreaming, cancelInference, agentMode, setAgentMode,
+      verify, setVerify, yolo, handleYoloChange, openFilePicker, setLeftView,
+    ],
+  );
+
+  // ---- pane-resize handlers (DRY the shared drag-start + clamp logic) ----
+  const SidebarResize = useMemo(
+    () => ({
+      onDragStart: () => {
+        paneStarts.current.sidebar = sidebarW;
+      },
+      onDelta: (d: number) => {
+        setSidebarW(Math.min(520, Math.max(160, paneStarts.current.sidebar + d)));
+      },
+    }),
+    [sidebarW],
+  );
+  const ChatResize = useMemo(
+    () => ({
+      onDragStart: () => {
+        paneStarts.current.chat = chatW;
+      },
+      onDelta: (d: number) => {
+        setChatW(Math.min(720, Math.max(300, paneStarts.current.chat - d)));
+      },
+    }),
+    [chatW],
+  );
+  const ConsoleResize = useMemo(
+    () => ({
+      onDragStart: () => {
+        paneStarts.current.console = consoleH;
+      },
+      onDelta: (d: number) => {
+        setConsoleH(Math.min(520, Math.max(96, paneStarts.current.console - d)));
+      },
+    }),
+    [consoleH],
+  );
+
+  const openProject = useCallback(
+    (path: string) => {
+      void applyWorkspace(path);
+    },
+    [applyWorkspace],
+  );
+
+  const closePalette = useCallback(() => setPaletteOpen(false), []);
+
+  const handleToggleSkill = useCallback(
+    (name: string, active: boolean) => {
+      api
+        .skillSetActive(name, active)
+        .then(setKnowledge)
+        .catch(() => {});
+    },
+    [setKnowledge],
+  );
 
   return (
     <div className="flex h-full w-full flex-col bg-editor text-ink">
@@ -1561,10 +2027,14 @@ export default function App() {
       <MenuBar
         onOpenFolder={selectWorkspace}
         onOpenFile={openFilePicker}
-        onSettings={() => setShowSettings(true)}
+        onSettings={openSettings}
         onSelectModel={loadModel}
-        onConsole={() => setShowConsole((v) => !v)}
+        onConsole={toggleConsole}
         consoleVisible={showConsole}
+        onTerminal={toggleTerminal}
+        terminalVisible={showTerminal}
+        onGraph={toggleGraph}
+        graphVisible={showGraph}
       />
       <ModelBar
         model={model}
@@ -1590,15 +2060,19 @@ export default function App() {
           style={{ width: sidebarW, minWidth: 160, maxWidth: 520 }}
         >
           <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-1.5">
-            {(
-              [
-                ["files", "Files"],
-                ["chats", "Chats"],
-              ] as const
-            ).map(([id, label]) => (
+              {(
+                [
+                  ["files", "Files"],
+                  ["chats", "Chats"],
+                  ["changes", "Diff"],
+                  ["threads", "Threads"],
+                  ["resume", "Resume"],
+                ] as const
+              ).map(([id, label]) => (
               <button
                 key={id}
                 onClick={() => setLeftView(id)}
+                aria-pressed={leftView === id}
                 className={`rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wider transition-colors ${
                   leftView === id
                     ? "bg-accent/15 text-cyan-600"
@@ -1614,13 +2088,15 @@ export default function App() {
                 <button
                   onClick={newFile}
                   title="New file"
+                  aria-label="New file"
                   className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
                 >
                   +
                 </button>
                 <button
-                  onClick={() => setShowKnowledge(true)}
+                  onClick={openKnowledge}
                   title="Skills & rules"
+                  aria-label="Skills and rules"
                   className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
                 >
                   ✦
@@ -1628,6 +2104,7 @@ export default function App() {
                 <button
                   onClick={selectWorkspace}
                   title="Open workspace"
+                  aria-label="Open workspace"
                   className="rounded px-1.5 py-0.5 text-sm text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"
                 >
                   📁
@@ -1651,9 +2128,9 @@ export default function App() {
               onRemoveWorkspace={removeWorkspace}
               onOpenFile={openFile}
               onNewFile={newFile}
-              onOpenSkills={() => setShowKnowledge(true)}
+              onOpenSkills={openKnowledge}
               refreshSignal={explorerRefresh}
-              onRefresh={() => setExplorerRefresh((n) => n + 1)}
+              onRefresh={refreshExplorer}
             />
           </div>
           {leftView === "chats" && (
@@ -1664,34 +2141,59 @@ export default function App() {
               onSwitchChat={switchChat}
               onNewChat={newChat}
               onDeleteChat={deleteChat}
-              onOpenProject={(path) => void applyWorkspace(path)}
+              onOpenProject={openProject}
+            />
+          )}
+          {leftView === "changes" && (
+            <ChangesPanel messages={messages} onDiffResolve={handleDiffResolve} />
+          )}
+          {leftView === "resume" && (
+            <SessionResumePanel
+              workspaceRoot={workspaceRoot}
+              onResume={switchChat}
+              onNewChat={newChat}
+            />
+          )}
+          {leftView === "threads" && (
+            <ThreadsPanel
+              chatStatus={chatStatus}
+              activeSessionId={activeSessionId}
+              currentStep={currentStep}
+              currentSubtask={currentSubtask}
+              runningSubtasks={runningSubtasks}
+              modelName={model?.name ?? null}
+              ledger={ledger}
+              backgroundTasks={backgroundTasks}
+              onAbort={abortBackgroundTask}
             />
           )}
         </nav>
         <ResizeHandle
           axis="x"
-          onDragStart={() => (paneStarts.current.sidebar = sidebarW)}
-          onDelta={(d) =>
-            setSidebarW(Math.min(520, Math.max(160, paneStarts.current.sidebar + d)))
-          }
+          onDragStart={SidebarResize.onDragStart}
+          onDelta={SidebarResize.onDelta}
         />
         <main className="flex min-w-0 flex-1 flex-col">
           <Tabs
             files={files}
             activeKey={activeKey}
-            onSelect={setActiveKey}
+            onSelect={filesSetActive}
             onClose={closeFile}
           />
           <div className="min-h-0 flex-1 overflow-hidden">
-            <EditorPane file={activeFile} onContentChange={updateContent} />
+            <EditorPane
+              file={activeFile}
+              onContentChange={updateContent}
+              pendingSections={pendingSections}
+              hunkResolution={hunkResolution}
+              onToggleHunk={handleToggleHunk}
+            />
           </div>
         </main>
         <ResizeHandle
           axis="x"
-          onDragStart={() => (paneStarts.current.chat = chatW)}
-          onDelta={(d) =>
-            setChatW(Math.min(720, Math.max(300, paneStarts.current.chat - d)))
-          }
+          onDragStart={ChatResize.onDragStart}
+          onDelta={ChatResize.onDelta}
         />
         <ChatPanel
           width={chatW}
@@ -1704,11 +2206,17 @@ export default function App() {
           modelName={model?.name ?? null}
           agentMode={agentMode}
           onAgentModeChange={setAgentMode}
+          customModes={customModes}
+          activeCustomMode={activeCustomMode}
+          onCustomModeChange={applyCustomMode}
+          workflows={workflows}
+          onWorkflowInvoke={invokeWorkflow}
           onSend={sendPrompt}
           onCancel={cancelInference}
           onClear={clearChat}
           currentStep={currentStep}
           currentSubtask={currentSubtask}
+          queuedCount={queuedCount}
           todos={todos}
           questionReq={questionReq}
           onRespondQuestion={respondQuestion}
@@ -1724,16 +2232,25 @@ export default function App() {
           pendingPlan={pendingPlan}
           onApprovePlan={approvePlan}
           onRejectPlan={rejectPlan}
-          onOpenSkills={() => setShowKnowledge(true)}
+          onOpenSkills={openKnowledge}
           onEditResubmit={editResubmit}
           onExport={exportChat}
           exportFormat={exportFormat}
           onExportFormatChange={handleExportFormatChange}
           contextUsage={usage}
+          onDiffResolve={handleDiffResolve}
         />
         {isSwitching && (
-          <div className="pointer-events-none absolute right-6 top-1/2 z-40 -translate-y-1/2 rounded-md border border-border bg-panel px-3 py-1.5 text-[11px] text-zinc-500 shadow-sm">
-            Loading…
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none absolute right-2 top-1/2 z-40 flex -translate-y-1/2 items-center gap-2 rounded-md border border-border bg-panel px-3 py-1.5 text-[11px] text-zinc-500 shadow-sm"
+          >
+            <svg className="h-3.5 w-3.5 animate-spin text-cyan-600" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v3a5 5 0 00-5 5H4z" />
+            </svg>
+            <span>Switching…</span>
           </div>
         )}
         {contextTrimNotice && (
@@ -1747,21 +2264,79 @@ export default function App() {
           </div>
         )}
       </div>
+      {(showConsole || showTerminal || showGraph) && (
+        <div className="flex shrink-0 items-center gap-1 border-t border-border bg-panel px-2 pt-1">
+          <button
+            onClick={toggleConsole}
+            className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+              showConsole
+                ? "bg-accent/15 text-accent"
+                : "text-zinc-500 hover:text-zinc-700"
+            }`}
+          >
+            Console
+          </button>
+          <button
+            onClick={toggleTerminal}
+            className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+              showTerminal
+                ? "bg-accent/15 text-accent"
+                : "text-zinc-500 hover:text-zinc-700"
+            }`}
+          >
+            Terminal
+          </button>
+          <button
+            onClick={toggleGraph}
+            className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+              showGraph
+                ? "bg-accent/15 text-accent"
+                : "text-zinc-500 hover:text-zinc-700"
+            }`}
+          >
+            Execution graph
+          </button>
+          <div className="flex-1" />
+        </div>
+      )}
       {showConsole && (
         <ResizeHandle
           axis="y"
-          onDragStart={() => (paneStarts.current.console = consoleH)}
-          onDelta={(d) =>
-            setConsoleH(Math.min(520, Math.max(96, paneStarts.current.console - d)))
-          }
+          onDragStart={ConsoleResize.onDragStart}
+          onDelta={ConsoleResize.onDelta}
         />
       )}
       <ConsolePanel
         entries={consoleEntries}
         visible={showConsole}
         height={consoleH}
-        onClear={() => setConsoleEntries([])}
+        onClear={clearConsole}
       />
+      {showTerminal && (
+        <ResizeHandle
+          axis="y"
+          onDragStart={ConsoleResize.onDragStart}
+          onDelta={ConsoleResize.onDelta}
+        />
+      )}
+      {showTerminal && (
+        <TerminalPanel visible={showTerminal} height={consoleH} cwd={workspaceRoot} />
+      )}
+      {showGraph && (
+        <ResizeHandle
+          axis="y"
+          onDragStart={ConsoleResize.onDragStart}
+          onDelta={ConsoleResize.onDelta}
+        />
+      )}
+      {showGraph && (
+        <ExecutionGraphPanel
+          state={execGraph}
+          visible={showGraph}
+          height={consoleH}
+          onClear={clearGraph}
+        />
+      )}
       <StatusBar
         model={model}
         workspaceRoot={workspaceRoot}
@@ -1789,12 +2364,26 @@ export default function App() {
         policy={policy}
         onRespond={respondPermission}
       />
-      <KnowledgePanel open={showKnowledge} onClose={() => setShowKnowledge(false)} />
+      <KnowledgePanel open={showKnowledge} onClose={closeKnowledge} />
       <SettingsModal
         open={showSettings}
-        onClose={() => setShowSettings(false)}
+        onClose={closeSettings}
         params={genParams}
         onParamsChange={handleParamsChange}
+      />
+      <CommandPalette
+        open={paletteOpen}
+        initialMode={paletteMode}
+        onClose={closePalette}
+        workspaceRoot={workspaceRoot}
+        actions={paletteActions}
+        skills={paletteSkills}
+        modes={customModes}
+        activeMode={activeCustomMode}
+        onOpenFile={openFile}
+        onSwitchChat={switchChat}
+        onApplyMode={applyCustomMode}
+        onToggleSkill={handleToggleSkill}
       />
     </div>
   );

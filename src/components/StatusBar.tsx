@@ -33,6 +33,51 @@ function formatMs(n: number): string {
   return `${Math.round(n)}ms`;
 }
 
+/** Per-category colors for the context-breakdown bar (light theme). */
+const CONTEXT_SEGMENTS: {
+  key: keyof NonNullable<ContextUsage["breakdown"]>;
+  label: string;
+  cls: string;
+}[] = [
+  { key: "system", label: "system", cls: "bg-zinc-700" },
+  { key: "file", label: "file buffer", cls: "bg-cyan-500" },
+  { key: "rules", label: "rules", cls: "bg-violet-500" },
+  { key: "skills", label: "skills", cls: "bg-emerald-500" },
+  { key: "memory", label: "memory", cls: "bg-sky-500" },
+  { key: "otherPinned", label: "pinned", cls: "bg-amber-500" },
+  { key: "turns", label: "turns", cls: "bg-zinc-400" },
+];
+
+/** Horizontal segmented bar visualising the per-category context split. */
+function ContextBreakdownBar({ usage }: { usage: ContextUsage }) {
+  const b = usage.breakdown;
+  if (!b) return null;
+  const used = Math.max(1, usage.totalTokens);
+  return (
+    <span
+      className="flex h-1.5 w-16 shrink-0 items-stretch overflow-hidden rounded-full bg-zinc-200"
+      role="img"
+      aria-label="Context usage by category"
+      title={[
+        "Context split (of " +
+          `${formatTokens(usage.totalTokens)} used / ${formatTokens(usage.limit)} limit):`,
+        ...CONTEXT_SEGMENTS.filter((s) => (b[s.key] ?? 0) > 0).map(
+          (s) => `${s.label.padEnd(11)} ${formatTokens(b[s.key] ?? 0)}`,
+        ),
+        `evicted   ${usage.evictedTurns} turn(s)`,
+      ].join("\n")}
+    >
+      {CONTEXT_SEGMENTS.filter((s) => (b[s.key] ?? 0) > 0).map((s) => (
+        <span
+          key={s.key}
+          className={`${s.cls} h-full`}
+          style={{ width: `${(((b[s.key] ?? 0) / used) * 100).toFixed(2)}%` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 export default function StatusBar({
   model,
   workspaceRoot,
@@ -89,13 +134,25 @@ export default function StatusBar({
               usage.overflow ? "text-amber-600" : "text-zinc-400"
             }`}
             title={
-              usage.overflow
+              (usage.overflow
                 ? `Over ${formatTokens(usage.threshold)}-token budget (80% of ${formatTokens(usage.limit)}) - oldest turns are being evicted (${usage.evictedTurns} evicted so far)`
-                : `${usage.messageCount} messages · ${formatTokens(usage.threshold)}-token eviction threshold`
+                : `${usage.messageCount} messages · ${formatTokens(usage.threshold)}-token eviction threshold`)
+              + (usage.breakdown
+                  ? `\n\nContext split:\n${[
+                      usage.breakdown.system > 0 && `system   ${formatTokens(usage.breakdown.system)}`,
+                      usage.breakdown.file > 0 && `file     ${formatTokens(usage.breakdown.file)}`,
+                      usage.breakdown.rules > 0 && `rules    ${formatTokens(usage.breakdown.rules)}`,
+                      usage.breakdown.skills > 0 && `skills   ${formatTokens(usage.breakdown.skills)}`,
+                      usage.breakdown.memory > 0 && `memory   ${formatTokens(usage.breakdown.memory)}`,
+                      usage.breakdown.otherPinned > 0 && `pinned   ${formatTokens(usage.breakdown.otherPinned)}`,
+                      `turns    ${formatTokens(usage.breakdown.turns)}`,
+                    ].filter(Boolean).join("\n")}`
+                  : "")
             }
           >
             ctx {formatTokens(usage.totalTokens)}/{formatTokens(usage.limit)}
             {usage.overflow && <span className="text-amber-600"> · evicting</span>}
+            <ContextBreakdownBar usage={usage} />
           </span>
         )}
         {knowledge && knowledge.skills.some((s) => s.active) && (
