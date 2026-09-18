@@ -43,6 +43,39 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// Abstraction over the host application's event bus so the [`agent`] layer
+/// stays free of `tauri`/`AppHandle`. A [`TauriEventSink`](crate::commands::agent::TauriEventSink)
+/// adapter wires this to Tauri's `Emitter` in the command layer.
+///
+/// Each `emit` corresponds to a real-time `agent://*` event the frontend
+/// listens for. Payloads arrive already serialized as JSON; agent code uses
+/// [`ToolContext::emit`] (typed) instead of talking to the feature directly.
+pub trait EventSink: Send + Sync {
+    fn emit_value(&self, event: &str, payload: &serde_json::Value);
+}
+
+/// Minimal, tauri-free context the tool layer needs to talk to the host:
+/// the event bus plus a few app-owned paths (currently just the config
+/// directory used for MCP catalog + policy rules). Injected at the command
+/// boundary from the real `AppHandle`; `Clone` so worker threads can move it.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Bridges `agent://*` events to the host UI.
+    pub sink: std::sync::Arc<dyn EventSink>,
+    /// Absolute config directory (MCP catalog, policy, plan files).
+    pub config_dir: PathBuf,
+}
+
+impl ToolContext {
+    /// Serialize and emit a typed [`agent://*`](EventSink) event. Thin wrapper
+    /// over [`EventSink::emit_value`] so call sites never touch JSON directly.
+    pub fn emit(&self, event: &str, payload: impl Serialize) {
+        if let Ok(value) = serde_json::to_value(payload) {
+            self.sink.emit_value(event, &value);
+        }
+    }
+}
+
 /// A structured tool invocation, serialized as
 /// `{ "type": "<tool_name>", ...params }` (snake_case type tag, camelCase fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +501,7 @@ ToolCall::ViewRepoMap { .. } => "view_repo_map",
     /// canonical [`registry`](crate::agent::registry) can be drift-checked
     /// against the dispatcher (`core::test_registry_matches_dispatcher`). Add a
     /// name here whenever a new `ToolCall` variant ships.
+    #[allow(dead_code)]
     pub fn all_tool_names() -> Vec<&'static str> {
         vec![
             "glob_search_codebase",
@@ -1067,6 +1101,7 @@ pub struct ToolState {
     pub engine: tokio::sync::Mutex<Option<std::sync::Arc<crate::engine::EnginePool>>>,
     /// Clone of the emitter channel so nested plan-item loops can stream
     /// tokens/steps to the UI. Kept in sync with `InferenceState.worker_tx`.
+    #[allow(dead_code)]
     pub worker_tx: std::sync::Mutex<Option<crossbeam_channel::Sender<crate::engine::WorkerEvent>>>,
     /// The session currently running the agent loop (for plan-step events).
     pub session_id: std::sync::atomic::AtomicU64,
@@ -1144,6 +1179,7 @@ impl ToolState {
     }
 
 /// Return all workspace roots.
+    #[allow(dead_code)]
     pub async fn all_workspaces(&self) -> Vec<PathBuf> {
         self.workspace.lock().await.clone()
     }
@@ -1155,6 +1191,7 @@ impl ToolState {
 
     /// Persist the current in-memory session permissions to
     /// `{workspace}/.ai/session-permissions.json` (first workspace root).
+    #[allow(dead_code)]
     pub fn save_session_allow(&self) {
         let Some(path) = self.permissions_path() else {
             return;
@@ -1213,6 +1250,7 @@ impl ToolState {
     }
 
     /// Resolve the persistence file path from the primary workspace root.
+    #[allow(dead_code)]
     fn permissions_path(&self) -> Option<PathBuf> {
         // Primary workspace is a tokio mutex — we cannot block here on a std
         // mutex; take the first entry via try_lock and fall back to scraping

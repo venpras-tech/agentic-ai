@@ -48,11 +48,13 @@ impl McpServerConfig {
     /// Whether `tool` may be called through this server. An empty allow-list
     /// means everything is allowed; a trailing `*` in an entry acts as a
     /// prefix wildcard (`"mcp__playwright__*"` style).
+    #[allow(dead_code)]
     pub fn tool_allowed(&self, tool: &str) -> bool {
         Self::matches_allow_list(&self.allowed_tools, tool)
     }
 
     /// Allow-list matcher shared with ad-hoc calls (empty list = allow all).
+    #[allow(dead_code)]
     pub fn matches_allow_list(list: &[String], tool: &str) -> bool {
         if list.is_empty() {
             return true;

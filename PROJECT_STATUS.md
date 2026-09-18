@@ -1,6 +1,6 @@
 # AI Code Editor — Project Status
 
-**Last Updated**: 2026-09-05 (model-boundary typing, dedicated Debug profile, row-by-row subtask status, queued mid-run messages, App.tsx reducer-store consolidation, `/fork-as-background`, token-fan-out caps, multi-model subagents, bundled tokenizer)
+**Last Updated**: 2026-09-09 (chatReducer↔agent-run coordination race fixes: stale-closure ledger/activeSessionId/activeChatId reads, atomic subtask updates, guarded prompt-flush)
 **Stack**: Tauri 2 (Rust) + React 19 + Vite 6 + Tailwind v4 + Monaco editor
 **Inference**: llama.cpp GGUF (local) + OpenAI-compatible SSE (remote), multi-provider routing (Planner/Editor/Autocomplete/Embed roles)
 **Agent**: ReAct loop with 48+ tools, 4 subagent profiles (explore/implement/review/debug), plan mode, decompose mode, background tasks, custom modes, auto-memory extraction, multi-stage context compaction, repo-map (PageRank), skill auto-suggest
@@ -138,7 +138,7 @@
   - Status: Fixed — `RepoGraph` defs/incoming/outgoing (tools.rs:1575-1582) + deterministic PageRank (tools.rs:1708-1739), mtime-keyed cache (tools.rs:1747-1924), `view_repo_map` tool (tools.rs:1928-1983, dispatch 458-460). **Advertised to the model in this session**: added `view_repo_map` schema to `core.rs` tool_schemas, policy read-only allow list, subagent read-only tools, and `prompt.ts`.
 
 - [x] **No multi-provider model routing** (`src-tauri/src/engine.rs`)
-  - Status: **Wired in this session** — `ProviderRegistry` (remote.rs:911-1005) with `ProviderRole` (Planner/Editor/Autocomplete/Embed) and `route()` fallback is now registered in Tauri managed state (`ProviderRegistryState`, main.rs:58-69) with six `providers_upsert/remove/set_role/clear_role/route/list` commands (main.rs ~547-600) exposed via IPC (`src/lib/ipc.ts`) and `src/types.ts`. Integrated into `configure_remote_model` (main.rs:484-513): an Editor-routed non-Local provider overrides the caller's config; an empty registry preserves today's single remote behavior exactly. 5 new command tests. Full per-role pool execution deferred as follow-up.
+  - Status: **Wired in this session** — `ProviderRegistry` (remote.rs:911-1005) with `ProviderRole` (Planner/Editor/Autocomplete/Embed) and `route()` fallback is now registered in Tauri managed state (`ProviderRegistryState`, main.rs:58-69) with six `providers_upsert/remove/set_role/clear_role/route/list` commands (main.rs ~547-600) exposed via IPC (`src/lib/ipc.ts`) and `src/types.ts`. Integrated into `configure_remote_model` (main.rs:484-513): an Editor-routed non-Local provider overrides the caller's config; an empty registry preserves today's single remote behavior exactly. 5 new command tests. **Per-role pool execution shipped 2026-09-06** (see P0 Architecture).
 
 - [x] **No named checkpoints/snapshots** (`src-tauri/src/main.rs`)
   - Status: Fixed — user-named checkpoints persisted to `.ai/checkpoints.json` (main.rs:1930-1962); `agent_git_checkpoint_cmd` records optional names (1997-2029), `agent_checkpoint_names_cmd` browses them (2079-2088); auto-checkpoint before each file edit (tools.rs:216-232); `CheckpointMenu.tsx` save/list/revert UI.
@@ -238,6 +238,17 @@
   - Competitors: Windsurf `.windsurf/workflows/` (reusable agentic recipes), Continue.dev configurable slash commands
   - We have: Hardcoded slash commands (/plan, /bg, /clear, etc.)
   - Status: **Shipped 2026-09-02** — `workflows.rs` loads `.ai/workflows/*.md` (frontmatter `name`/`description`/`allowedTools` + body directive), exposed via `agent_workflows`/`workflow_enforce_tools` IPC. Frontend loads workflows per workspace, lists them in the `/` hint menu, and dispatches `/name <goal>` → `onWorkflowInvoke` builds the directive+goal prompt and enforces `allowedTools:` via `register_workflow_tools` (thread-local gate reusing the custom-mode enforcement path, `workflow_child_tool_verdict`). Built-in hints remain. Tests: `workflows::*` (4).
+  - **2026-09-06: `allowedTools:` now actually enforced end-to-end.** The
+    registry moved from a *thread-local* to a process-global
+    `OnceLock<Mutex<Vec<(name, allowed)>>>` — the frontend registers the
+    allow-list on an async Tauri worker thread while the orchestrator enforces
+    it on its own thread, so a thread-local store silently dropped every
+    registration (the verdict was dead code). `AgentTaskRequest` gained
+    `#[serde(default)] workflow: Option<String>`, threaded from the workflow
+    slash command through `sendPrompt`/`runAgentTask`; `run_focused_steps` now
+    denies disallowed calls alongside the custom-mode gate, and the dead
+    `workflows.rs` wrappers were removed. Test:
+    `subagent::tests::workflow_tool_registry_is_global_and_verdicts_lookup_by_name`.
 
 - [x] **No browser automation** (`src-tauri/src/agent/tools.rs`)
   - Competitors: Cline Puppeteer (navigate, click, type, screenshot), Cursor Browser tool
@@ -353,8 +364,7 @@ ranked by expected user-experience impact.
 ### High-impact UX gaps (first to close)
 
 - [x] **No command palette / quick-open** (Cursor Cmd+Shift+P, Claude Code Ctrl+B/T, Zed Ctrl+T)
-  - Status: **Shipped 2026-09-02** — hand-rolled `CommandPalette` (`cmdk`-style, no dep) wired at App.tsx; Ctrl+P opens files, Ctrl+Shift+P opens commands/tools/sessions. See ROADMAP note.
-  - Remaining: adopt real `cmdk` for fuzzy ranking/grouping polish if desired.
+  - Status: **Shipped** — `CommandPalette.tsx` rebuilt on real **`cmdk` 1.1.1** (2026-09-06): native fuzzy ranking, keyword matching, group headings and keyboard navigation; Ctrl+P opens files, Ctrl+Shift+P opens commands/tools/sessions. Same props/interface, so App.tsx wiring is unchanged.
 - [x] **No image / vision input in chat** (Copilot images+PDFs, Gemini multimodal, v0 screenshot-to-code)
   - Status: **Shipped 2026-09-04** — image paste → base64 attachment surfaced to vision-capable remote providers. Frontend: ChatPanel textarea `onPaste` reads image files → `ImageAttachment[]` (base64 data URLs) with thumbnail previews + per-image remove; `SendOptions.images` carries them through `sendPrompt` → `streamInference`/`agentRunTask` (App.tsx). Backend: `InferenceRequest.images`/`ImageAttachment` (engine.rs), `user_content_value()`/`split_data_url()` emit OpenAI `image_url` blocks and Anthropic `image` base64 blocks (remote.rs), plumbed through the orchestrator parent loop (`AgentTaskRequest.images`). Local llama.cpp has no vision and ignores images.
 - [x] **No integrated interactive terminal** (Cursor, Claude Code Desktop, Devin for Terminal)
@@ -369,7 +379,7 @@ ranked by expected user-experience impact.
 - [x] **No parallel/thread view for agents** (Cursor Agents Window, Copilot Agents Window, Zed threads, Claude Agent View)
   - We have: background task pills; no unified panel showing status/model/active-tool per session/thread.
   - Fix: a threads/sessions panel mapping to existing `EnginePool` workers + `/bg` tasks.
-  - Status: **Shipped** — `ThreadsPanel.tsx` sidebar tab showing sessions and their status.
+  - Status: **Shipped** — `ThreadsPanel.tsx` sidebar tab showing sessions and their status; **unified 2026-09-06** into a single **Sessions** sidebar tab (`SessionsPanel.tsx`) that tab-bars Resume (recent chats across projects) and Live (agent run + subtasks + background tasks + ledger), so the palette's "Resume a session…" and "Open threads / status" both land in one place.
 - [x] **No subagent status tracking row-by-row** (Copilot, Claude, Cursor track model + elapsed + active tool)
   - We have: `WorkerEvent::Subtask` but only a status label; no per-subagent model/tool/duration panel.
   - Status: **Shipped 2026-09-05** — backend `SubtaskStat` now carries `model`/`elapsed_ms`/`tool` (engine.rs, set by a `SubtaskReporter` in the orchestrator that attaches the subagent's pool model and re-emits "running" only on tool changes); frontend `agentRunStore` gained an `upsertSubtask`/`removeSubtask` `runningSubtasks` list (start time preserved across refresh events) and `ThreadsPanel` renders a live row per subagent with model chip + active `⎇ tool` + ticking elapsed (`formatMs(now - startedAt)` via its 1s ticker).
@@ -489,6 +499,20 @@ ChatPanel.tsx:691 → App.tsx:1248 sendPrompt → api.agentRunTask/streamInferen
     `plan_subtasks`, and `maybe_extract_memory` through `RuntimeRouter` with a
     pool-handle fallback; the flat execute loop keeps `primary` for KV-cache
     reuse. Test: `runtime_router_routes_local_roles_to_the_pool`.
+  - **2026-09-06: per-role pool execution shipped.** The cached single
+    `RemoteGenerator` per role is replaced with a real worker pool: each
+    remote-routed role now lazily spawns an `EnginePool` of `ROLE_POOL_WORKERS=2`
+    dedicated worker threads (one HTTP client per worker, built via
+    `EnginePool::spawn_with` + `RemoteGenerator::new` at construction — no
+    network touched), and `RuntimeRouter::resolve` hands handles out round-robin
+    across the role's workers (`next_idx` cursor). Parallel subtasks, plan mode,
+    autocomplete, and memory extraction under a routed role now run concurrently
+    instead of serializing on one cached generator; local/unrouted roles still
+    lease the primary pool (KV-cache semantics preserved). `RoutedGen` is gone —
+    `resolve` returns an owned `PoolGenerator` on both arms, and `event_tx` is
+    now plumbed into every role pool (progress/stream events flow again). Tests:
+    `runtime_router_routes_local_roles_to_the_pool`,
+    `runtime_router_spawns_worker_pool_per_remote_role`.
 
 ### P1 — Architecture (Design Quality / Maintainability)
 
@@ -510,8 +534,14 @@ ChatPanel.tsx:691 → App.tsx:1248 sendPrompt → api.agentRunTask/streamInferen
     it and passes it through `run_focused_steps`, `plan_subtasks`,
     `run_summary`, `run_subagents`/`drive_subagent`, and
     `execute_plan`/`execute_plan_inner` for exact-count compaction.
-  - Remaining: when no sibling `tokenizer.json` ships with a model we still fall
-    back to the chars/4 heuristic; a bundled/template tokenizer would remove that.
+  - **2026-09-05: the bundled tokenizer closed this gap.** A Qwen2.5-Coder BPE
+    `tokenizer.json` is embedded at compile time (`include_bytes!`, context.rs
+    `BUNDLED_TOKENIZER` `OnceLock`) and used as the default in
+    `ContextManager::new`, so exact token counts work even with no sibling
+    `tokenizer.json`; a user-supplied `tokenizer.json` still overrides via
+    `load_tokenizer` (main.rs). The chars/4 heuristic remains only as a
+    last-resort fallback (bundled-parse failure or `encode` error) and for the
+    orchestrator's `est_tokens` when no tokenizer is threaded.
 
 - [x] **No frontend state store — monolithic `App.tsx` (1809 lines, ~50 state slots)** (`src/App.tsx:71`)
   - Competitors: Cursor/Continue split UI state into a store + focused domain
@@ -521,7 +551,11 @@ ChatPanel.tsx:691 → App.tsx:1248 sendPrompt → api.agentRunTask/streamInferen
     the custom-modes domain moved into a Zustand store `src/stores/customModes.ts`
     (load/reload/apply/system-prompt + modeAwareSystemPrompt + activeModeRef all
     owned by the slice; 5 unit tests), and `zustand` added as a dependency.
-  - Remaining: sessions/model/policy state + the inline JSX callback extraction.
+  - Remaining (2026-09-02): sessions/model/policy state + the inline JSX
+    callback extraction. **All closed since** — `modelStore`/`policyStore`
+    shipped 2026-09-02; the JSX callbacks were audited 2026-09-09 and already
+    stable; the chatReducer↔agent-run coordination gap shipped 2026-09-09 (see
+    below).
   - Status: **2026-09-05: three more reducer hosts shipped** — the chat transcript
     (`stores/transcriptStore.ts`, wraps `chatReducer`), the execution DAG
     (`stores/execGraphStore.ts`, wraps `execGraphReducer`) and the turn lifecycle
@@ -533,6 +567,23 @@ ChatPanel.tsx:691 → App.tsx:1248 sendPrompt → api.agentRunTask/streamInferen
     remains a prop-feeding orchestrator; the remaining `useState` slices (genParams,
     verify/yolo/agentMode, savedRemote, workspace/chat/pane prefs) are intentionally
     left in place as low-risk UI mutations.
+  - **2026-09-09: the chatReducer↔agent-run coordination races shipped.** Auditing
+    the store split surfaced several stale-closure / non-atomic reads where event
+    handlers (registered once in `useEngineEvents`) read render-closure state that
+    had moved on; all fixed: (1) `onDone`'s ledger entry read `ledger` from the
+    render closure, which could miss `onStep`'s async `ledgerTokens` accumulation —
+    now reads `useTranscriptStore.getState().ledger` stale-safe (App.tsx onDone);
+    (2) `onTool`'s fallback read `activeSessionId` from the closure, silently
+    dropping tool events when `onDone` already fired — now falls back to
+    `useAgentRunStore.getState().activeSessionId`; (3) `onDone`/`onError` read
+    `activeChatId` from the closure for `sessionAppend`, which could persist a turn
+    under a stale chat id — mirrored in `activeChatIdRef`; (4) `onSubtask`'s
+    `setCurrentSubtask`+`upsertSubtask` (and the clear+remove pair) were two
+    non-atomic `set` calls on `agentRunStore` — `upsertSubtask` now keeps
+    `currentSubtask` in sync and `removeSubtask` clears it, in a single atomic
+    update (agentRunStore.ts); (5) the queued-prompt flush effect could overlap —
+    added a `flushInFlightRef` guard so a cue is never double-run. `npx tsc
+    --noEmit` clean, 113 frontend tests pass.
 
 - [x] **Model-boundary contract is under-typed** (`src/types.ts`, `src/lib/ipc.ts:286`)
   - Competitors: facade layers (Claude Code's `api` struct) define typed request/
@@ -730,20 +781,20 @@ ChatPanel.tsx:691 → App.tsx:1248 sendPrompt → api.agentRunTask/streamInferen
 9. ✅ Consolidate App.tsx state (chatReducer + customModes/modelStore/policyStore/filesStore/agentRunStore Zustand slices; **2026-09-05: transcript/execGraph/chatStatus reducer-stores + queue-in-store shipped**; App stays a prop-feeding orchestrator)
 
 ### Phase 8 — Competitive UI/UX (from 2026-08-31 gap analysis) ✅ Essentially Complete
-1. ✅ Command palette / quick-open: Ctrl+P files, Ctrl+Shift+P actions/tools/sessions (hand-rolled, 2026-09-02)
+1. ✅ Command palette / quick-open: Ctrl+P files, Ctrl+Shift+P actions/tools/sessions — **rebuilt on real `cmdk` 1.1.1** (fuzzy ranking, keywords, group headings; 2026-09-06)
 2. ✅ Image/vision input in chat (paste → base64 → vision providers, 2026-09-04; `browse_web` screenshots render via image decode)
 3. ✅ Integrated interactive terminal pane (`TerminalPanel.tsx` xterm.js + `terminal_spawn/write/kill/list`, Ctrl+Alt+T)
 4. ✅ Monaco inline AI completion wired to the `Autocomplete`-role generator (`ensureInlineProvider` → `api.autocomplete` → `autocomplete_generate`)
 5. ✅ Multi-file source-control / Changes panel (aggregate working-tree diffs with accept/revert, 2026-09-02)
-6. ✅ Threads/sessions panel with per-session+status (`ThreadsPanel.tsx`); **row-by-row subagent rows added 2026-09-05** (per-subtask model chip + active tool + live elapsed)
+6. ✅ Unified **Sessions** sidebar tab (`SessionsPanel.tsx`, 2026-09-06) — Resume (recent chats, keyboard-driven) + Live (agent run + row-by-row subagents + background tasks + session ledger) under one entry; replaces the separate Threads/Resume tabs
 7. ✅ Session resume picker (keyboard-driven, 2026-09-02)
 8. ✅ Model-hub downloader surfaced in ModelBar ("browse models" flow, ModelBar.tsx:556-641)
 9. ✅ Context-window breakdown by category (`ContextBreakdownBar`, StatusBar.tsx:37-79)
 10. ✅ Plan–subtask–tool graph visualization (hand-rolled DAG from `plan-step`/`subtask`/`step`/`tool` events via `execGraphReducer`; `ExecutionGraphPanel` bottom strip, Ctrl+Alt+G, 2026-09-03)
+11. ✅ **ChatPanel on `@assistant-ui/react` 0.15.18 (2026-09-06)** — ChatPanel now runs under `AssistantRuntimeProvider` + a read-only `useExternalStoreRuntime` mirror of the canonical transcript (`lib/assistantMessages.ts`: `ExternalStoreAdapter`, `convertExternalMessage`, `getAppendText`); messages render through `MessageByIndexProvider`/`MessagePrimitive.Root`; the composer is `ComposerPrimitive.Root/Input/Send` (store-controlled input, Enter via `requestSubmit`, `MessageNotSentError` preserves drafts on overflow). Slash commands, modes, image paste, history/mentions/dictation all kept; verification via `tsc` + 113 vitest tests.
 
-**Framework adoption strategy** (incremental first, big-bang only when a ChatPanel rewrite is planned):
-- **Adopt now**: `cmdk` (palette), `@xterm/xterm` (terminal ✅ adopted), OpenAI/Anthropic vision via existing attach plumbing (✅ adopted), `Zustand` (App.tsx consolidation).
-- **Evaluate for a rewrite**: `@assistant-ui/react` or `Vercel AI Elements` to replace the hand-rolled ChatPanel; `LangGraph UI` patterns for agent graph visualization.
+**Framework adoption strategy**:
+- **Adopted**: `cmdk` 1.1.1 (palette, 2026-09-06), `@xterm/xterm` (terminal), OpenAI/Anthropic vision via attach plumbing, `Zustand` (App.tsx consolidation), **`@assistant-ui/react` 0.15.18** (ChatPanel composer/thread primitives, 2026-09-06).
 
 ### Phase 9 — Agentic Modes (from 2026-08-31 modes gap analysis)
 1. ✅ Wire `smalltalk` into `stream_inference` (main.rs) + orchestrator greeting short-circuit (`should_shortcut_smalltalk`, orchestrator.rs; skips model/tool round-trip for trivial greetings unless plan/decompose — 2026-09-03)

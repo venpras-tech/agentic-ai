@@ -23,8 +23,6 @@
 //!     always reach it in agent mode.
 //!   * `delegation` — how a delegated subagent may use the tool
 //!     ([`SubagentAccess`]); parent agents may always call anything.
-//!   * `read_only`  — the tool is safe to auto-allow (skips the approval gate
-//!     unless a policy rule overrides it), returned by [`is_read_only`].
 //!
 //! Every consumer that used to hard-code a string list now derives it from here,
 //! and [`validate()`] (called by `core::test_registry_matches_dispatcher`)
@@ -59,8 +57,6 @@ pub enum SubagentAccess {
 pub struct ToolMeta {
     /// Exact snake_case name emitted by `ToolCall::name()`.
     pub name: &'static str,
-    /// Safe to auto-allow (skips the approval gate) unless overridden.
-    pub read_only: bool,
     /// How subagents may use the tool.
     pub delegation: SubagentAccess,
     /// Lazily-built JSON schema advertised to the model. Required for every
@@ -72,18 +68,7 @@ pub struct ToolMeta {
 const fn rw(name: &'static str, schema: fn() -> Value) -> ToolMeta {
     ToolMeta {
         name,
-        read_only: true,
         delegation: SubagentAccess::ReadOnly,
-        schema,
-    }
-}
-
-/// Read-only but only delegated to the `implement` profile.
-const fn ro_impl(name: &'static str, schema: fn() -> Value) -> ToolMeta {
-    ToolMeta {
-        name,
-        read_only: true,
-        delegation: SubagentAccess::Implement,
         schema,
     }
 }
@@ -92,7 +77,6 @@ const fn ro_impl(name: &'static str, schema: fn() -> Value) -> ToolMeta {
 const fn problem(name: &'static str, schema: fn() -> Value) -> ToolMeta {
     ToolMeta {
         name,
-        read_only: true,
         delegation: SubagentAccess::Forbidden,
         schema,
     }
@@ -102,7 +86,6 @@ const fn problem(name: &'static str, schema: fn() -> Value) -> ToolMeta {
 const fn parent(name: &'static str, schema: fn() -> Value) -> ToolMeta {
     ToolMeta {
         name,
-        read_only: true,
         delegation: SubagentAccess::ParentOnly,
         schema,
     }
@@ -112,7 +95,6 @@ const fn parent(name: &'static str, schema: fn() -> Value) -> ToolMeta {
 const fn mutating(name: &'static str, delegation: SubagentAccess, schema: fn() -> Value) -> ToolMeta {
     ToolMeta {
         name,
-        read_only: false,
         delegation,
         schema,
     }
@@ -712,11 +694,6 @@ impl ToolMeta {
     pub fn get(name: &str) -> Option<&'static ToolMeta> {
         TOOLS.iter().find(|m| m.name == name)
     }
-
-    /// Parent agents may always call every registered tool.
-    pub fn parent_allowed(&self) -> bool {
-        true
-    }
 }
 
 /// The JSON schema map advertised to the model — derived entirely from the
@@ -725,12 +702,8 @@ pub fn tool_schemas() -> HashMap<&'static str, Value> {
     TOOLS.iter().map(|m| (m.name, (m.schema)())).collect()
 }
 
-/// Is this tool safe to auto-allow (skip the approval gate) by default?
-pub fn is_read_only(name: &str) -> bool {
-    ToolMeta::get(name).map(|m| m.read_only).unwrap_or(false)
-}
-
 /// The canonical set of every registered tool name (used by the drift guard).
+#[allow(dead_code)]
 pub fn all_names() -> Vec<&'static str> {
     TOOLS.iter().map(|m| m.name).collect()
 }
@@ -763,6 +736,7 @@ pub fn is_parent_only(name: &str) -> bool {
 }
 
 /// Names in the parent-only set (`CHILD_NEVER`) — used by tests.
+#[allow(dead_code)]
 pub fn parent_only_names() -> Vec<&'static str> {
     TOOLS
         .iter()
@@ -773,6 +747,7 @@ pub fn parent_only_names() -> Vec<&'static str> {
 
 /// Prove the registry is internally consistent and covers every name produced
 /// by the dispatcher. Called by `core::test_registry_matches_dispatcher`.
+#[allow(dead_code)]
 pub fn validate(dispatcher_names: &[&str]) -> Result<(), String> {
     let mut registered: Vec<&'static str> = all_names();
     registered.sort_unstable();

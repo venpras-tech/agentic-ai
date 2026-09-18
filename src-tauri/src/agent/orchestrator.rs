@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use serde::Deserialize;
-use tauri::AppHandle;
+use super::ToolContext;
 use tokio_util::sync::CancellationToken;
 
 use super::context::ContextMessage;
@@ -145,9 +145,17 @@ pub struct AgentTaskRequest {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
     /// Repetition-penalty multiplier; engine defaults when omitted.
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
     pub seed: Option<u32>,
     /// How many tool-call rounds to allow (default 6).
     #[serde(default)]
@@ -179,6 +187,12 @@ pub struct AgentTaskRequest {
     /// call (a mode with no `allowedTools` is unrestricted).
     #[serde(default)]
     pub agent_mode: Option<String>,
+    /// Active user-defined workflow (`.ai/workflows/*.md`) when the task was
+    /// started from `/name <goal>`. Gates which tools may run while the
+    /// workflow's `allowedTools:` allow-list is registered (see
+    /// `subagent::workflow_child_tool_verdict`); None = unrestricted.
+    #[serde(default)]
+    pub workflow: Option<String>,
     /// Base64 image attachments (vision-capable remote providers). Carried so
     /// the plain-stream path can inject multimodal blocks; the agent loop
     /// surfaces them as a textual marker since the context stream is text-only.
@@ -328,7 +342,7 @@ fn should_shortcut_smalltalk(request: &AgentTaskRequest) -> bool {
 pub fn run_agent_loop_pool(
     pool: &EnginePool,
     tool_state: &ToolState,
-    app: &AppHandle,
+    app: &ToolContext,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
     session_id: u64,
@@ -937,7 +951,7 @@ fn finish_outcome(
 pub(crate) fn run_focused_steps(
     gen: &mut dyn TextGenerator,
     tool_state: &ToolState,
-    app: &AppHandle,
+    app: &ToolContext,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
     session_id: u64,
@@ -1016,7 +1030,7 @@ pub(crate) fn run_focused_steps(
         if dropped > 0 {
             let half = messages.len() / 2;
             if dropped > half {
-                use tauri::Emitter;
+        
                 let _ = app.emit(
                     "agent://context-trimmed",
                     ContextTrimmedEvent {
@@ -1042,7 +1056,11 @@ pub(crate) fn run_focused_steps(
             max_tokens: request.max_tokens.max(1),
             temperature: request.temperature,
             top_p: request.top_p,
+            top_k: request.top_k,
+            min_p: request.min_p,
             repeat_penalty: request.repeat_penalty,
+            frequency_penalty: request.frequency_penalty,
+            presence_penalty: request.presence_penalty,
             seed: request.seed,
             stop_words: request.stop_words.clone(),
             cached_prefix_tokens: prev_prompt_tokens,
@@ -1324,17 +1342,16 @@ pub(crate) fn run_focused_steps(
         }
         let batch = fanout_batch_size(calls.len(), over_budget > working_budget);
         let results: Vec<Result<ToolResult, String>> = {
-            // Custom-mode enforcement: when the task runs under a user-defined
-            // mode with a declared `allowedTools` list, calls outside that list
+            // Custom-mode + workflow enforcement: when the task runs under a
+            // user-defined mode with a declared `allowedTools` list — or under
+            // a `/name` workflow with the same — calls outside the allow-list
             // are replaced with a denied result instead of reaching the tools.
             let denied: Vec<Option<ToolResult>> = calls
                 .iter()
                 .map(|call| {
-                    request.agent_mode.as_ref().and_then(|mode| {
-                        if subagent::tool_allowed(mode, call.name()) {
-                            None
-                        } else {
-                            Some(ToolResult::err(
+                    if let Some(mode) = request.agent_mode.as_ref() {
+                        if !subagent::tool_allowed(mode, call.name()) {
+                            return Some(ToolResult::err(
                                 call.name(),
                                 "mode restriction".into(),
                                 format!(
@@ -1343,9 +1360,21 @@ pub(crate) fn run_focused_steps(
                                     call.name(),
                                     mode,
                                 ),
-                            ))
+                            ));
                         }
-                    })
+                    }
+                    if let Some(wf) = request.workflow.as_ref() {
+                        if let Some(reason) =
+                            subagent::workflow_child_tool_verdict(wf, call.name())
+                        {
+                            return Some(ToolResult::err(
+                                call.name(),
+                                "workflow restriction".into(),
+                                reason,
+                            ));
+                        }
+                    }
+                    None
                 })
                 .collect();
             let any_denied = denied.iter().any(Option::is_some);
@@ -1531,7 +1560,7 @@ fn short_label(text: &str, cap: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn emit_tool_event(
-    app: &AppHandle,
+    app: &ToolContext,
     state: &super::ToolState,
     id: &str,
     status: &str,
@@ -1540,7 +1569,7 @@ fn emit_tool_event(
     duration_ms: Option<u64>,
     detail: Option<String>,
 ) {
-    use tauri::Emitter;
+    
     let _ = app.emit(
         "agent://tool-event",
         AgentToolEvent {
@@ -1566,7 +1595,7 @@ fn emit_tool_event(
 /// report per delegation.
 #[allow(clippy::too_many_arguments)]
 fn run_subagents(
-    app: &AppHandle,
+    app: &ToolContext,
     tool_state: &ToolState,
     spare: Option<&EnginePool>,
     interrupt: &CancellationToken,
@@ -1835,7 +1864,7 @@ fn run_subagents(
 /// per-row progress line (model + elapsed + currently executing tool). Owned
 /// by the scoped child thread; `set_tool` re-broadcasts a "running" update
 /// only when the active tool actually changes, keeping the event stream light.
-struct SubtaskReporter {
+pub(crate) struct SubtaskReporter {
     session_id: u64,
     index: usize,
     total: usize,
@@ -1941,7 +1970,7 @@ fn subgen_for_override(
 /// seeded context, then a distilled report extracted from the final turn.
 #[allow(clippy::too_many_arguments)]
 fn drive_subagent(
-    app: &AppHandle,
+    app: &ToolContext,
     tool_state: &ToolState,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
@@ -2088,7 +2117,7 @@ fn drive_subagent(
 /// so a plan can never execute itself recursively.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_plan(
-    app: &AppHandle,
+    app: &ToolContext,
     tool_state: &ToolState,
     gen: &mut dyn TextGenerator,
     interrupt: &CancellationToken,
@@ -2129,7 +2158,7 @@ pub(crate) fn execute_plan(
 /// The inner (unguarded) plan runner; see [`execute_plan`].
 #[allow(clippy::too_many_arguments)]
 fn execute_plan_inner(
-    app: &AppHandle,
+    app: &ToolContext,
     tool_state: &ToolState,
     gen: &mut dyn TextGenerator,
     interrupt: &CancellationToken,
@@ -2376,7 +2405,7 @@ fn set_plan_status(
 }
 
 fn emit_plan_step(
-    app: &AppHandle,
+    app: &ToolContext,
     session_id: u64,
     plan_id: &str,
     item_index: usize,
@@ -2384,7 +2413,7 @@ fn emit_plan_step(
     status: &str,
     error: Option<&str>,
 ) {
-    use tauri::Emitter;
+    
     let _ = app.emit(
         "agent://plan-step",
         PlanStepEvent {
@@ -2404,7 +2433,7 @@ fn emit_plan_step(
 /// fall back to the flat loop.
 fn plan_subtasks(
     gen: &mut dyn TextGenerator,
-    app: &AppHandle,
+    app: &ToolContext,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
     session_id: u64,
@@ -2423,7 +2452,7 @@ fn plan_subtasks(
         }
         let dropped = trim_working_history(messages, working_budget, &tokenizer);
         if dropped > messages.len() / 2 {
-            use tauri::Emitter;
+    
             let _ = app.emit(
                 "agent://context-trimmed",
                 ContextTrimmedEvent {
@@ -2456,7 +2485,11 @@ fn plan_subtasks(
         max_tokens: request.max_tokens.clamp(1, 1024),
         temperature: request.temperature,
         top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
         repeat_penalty: request.repeat_penalty,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
         seed: request.seed,
         stop_words: request.stop_words.clone(),
         cached_prefix_tokens: None,
@@ -2478,7 +2511,7 @@ fn plan_subtasks(
 /// calls permitted) that becomes the user-facing answer.
 fn run_summary(
     gen: &mut dyn TextGenerator,
-    app: &AppHandle,
+    app: &ToolContext,
     interrupt: &CancellationToken,
     tx: &Sender<WorkerEvent>,
     session_id: u64,
@@ -2497,7 +2530,7 @@ fn run_summary(
         }
         let dropped = trim_working_history(messages, working_budget, &tokenizer);
         if dropped > messages.len() / 2 {
-            use tauri::Emitter;
+    
             let _ = app.emit(
                 "agent://context-trimmed",
                 ContextTrimmedEvent {
@@ -2529,7 +2562,11 @@ fn run_summary(
         max_tokens: request.max_tokens.max(1),
         temperature: request.temperature,
         top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
         repeat_penalty: request.repeat_penalty,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
         seed: request.seed,
         stop_words: request.stop_words.clone(),
         cached_prefix_tokens: None,
@@ -2628,7 +2665,11 @@ fn maybe_extract_memory(
         max_tokens: 256,
         temperature: request.temperature,
         top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
         repeat_penalty: request.repeat_penalty,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
         seed: request.seed,
         stop_words: None,
         cached_prefix_tokens: None,
@@ -2849,7 +2890,11 @@ fn summarize_old_block(
         max_tokens: 800,
         temperature: request.temperature,
         top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
         repeat_penalty: request.repeat_penalty,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
         seed: request.seed,
         stop_words: None,
         cached_prefix_tokens: None,
@@ -3336,7 +3381,11 @@ mod tests {
             temperature: Some(0.7),
             top_p: Some(0.9),
                         repeat_penalty: Some(1.0),
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: None,
+            top_k: None,
+            min_p: None,
             max_steps: None,
             stop_words: None,
             plan_mode: false,
@@ -3344,6 +3393,7 @@ mod tests {
             decompose: false,
             token_budget: None,
             agent_mode: None,
+            workflow: None,
             images: None,
         };
         let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs, &req);        assert!(ok, "summary generation returns true");
@@ -3363,7 +3413,11 @@ mod tests {
             temperature: Some(0.7),
             top_p: Some(0.9),
             repeat_penalty: Some(1.0),
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: None,
+            top_k: None,
+            min_p: None,
             max_steps: None,
             stop_words: None,
             plan_mode: false,
@@ -3371,6 +3425,7 @@ mod tests {
             decompose: false,
             token_budget: None,
             agent_mode: None,
+            workflow: None,
             images: None,
         };
         assert!(should_shortcut_smalltalk(&base()), "greeting qualifies");

@@ -40,11 +40,14 @@ interface AgentRunState {
   setIsStreaming: (v: boolean) => void;
   setLastDone: (d: InferenceDone | null) => void;
   setCurrentStep: (s: number | null) => void;
-  setCurrentSubtask: (s: SubtaskRun | null) => void;
-  /** Upsert one running sub-task, preserving its start time across refresh events. */
+  /** Upsert one running sub-task into the set, keeping `currentSubtask` in sync
+   *  atomically so subscribers never observe a partial update. */
   upsertSubtask: (s: SubtaskRun) => void;
-  /** Drop a finished sub-task by (index, total) identity. */
+  /** Clear `currentSubtask` and drop a finished sub-task by (index, total)
+   *  identity in one atomic update. */
   removeSubtask: (index: number, total: number) => void;
+  /** Mark the current sub-task (latest event) without touching the running set. */
+  setCurrentSubtask: (s: SubtaskRun | null) => void;
   /** Append a prompt to the busy-queue (updates queuedCount). */
   enqueuePrompt: (p: QueuedPrompt) => void;
   /** Dequeue the next queued prompt (no-op when empty). */
@@ -69,7 +72,6 @@ export const useAgentRunStore = create<AgentRunState>((set, get) => ({
   setIsStreaming: (v) => set({ isStreaming: v }),
   setLastDone: (d) => set({ lastDone: d }),
   setCurrentStep: (s) => set({ currentStep: s }),
-  setCurrentSubtask: (s) => set({ currentSubtask: s }),
   upsertSubtask: (s) =>
     set((state) => {
       const prev = state.runningSubtasks.find((r) =>
@@ -80,6 +82,7 @@ export const useAgentRunStore = create<AgentRunState>((set, get) => ({
           ? { ...s, startedAt: prev.startedAt }
           : s;
       return {
+        currentSubtask: merged,
         runningSubtasks: [
           ...state.runningSubtasks.filter(
             (r) => !sameSubtask(r, s.index, s.total),
@@ -89,11 +92,19 @@ export const useAgentRunStore = create<AgentRunState>((set, get) => ({
       };
     }),
   removeSubtask: (index, total) =>
-    set((state) => ({
-      runningSubtasks: state.runningSubtasks.filter(
-        (r) => !sameSubtask(r, index, total),
-      ),
-    })),
+    set((state) => {
+      const stillCurrent =
+        state.currentSubtask != null &&
+        state.currentSubtask.index === index &&
+        state.currentSubtask.total === total;
+      return {
+        currentSubtask: stillCurrent ? null : state.currentSubtask,
+        runningSubtasks: state.runningSubtasks.filter(
+          (r) => !sameSubtask(r, index, total),
+        ),
+      };
+    }),
+  setCurrentSubtask: (s) => set({ currentSubtask: s }),
   resetRun: () =>
     set({
       activeSessionId: null,

@@ -1,5 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import {
+  AssistantRuntimeProvider,
+  ComposerPrimitive,
+  MessageByIndexProvider,
+  MessagePrimitive,
+  MessageNotSentError,
+  unstable_useComposerInput,
+  useExternalStoreRuntime,
+  type AppendMessage,
+  type ExternalStoreAdapter,
+} from "@assistant-ui/react";
 
 import type {
   AgentMode,
@@ -19,6 +30,12 @@ import StatusIndicator from "./StatusIndicator";
 import { api } from "../lib/ipc";
 import type { ChatStatus } from "../lib/chatStatus";
 import { HANDOFF_OPTIONS, type HandoffChain } from "../lib/handoffChain";
+import {
+  convertExternalMessage,
+  getAppendText,
+  toExternalMessages,
+  type ExternalChatMessage,
+} from "../lib/assistantMessages";
 
 export interface SendOptions {
   planMode?: boolean;
@@ -28,6 +45,8 @@ export interface SendOptions {
   images?: ImageAttachment[];
   /** Optional mode handoff chain (Plan→Act→Review auto-continuation). */
   handoff?: HandoffChain;
+  /** Name of the `/name` workflow that produced this prompt (enforced tools). */
+  workflowName?: string;
 }
 
 interface ChatPanelProps {
@@ -794,7 +813,33 @@ function AssistantTurn({
   );
 }
 
-export default function ChatPanel(props: ChatPanelProps) {  const {
+// ---------------------------------------------------------------------------
+// assistant-ui external-store bridge
+// ---------------------------------------------------------------------------
+
+/** Stable handle ChatPanel keeps so code outside the composer's form (message
+ *  edit buttons, slash-hint chips, dictation) can write into the managed
+ *  composer text. The composer's own text lives in the assistant-ui store;
+ *  the panel keeps a `input` mirror for its hint/autocomplete logic. */
+export type ComposerBridge = {
+  setText: (text: string) => void;
+};
+
+/** Mounted inside `ComposerPrimitive.Root`; publishes the composer's
+ *  `setText` into the bridge so ChatPanel can drive it programmatically. */
+function ComposerBinder({ bridge }: { bridge: { current: ComposerBridge | null } }) {
+  const { setText } = unstable_useComposerInput();
+  useEffect(() => {
+    bridge.current = { setText };
+    return () => {
+      bridge.current = null;
+    };
+  }, [bridge, setText]);
+  return null;
+}
+
+export default function ChatPanel(props: ChatPanelProps) {
+  const {
     messages,
     streams,
     activeSessionId,
@@ -845,11 +890,22 @@ agentMode,
   const scrollRef = useRef<VirtuosoHandle>(null);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
-  const sendingRef = useRef(false);
   const historyRef = useRef<string[]>([]);
   const historyIdxRef = useRef<number>(-1);
   const [mode, setMode] = useState<SendMode>("general");
   const [handoff, setHandoff] = useState<HandoffChain>("none");
+  // `input` mirrors the managed composer text (the source of truth lives in the
+  // assistant-ui store) so the hint/autocomplete/mode logic keeps its
+  // controlled value; `mirrorRef` tracks it synchronously for async writes.
+  const mirrorRef = useRef("");
+  // Bridge into the composer (filled by <ComposerBinder/> inside the composer
+  // form) so edit buttons / hint chips / dictation can write the input text.
+  const composerBridgeRef = useRef<ComposerBridge | null>(null);
+  const setComposerText = useCallback((text: string) => {
+    mirrorRef.current = text;
+    setInput(text);
+    composerBridgeRef.current?.setText(text);
+  }, []);
 
   const streamingText = activeSessionId != null ? (streams.get(activeSessionId) ?? "") : "";
   const totalLen =
@@ -900,132 +956,170 @@ agentMode,
     setMode((cur) => (pendingPlan != null && cur === "general" ? "act" : cur));
   }, [pendingPlan]);
 
-  const submit = () => {
-    const raw = input.trim();
-    // Sending while the agent is busy is fine: `App.sendPrompt` queues the
-    // message and runs it once the current turn finishes (queued/steer).
-    // `sendingRef` only guards against double-submits within the same tick.
-    if (!raw || sendingRef.current) return;
-    if (raw.length > MAX_INPUT_CHARS) {
-      setInputError(
-        `Message is too long (${raw.length.toLocaleString()} chars; max ${MAX_INPUT_CHARS.toLocaleString()}). Shorten it and try again.`,
-      );
-      return;
-    }
-    setInputError(null);
-    sendingRef.current = true;
+  // Composer submit path. The assistant-ui composer hands us the exact text it
+  // sent (via `onNew`); everything the old controlled-textarea `submit()` did —
+  // command parsing, mode stamping, images, handoffs, history — runs from here,
+  // so Enter and the Send button share one pipeline.
+  const handleComposerSend = useCallback(
+    (raw: string) => {
+      // Sending while the agent is busy is fine: `App.sendPrompt` queues the
+      // message and runs it once the current turn finishes (queued/steer).
+      // assistant-ui's own composer de-duplicates concurrent sends.
+      if (!raw.trim()) return;
+      if (raw.length > MAX_INPUT_CHARS) {
+        setInputError(
+          `Message is too long (${raw.length.toLocaleString()} chars; max ${MAX_INPUT_CHARS.toLocaleString()}). Shorten it and try again.`,
+        );
+        // Signal the runtime so the composer restores the draft it cleared
+        // before handing us control.
+        throw new MessageNotSentError("message exceeds MAX_INPUT_CHARS");
+      }
+      setInputError(null);
 
-    // Editing mode: resubmit edited message, truncating history.
-    if (editingIndex != null && onEditResubmit) {
-      onEditResubmit(raw, editingIndex);
-      setEditingIndex(null);
-      setInput("");
-      sendingRef.current = false;
-      return;
-    }
+      // Editing mode: resubmit edited message, truncating history.
+      if (editingIndex != null && onEditResubmit) {
+        onEditResubmit(raw, editingIndex);
+        setEditingIndex(null);
+        setInput("");
+        return;
+      }
 
-    let text = raw;
-    let opts: SendOptions | undefined;
+      let text = raw;
+      let opts: SendOptions | undefined;
 
-    if (raw.startsWith("/")) {
-      const [cmd, ...rest] = raw.slice(1).split(" ");
-      const arg = rest.join(" ").trim();
-      switch (cmd) {
-        case "plan":
-          if (!arg) return;
-          text = arg;
-          opts = { planMode: true };
-          break;
-        case "act":
-          text = arg || "Proceed with the approved plan.";
-          opts = { verify };
-          break;
-        case "decompose":
-          text = arg || "Decompose the approved task and complete it.";
-          opts = { decompose: true, verify };
-          break;
-        case "fix":
-          text = arg
-            ? `Diagnose and fix: ${arg}`
-            : "Diagnose the current state of the workspace and fix any problems you find.";
-          opts = { verify: true };
-          break;
-        case "bug":
-          text =
-            "Investigate the reported bug carefully and produce a structured analysis. " +
-            "Trace the symptom to its root cause, identify the exact failing file(s)/line(s), " +
-            "explain the mechanism, then propose and apply a fix (use `analyze_bug` if available), " +
-            "and verify it. Bug report:\n" +
-            (arg || "A bug has been reported in the workspace — find it and fix it.");
-          opts = { verify: true };
-          break;
-        case "review":
-          text =
-            "Perform a thorough code review of the target and report issues by severity: " +
-            "correctness, concurrency, error-handling, security, performance and style. " +
-            "Quote the relevant code, explain each finding, and suggest concrete fixes. " +
-            "Target:\n" +
-            (arg || "Review the workspace's most recently changed file(s).");
-          opts = { verify: false };
-          break;
-        case "test":
-          text = arg
-            ? `Run the test suite and fix any failures: ${arg}`
-            : "Run the project's test suite, then diagnose and fix any failures, then re-run to verify.";
-          opts = { verify: true };
-          break;
-        case "commit":
-          text = arg || "Create a git commit with a descriptive message summarizing the current uncommitted changes.";
-          opts = { verify: false };
-          break;
-        case "skills":
-          onOpenSkills();
-          setInput("");
-          return;
-        case "clear":
-          onClear();
-          setInput("");
-          return;
-        default: {
-          // User-defined workflows (`.ai/workflows/*.md`): `/name <goal>`.
-          if (onWorkflowInvoke && workflows && workflows.some((w) => w.name === cmd)) {
-            return void (async () => {
-              const goal = arg || "Execute the workflow on the current workspace.";
-              const prompt = await onWorkflowInvoke(cmd, goal);
-              if (prompt != null) {
-                onSend(prompt, { verify });
-              }
-              historyRef.current.push(raw);
-              historyIdxRef.current = -1;
-              setInput("");
-            })();
+      if (raw.startsWith("/")) {
+        const [cmd, ...rest] = raw.slice(1).split(" ");
+        const arg = rest.join(" ").trim();
+        switch (cmd) {
+          case "plan":
+            if (!arg) {
+              // Keep the draft so the user can type the goal.
+              setComposerText(raw);
+              return;
+            }
+            text = arg;
+            opts = { planMode: true };
+            break;
+          case "act":
+            text = arg || "Proceed with the approved plan.";
+            opts = { verify };
+            break;
+          case "decompose":
+            text = arg || "Decompose the approved task and complete it.";
+            opts = { decompose: true, verify };
+            break;
+          case "fix":
+            text = arg
+              ? `Diagnose and fix: ${arg}`
+              : "Diagnose the current state of the workspace and fix any problems you find.";
+            opts = { verify: true };
+            break;
+          case "bug":
+            text =
+              "Investigate the reported bug carefully and produce a structured analysis. " +
+              "Trace the symptom to its root cause, identify the exact failing file(s)/line(s), " +
+              "explain the mechanism, then propose and apply a fix (use `analyze_bug` if available), " +
+              "and verify it. Bug report:\n" +
+              (arg || "A bug has been reported in the workspace — find it and fix it.");
+            opts = { verify: true };
+            break;
+          case "review":
+            text =
+              "Perform a thorough code review of the target and report issues by severity: " +
+              "correctness, concurrency, error-handling, security, performance and style. " +
+              "Quote the relevant code, explain each finding, and suggest concrete fixes. " +
+              "Target:\n" +
+              (arg || "Review the workspace's most recently changed file(s).");
+            opts = { verify: false };
+            break;
+          case "test":
+            text = arg
+              ? `Run the test suite and fix any failures: ${arg}`
+              : "Run the project's test suite, then diagnose and fix any failures, then re-run to verify.";
+            opts = { verify: true };
+            break;
+          case "commit":
+            text = arg || "Create a git commit with a descriptive message summarizing the current uncommitted changes.";
+            opts = { verify: false };
+            break;
+          case "skills":
+            onOpenSkills();
+            setComposerText("");
+            return;
+          case "clear":
+            onClear();
+            setComposerText("");
+            return;
+          default: {
+            // User-defined workflows (`.ai/workflows/*.md`): `/name <goal>`.
+            if (onWorkflowInvoke && workflows && workflows.some((w) => w.name === cmd)) {
+              return void (async () => {
+                const goal = arg || "Execute the workflow on the current workspace.";
+                const prompt = await onWorkflowInvoke(cmd, goal);
+                if (prompt != null) {
+                  onSend(prompt, { verify, workflowName: cmd });
+                }
+                historyRef.current.push(raw);
+                historyIdxRef.current = -1;
+                setInput("");
+              })();
+            }
+            break;
           }
-          break;
         }
       }
-    }
 
-    // When no slash command was recognised, stamp the send with the dropdown
-    // mode (except "general", which is a plain conversation). This is what lets
-    // users pick Plan/Act/Decompose/… from the composer instead of typing `/…`.
-    if (!opts && mode !== "general") {
-      text = promptForMode(mode, raw);
-      opts = optionsForMode(mode, verify);
-    }
+      // When no slash command was recognised, stamp the send with the dropdown
+      // mode (except "general", which is a plain conversation). This is what lets
+      // users pick Plan/Act/Decompose/… from the composer instead of typing `/…`.
+      if (!opts && mode !== "general") {
+        text = promptForMode(mode, raw);
+        opts = optionsForMode(mode, verify);
+      }
 
-    // Attach any pasted images to this turn.
-    const images = pendingImages;
-    setPendingImages([]);
-    onSend(text, images.length ? { ...opts, images, ...(handoff !== "none" ? { handoff } : {}) } : { ...opts, ...(handoff !== "none" ? { handoff } : {}) });
-    historyRef.current.push(raw);
-    historyIdxRef.current = -1;
-    setInput("");
-    // Reset the dropdown to General once the message is off — the next send is
-    // treated as a fresh, un-stamped turn unless the user (or context) re-picks.
-    setMode("general");
-    // Reset dedup guard after a tick so the UI state can propagate.
-    setTimeout(() => { sendingRef.current = false; }, 0);
-  };
+      // Attach any pasted images to this turn.
+      const images = pendingImages;
+      setPendingImages([]);
+      onSend(text, images.length ? { ...opts, images, ...(handoff !== "none" ? { handoff } : {}) } : { ...opts, ...(handoff !== "none" ? { handoff } : {}) });
+      historyRef.current.push(raw);
+      historyIdxRef.current = -1;
+      setInput("");
+      // Reset the dropdown to General once the message is off — the next send is
+      // treated as a fresh, un-stamped turn unless the user (or context) re-picks.
+      setMode("general");
+    },
+    [editingIndex, onEditResubmit, setComposerText, verify, mode, handoff, pendingImages, onSend, onOpenSkills, onClear, workflows, onWorkflowInvoke],
+  );
+
+  // --- assistant-ui external-store runtime --------------------------------
+  // The canonical transcript is the source of truth; assistant-ui gets a
+  // read-only mirror (no `setMessages`), so message identity, composer and
+  // accessibility semantics come from the runtime while streaming, tools,
+  // diffs and steps keep flowing through the app's own store.
+  const externalMessages = useMemo(
+    () => toExternalMessages(messages, streams),
+    [messages, streams],
+  );
+
+  const onNew = useCallback(
+    async (message: AppendMessage) => {
+      handleComposerSend(getAppendText(message));
+    },
+    [handleComposerSend],
+  );
+
+  const runtimeStore = useMemo<ExternalStoreAdapter<ExternalChatMessage>>(
+    () => ({
+      messages: externalMessages,
+      convertMessage: convertExternalMessage,
+      // Keep the input usable, but block sending until a model is loaded.
+      isSendDisabled: !modelName,
+      onNew,
+    }),
+    [externalMessages, modelName, onNew],
+  );
+
+  const runtime = useExternalStoreRuntime(runtimeStore);
 
   const showingHints = !isStreaming && input.trim().startsWith("/");
 
@@ -1040,8 +1134,8 @@ agentMode,
     : [];
 
   const insertMention = (name: string) => {
-    setInput((prev) =>
-      prev.replace(/(?:^|\s)@[\w-]*$/, (lead) => `${lead}@${name} `),
+    setComposerText(
+      input.replace(/(?:^|\s)@[\w-]*$/, (lead) => `${lead}@${name} `),
     );
   };
 
@@ -1077,9 +1171,9 @@ agentMode,
             ),
           )
           .then((text) => {
-            if (text.trim()) {
-              setInput((prev) => (prev ? `${prev} ${text.trim()}` : text.trim()));
-            }
+            const t = text.trim();
+            if (!t) return;
+            setComposerText(mirrorRef.current ? `${mirrorRef.current} ${t}` : t);
           })
           .catch(() => {})
           .finally(() => setTranscribing(false));
@@ -1092,11 +1186,12 @@ agentMode,
   };
 
   return (
-    <aside
-      aria-label="Assistant chat"
-      className="flex h-full min-h-0 min-w-0 shrink flex-col overflow-hidden border-l border-border bg-panel"
-      style={width != null ? { width, flexBasis: width, minWidth: 300, maxWidth: 720 } : undefined}
-    >
+    <AssistantRuntimeProvider runtime={runtime}>
+      <aside
+        aria-label="Assistant chat"
+        className="flex h-full min-h-0 min-w-0 shrink flex-col overflow-hidden border-l border-border bg-panel"
+        style={width != null ? { width, flexBasis: width, minWidth: 300, maxWidth: 720 } : undefined}
+      >
       <header className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-border px-3 py-1">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           Assistant
@@ -1224,70 +1319,78 @@ agentMode,
           className="min-h-0 flex-1 py-2 pl-3 pr-6 text-[12.5px]"
           followOutput={() => isAtBottom}
           atBottomStateChange={(isBottom) => setIsAtBottom(isBottom)}
-          itemContent={(i, m) =>
-            m.role === "user" ? (
-              <div key={i} className="group mb-2 mr-2 flex justify-end">
-                <div className="flex max-w-[85%] items-end gap-1">
-                  <div
-                    className={`whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-left text-zinc-800 ${
-                      editingIndex === i
-                        ? "ring-2 ring-accent bg-accent/20"
-                        : "bg-accent/15"
-                    }`}
-                  >
-                    {m.content}
-                  </div>
-                  {!isStreaming && editingIndex == null && (
-                    <button
-                      onClick={() => {
-                        setEditingIndex(i);
-                        setInput(m.content);
-                        scrollRef.current?.scrollToIndex({
-                          index: "LAST",
-                          align: "end",
-                          behavior: "smooth",
-                        });
-                      }}
-                      title="Edit & resubmit"
-                      aria-label="Edit and resubmit this message"
-                      className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-zinc-400 opacity-0 transition-opacity hover:border-border hover:text-zinc-600 group-hover:opacity-100"
-                    >
-                      ✎
-                    </button>
-                  )}
-                  {editingIndex === i && (
-                    <button
-                      onClick={() => {
-                        setEditingIndex(null);
-                        setInput("");
-                      }}
-                      title="Cancel edit"
-                      aria-label="Cancel edit"
-                      className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-red-400 hover:border-border hover:text-red-600"
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <AssistantTurn
+          itemContent={(i, m) => (
+            <MessageByIndexProvider index={i}>
+              <MessagePrimitive.Root
                 key={i}
-                message={m}
-                index={i}
-                live={isStreaming && m.sessionId === activeSessionId}
-                liveText={m.sessionId === activeSessionId ? streamingText : ""}
-                pendingPlan={
-                  pendingPlan && m.sessionId === pendingPlan.sessionId && !isStreaming
-                    ? pendingPlan
-                    : null
-                }
-                onApprovePlan={onApprovePlan}
-                onRejectPlan={onRejectPlan}
-                onDiffResolve={onDiffResolve}
-              />
-            )
-          }
+                className={m.role === "user" ? "mb-2" : undefined}
+              >
+                {m.role === "user" ? (
+                  <div className="group mr-2 flex justify-end">
+                    <div
+                      className={`flex max-w-[85%] items-end gap-1`}
+                    >
+                      <div
+                        className={`whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-left text-zinc-800 ${
+                          editingIndex === i
+                            ? "ring-2 ring-accent bg-accent/20"
+                            : "bg-accent/15"
+                        }`}
+                      >
+                        {m.content}
+                      </div>
+                      {!isStreaming && editingIndex == null && (
+                        <button
+                          onClick={() => {
+                            setEditingIndex(i);
+                            setComposerText(m.content);
+                            scrollRef.current?.scrollToIndex({
+                              index: "LAST",
+                              align: "end",
+                              behavior: "smooth",
+                            });
+                          }}
+                          title="Edit & resubmit"
+                          aria-label="Edit and resubmit this message"
+                          className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-zinc-400 opacity-0 transition-opacity hover:border-border hover:text-zinc-600 group-hover:opacity-100"
+                        >
+                          ✎
+                        </button>
+                      )}
+                      {editingIndex === i && (
+                        <button
+                          onClick={() => {
+                            setEditingIndex(null);
+                            setComposerText("");
+                          }}
+                          title="Cancel edit"
+                          aria-label="Cancel edit"
+                          className="shrink-0 rounded border border-transparent px-1 py-0.5 text-[10px] text-red-400 hover:border-border hover:text-red-600"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <AssistantTurn
+                    message={m}
+                    index={i}
+                    live={isStreaming && m.sessionId === activeSessionId}
+                    liveText={m.sessionId === activeSessionId ? streamingText : ""}
+                    pendingPlan={
+                      pendingPlan && m.sessionId === pendingPlan.sessionId && !isStreaming
+                        ? pendingPlan
+                        : null
+                    }
+                    onApprovePlan={onApprovePlan}
+                    onRejectPlan={onRejectPlan}
+                    onDiffResolve={onDiffResolve}
+                  />
+                )}
+              </MessagePrimitive.Root>
+            </MessageByIndexProvider>
+          )}
         />
       )}
 
@@ -1320,6 +1423,8 @@ agentMode,
       <StatusIndicator status={status} />
 
       <footer className="shrink-0 border-t border-border p-2">
+        <ComposerPrimitive.Root>
+        <ComposerBinder bridge={composerBridgeRef} />
         {attachments.length > 0 && (
           <div className="mb-1.5 flex flex-wrap gap-1">
             {attachments.map((a) => {
@@ -1366,7 +1471,7 @@ agentMode,
             ].map((s) => (
               <button
                 key={s.cmd}
-                onClick={() => setInput(s.cmd + " ")}
+                onClick={() => setComposerText(s.cmd + " ")}
                 className="rounded border border-border px-1.5 py-0.5 text-[10px] text-zinc-500 hover:border-accent/50 hover:text-accent"
                 title={s.hint}
               >
@@ -1409,10 +1514,10 @@ agentMode,
             ))}
           </select>
         </div>
-        <textarea
-          value={input}
+        <ComposerPrimitive.Input
           maxLength={MAX_INPUT_CHARS}
           onChange={(e) => {
+            mirrorRef.current = e.target.value;
             setInput(e.target.value);
             if (inputError) setInputError(null);
           }}
@@ -1435,13 +1540,9 @@ agentMode,
             }
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              submit();
-            }
             if (e.key === "Escape" && editingIndex != null) {
               setEditingIndex(null);
-              setInput("");
+              setComposerText("");
             }
             // Ctrl+Up / Ctrl+Down: cycle through sent message history.
             if (e.key === "ArrowUp" && (e.ctrlKey || e.metaKey)) {
@@ -1453,7 +1554,7 @@ agentMode,
               } else if (historyIdxRef.current > 0) {
                 historyIdxRef.current--;
               }
-              setInput(hist[historyIdxRef.current]);
+              setComposerText(hist[historyIdxRef.current]);
             }
             if (e.key === "ArrowDown" && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
@@ -1461,10 +1562,10 @@ agentMode,
               if (historyIdxRef.current === -1) return;
               if (historyIdxRef.current < hist.length - 1) {
                 historyIdxRef.current++;
-                setInput(hist[historyIdxRef.current]);
+                setComposerText(hist[historyIdxRef.current]);
               } else {
                 historyIdxRef.current = -1;
-                setInput("");
+                setComposerText("");
               }
             }
           }}
@@ -1525,6 +1626,7 @@ agentMode,
         <div className="mt-2 flex items-center justify-between">
           {onAttachClick && (
             <button
+              type="button"
               onClick={onAttachClick}
               title="Attach a text file for semantic search (RAG)"
               aria-label="Attach a text file for semantic search"
@@ -1534,6 +1636,7 @@ agentMode,
             </button>
           )}
           <button
+            type="button"
             onClick={() => void toggleDictation()}
             disabled={transcribing}
             aria-label={
@@ -1560,19 +1663,16 @@ agentMode,
           </button>
           {isStreaming ? (
             <button
+              type="button"
               onClick={onCancel}
               className="rounded bg-red-500/15 px-3 py-1 text-[11px] font-medium text-red-600 hover:bg-red-500/25"
             >
               ■ Stop
             </button>
           ) : (
-            <button
-              onClick={submit}
-              disabled={!input.trim() || !modelName}
-              className="rounded bg-accent px-3.5 py-1 text-[11px] font-semibold text-white hover:bg-cyan-500 disabled:opacity-40"
-            >
+            <ComposerPrimitive.Send className="rounded bg-accent px-3.5 py-1 text-[11px] font-semibold text-white hover:bg-cyan-500 disabled:opacity-40">
               {editingIndex != null ? "Resubmit" : "Send"}
-            </button>
+            </ComposerPrimitive.Send>
           )}
           {lastDone && !isStreaming && (
             <span
@@ -1597,7 +1697,9 @@ agentMode,
             </span>
           )}
         </div>
+        </ComposerPrimitive.Root>
       </footer>
     </aside>
+    </AssistantRuntimeProvider>
   );
 }

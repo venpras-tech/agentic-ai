@@ -19,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 const HF_API_BASE: &str = "https://huggingface.co";
 /// Hard cap per model file (200 GiB) purely as a sanity guard.
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+/// How often the download loop pauses to re-read the cancel/pause flags.
+/// This bounds how late a user-issued cancel/pause can land.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
@@ -70,6 +73,47 @@ struct ApiSibling {
     size: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct ApiTreeEntry {
+    path: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    lfs: Option<ApiTreeLfs>,
+}
+
+#[derive(Deserialize)]
+struct ApiTreeLfs {
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+/// Per-repo file sizes (`/api/models/{repo_id}/tree/main`). The flat search
+/// API frequently reports `null` sizes for GGUF siblings, so each repo that is
+/// missing sizes is back-filled here with a single cheap request.
+async fn fetch_tree_sizes(
+    client: &reqwest::Client,
+    repo_id: &str,
+) -> std::collections::HashMap<String, u64> {
+    let url = format!("{HF_API_BASE}/api/models/{}/tree/main", repo_id);
+    let Ok(resp) = client.get(&url).send().await else {
+        return std::collections::HashMap::new();
+    };
+    if !resp.status().is_success() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(entries) = resp.json::<Vec<ApiTreeEntry>>().await else {
+        return std::collections::HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let size = e.size.or_else(|| e.lfs.and_then(|l| l.size))?;
+            Some((e.path, size))
+        })
+        .collect()
+}
+
 /// Search the hub for GGUF model repos. `full` + `blobs` query params make
 /// the API include sibling filenames and their byte sizes.
 pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
@@ -78,7 +122,8 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
         "{HF_API_BASE}/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit={limit}&full=true&blobs=true",
         urlencode(query)
     );
-    let resp = http_client()?
+    let client = http_client()?;
+    let resp = client
         .get(&url)
         .send()
         .await
@@ -91,7 +136,7 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
         .await
         .map_err(|e| format!("Bad HF response: {e}"))?;
 
-    Ok(models
+    let mut out: Vec<HfModel> = models
         .into_iter()
         .map(|m| HfModel {
             files: m
@@ -109,7 +154,48 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
             downloads: m.downloads,
         })
         .filter(|m| !m.files.is_empty())
-        .collect())
+        .collect();
+
+    // Back-fill missing sizes for repos the search API gave us nothing for.
+    let missing: Vec<String> = out
+        .iter()
+        .filter(|m| m.files.iter().any(|f| f.size.is_none()))
+        .map(|m| m.repo_id.clone())
+        .collect();
+    if !missing.is_empty() {
+        use futures_util::stream;
+        let sizes: Vec<(String, std::collections::HashMap<String, u64>)> = stream::iter(missing)
+            .map(|repo| {
+                let client = client.clone();
+                async move {
+                    let repo2 = repo.clone();
+                    let map = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        fetch_tree_sizes(&client, &repo),
+                    )
+                    .await
+                    .unwrap_or_else(|_| std::collections::HashMap::new());
+                    (repo2, map)
+                }
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+
+        let mut index: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
+            sizes.into_iter().collect();
+        for model in out.iter_mut() {
+            if let Some(size_map) = index.remove(&model.repo_id) {
+                for f in model.files.iter_mut() {
+                    if f.size.is_none() {
+                        f.size = size_map.get(&f.name).copied();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Destination path for a repo file under `models_dir`
@@ -180,73 +266,190 @@ pub struct DownloadProgress {
 }
 
 /// Stream `https://huggingface.co/{repo}/resolve/main/{file}` into
-/// `dest_path(models_dir, repo, file)`. Resumes nothing: a partial file is
-/// overwritten. `on_progress` fires after every chunk (~256 KiB granularity).
+/// `dest_path(models_dir, repo, file)`.
+///
+/// * **Resume** — a partial `*.part` file left by a previous pause/cancel is
+///   detected and the download is continued with a `Range: bytes=N-` request
+///   (appending to the file), so pausing/restarting does not re-download.
+/// * **Pause** — when `paused` is set the loop stops streaming and returns
+///   `Err("__paused__")` *keeping* the partial file so a later call resumes.
+/// * **Cancel** — `Err("__cancelled__")` is returned, again keeping the
+///   partial file (so the UI can restart where it left off).
+///
+/// `on_progress` fires after every chunk (~256 KiB granularity).
 pub async fn download_file(
     models_dir: &Path,
     repo_id: &str,
     file_name: &str,
-    interrupt: &CancellationToken,
+    cancel: &CancellationToken,
+    paused: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf, String> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{Duration, Instant};
+
+    const STALL_SECS: u64 = 20;
+    /// Consecutive stalls tolerated before surfacing a hard error. Each stall
+    /// auto-resumes from the received byte offset, so HF CDN hiccups that used
+    /// to hang a download forever now heal themselves.
+    const MAX_STALLS: u32 = 3;
+
     let url = format!("{HF_API_BASE}/{repo_id}/resolve/main/{file_name}");
     let dest = dest_path(models_dir, repo_id, file_name);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
     }
 
-    let resp = http_client()?
-        .get(&url)
-        .timeout(std::time::Duration::MAX) // large weights; no total timeout
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Download returned HTTP {}", resp.status()));
-    }
-    let total = resp.content_length();
-
     let tmp = dest.with_extension("part");
-    let mut file = tokio::fs::File::create(&tmp)
+    let existing: u64 = tmp
+        .metadata()
+        .map(|m| m.len())
+        .ok()
+        .filter(|_| tmp.is_file())
+        .unwrap_or(0);
+
+    let mut received: u64 = existing;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&tmp)
         .await
-        .map_err(|e| format!("Failed to create `{}`: {e}", tmp.display()))?;
-    let mut received: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if interrupt.is_cancelled() {
+        .map_err(|e| format!("Failed to open `{}`: {e}", tmp.display()))?;
+    let mut stalls: u32 = 0;
+
+    // Outer connection loop: reconnects (auto-resuming via `Range`) when the
+    // inner stream goes silent, instead of leaving the download frozen at 0%
+    // forever (HF CDN hiccups used to hang rides until the process died).
+    'outer: loop {
+        if cancel.is_cancelled() {
             drop(file);
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err("__cancelled__".to_string());
         }
-        let chunk = chunk.map_err(|e| format!("Connection lost mid-download: {e}"))?;
-        received += chunk.len() as u64;
-        if received > MAX_FILE_BYTES {
+        if paused.load(Ordering::Relaxed) {
+            drop(file);
+            return Err("__paused__".to_string());
+        }
+
+        // Connect with a Range resume header; bounded so neither a dead
+        // server nor a cancel can block the reconnect path indefinitely.
+        let mut req = http_client()?.get(&url).timeout(Duration::MAX);
+        if received > 0 {
+            req = req.header("Range", format!("bytes={received}-"));
+        }
+        let send = req.send();
+        let resp = tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(STALL_SECS), send) => match r {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    let _ = e;
+                    drop(file);
+                    return Err(format!("Download failed: {e}"));
+                }
+                Err(_) => {
+                    stalls += 1;
+                    if stalls > MAX_STALLS {
+                        drop(file);
+                        return Err(format!(
+                            "Download stalled (no server response for {STALL_SECS}s, {MAX_STALLS} retries) — kept a partial file; retry to resume"
+                        ));
+                    }
+                    continue 'outer;
+                }
+            },
+            _ = cancel.clone().cancelled_owned() => {
+                drop(file);
+                return Err("__cancelled__".to_string());
+            }
+        };
+        if !resp.status().is_success() {
+            let code = resp.status();
+            drop(file);
+            return Err(format!("Download returned HTTP {code}"));
+        }
+
+        // Negotiate resume: `206 Partial Content` means the server honoured
+        // our `Range`; a plain `200` means it ignored it, so start over.
+        let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if !resumed && received > 0 {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
-            return Err("File exceeds sanity size cap".to_string());
+            file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| format!("Failed to create `{}`: {e}", tmp.display()))?;
+            received = 0;
+            stalls = 0;
         }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("Write failed: {e}"))?;
-        on_progress(DownloadProgress {
-            received,
-            total,
-            done: false,
-        });
+        let total = resp.content_length().map(|len| len + received);
+        let mut stream = resp.bytes_stream();
+
+        let mut last_data = Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                drop(file);
+                return Err("__cancelled__".to_string());
+            }
+            if paused.load(Ordering::Relaxed) {
+                drop(file);
+                return Err("__paused__".to_string());
+            }
+            // Poll with a 1s ceiling between chunk reads so cancel/pause land
+            // promptly; a silent upstream is detected via `last_data`.
+            match tokio::time::timeout(POLL_INTERVAL, stream.next()).await {
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.map_err(|e| format!("Connection lost mid-download: {e}"))?;
+                    received += chunk.len() as u64;
+                    if received > MAX_FILE_BYTES {
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        return Err("File exceeds sanity size cap".to_string());
+                    }
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| format!("Write failed: {e}"))?;
+                    last_data = Instant::now();
+                    stalls = 0;
+                    on_progress(DownloadProgress {
+                        received,
+                        total,
+                        done: false,
+                    });
+                }
+                Ok(None) => {
+                    // EOF – stream finished normally.
+                    file.flush()
+                        .await
+                        .map_err(|e| format!("Flush failed: {e}"))?;
+                    drop(file);
+                    tokio::fs::rename(&tmp, &dest)
+                        .await
+                        .map_err(|e| format!("Finalize failed: {e}"))?;
+                    on_progress(DownloadProgress {
+                        received,
+                        total,
+                        done: true,
+                    });
+                    return Ok(dest);
+                }
+                Err(_elapsed) => {
+                    if last_data.elapsed() >= Duration::from_secs(STALL_SECS) {
+                        stalls += 1;
+                        if stalls > MAX_STALLS {
+                            drop(file);
+                            return Err(format!(
+                                "Download stalled (no data for {STALL_SECS}s, {MAX_STALLS} retries) — kept a partial file; retry to resume"
+                            ));
+                        }
+                        // Reconnect from the current byte offset and keep
+                        // appending to the same `.part` file.
+                        break;
+                    }
+                }
+            }
+        }
+        // Fall through to the outer loop for a reconnect.
+        continue 'outer;
     }
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|e| format!("Flush failed: {e}"))?;
-    drop(file);
-    tokio::fs::rename(&tmp, &dest)
-        .await
-        .map_err(|e| format!("Finalize failed: {e}"))?;
-    on_progress(DownloadProgress {
-        received,
-        total,
-        done: true,
-    });
-    Ok(dest)
 }
 
 /// List every completed `*.gguf` under `models_dir` (recursive, shallow depth).
@@ -263,10 +466,14 @@ pub fn list_downloaded(models_dir: &Path) -> Vec<DownloadedModel> {
         if let Ok(files) = std::fs::read_dir(&repo_path) {
             for f in files.flatten() {
                 let p = f.path();
-                if p.extension()
+                let is_gguf = p.extension()
                     .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                // imatrix files are calibration artifacts, not runnable models.
+                let is_imatrix = p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase().contains("imatrix"))
+                    .unwrap_or(false);
+                if is_gguf && !is_imatrix {
                     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
                     out.push(DownloadedModel {
                         repo_id: repo.file_name().to_string_lossy().replace("--", "/"),
@@ -336,6 +543,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("q4.gguf"), "12345").unwrap();
         std::fs::write(repo.join("notes.txt"), "ignore me").unwrap();
+        std::fs::write(repo.join("calib.imatrix.gguf"), "x").unwrap();
         // Stray top-level file must be ignored.
         std::fs::write(dir.join("loose.gguf"), "x").unwrap();
 

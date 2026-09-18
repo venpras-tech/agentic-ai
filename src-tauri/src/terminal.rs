@@ -182,7 +182,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
     app: tauri::AppHandle,
     id: String,
     stream: &'static str,
-    mut reader: BufReader<R>,
+    reader: BufReader<R>,
 ) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = reader.lines();

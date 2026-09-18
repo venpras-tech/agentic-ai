@@ -542,6 +542,21 @@ impl RemoteGenerator {
             "temperature": request.temperature.unwrap_or(0.8),
             "top_p": request.top_p.unwrap_or(0.95),
         });
+        if let Some(k) = request.top_k {
+            body["top_k"] = json!(k.min(512));
+        }
+        if let Some(p) = request.min_p {
+            body["min_p"] = json!(p.clamp(0.0, 1.0));
+        }
+        if let Some(p) = request.frequency_penalty {
+            body["frequency_penalty"] = json!(p.clamp(0.0, 2.0));
+        }
+        if let Some(p) = request.presence_penalty {
+            body["presence_penalty"] = json!(p.clamp(0.0, 2.0));
+        }
+        if let Some(seed) = request.seed {
+            body["seed"] = json!(seed);
+        }
         let stop = request.stop_words.clone().unwrap_or_default();
         let stop: Vec<Value> = stop
             .into_iter()
@@ -651,6 +666,9 @@ impl RemoteGenerator {
             "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
         });
+        if let Some(k) = request.top_k {
+            body["top_k"] = json!(k.min(512));
+        }
         let stop = request.stop_words.clone().unwrap_or_default();
         let stop: Vec<Value> = stop
             .into_iter()
@@ -772,6 +790,7 @@ impl ProviderRole {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "editor" => Self::Editor,
@@ -823,6 +842,7 @@ impl ProviderKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "local" => Self::Local,
@@ -840,6 +860,7 @@ impl ProviderKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Local => "Local (GGUF)",
@@ -854,17 +875,6 @@ impl ProviderKind {
             Self::Groq => "Groq",
             Self::Mistral => "Mistral",
             Self::Custom => "Custom (OpenAI-compatible)",
-        }
-    }
-
-    pub fn requires_api_key(&self) -> bool {
-        !matches!(self, Self::Local | Self::Ollama | Self::LmStudio)
-    }
-
-    pub fn generation_style(&self) -> GenerationStyle {
-        match self {
-            Self::Anthropic => GenerationStyle::AnthropicMessages,
-            _ => GenerationStyle::ChatCompletions,
         }
     }
 }
@@ -899,6 +909,7 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    #[allow(dead_code)]
     pub fn local(model: impl Into<String>) -> Self {
         Self {
             id: "local".into(),
@@ -912,6 +923,7 @@ impl ProviderConfig {
         }
     }
 
+    #[allow(dead_code)]
     pub fn remote(
         kind: ProviderKind,
         name: impl Into<String>,
@@ -978,6 +990,7 @@ impl ProviderRegistry {
 
     /// Create a registry from a single local + optional remote, matching the
     /// current single-provider behaviour exactly.
+    #[allow(dead_code)]
     pub fn with_defaults(
         local_model: &str,
         remote: Option<RemoteModelConfig>,
@@ -1037,6 +1050,7 @@ impl ProviderRegistry {
         &self.providers
     }
 
+    #[allow(dead_code)]
     pub fn get_provider(&self, id: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.id == id)
     }
@@ -1166,7 +1180,6 @@ mod registry_tests {
     }
 
     #[test]
-    #[test]
     fn find_best_remote_provider_matches_model_id_or_name_case_insensitive() {
         let mut reg = ProviderRegistry::new();
         reg.add_provider(ProviderConfig::local("qwen-0.5b"));
@@ -1198,6 +1211,7 @@ mod registry_tests {
         assert!(reg.find_best_remote_provider("   ").is_none());
     }
 
+    #[test]
     fn to_remote_model_config_round_trips_correctly() {
         let cfg = ProviderConfig::remote(
             ProviderKind::OpenAI,

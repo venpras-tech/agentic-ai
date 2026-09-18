@@ -59,6 +59,7 @@ pub fn load_workflows(workspace: &Path) -> Vec<Workflow> {
 
 /// Build the effective user prompt for a workflow invocation:
 /// `{directive}\n\nGoal: {goal}`.
+#[allow(dead_code)]
 pub fn prompt_for(workflow: &Workflow, goal: &str) -> String {
     let directive = if workflow.system_prompt.is_empty() {
         format!(
@@ -70,18 +71,6 @@ pub fn prompt_for(workflow: &Workflow, goal: &str) -> String {
         workflow.system_prompt.clone()
     };
     format!("{directive}\n\nGoal: {goal}")
-}
-
-/// Register a workflow's tool allow-list under `name` so the shared
-/// `tool_allowed`/`child_verdict` enforcement gate applies for the run.
-pub fn enforce_tools(name: &str, allowed_tools: Vec<String>) {
-    super::subagent::register_workflow_tools(name, allowed_tools);
-}
-
-/// Resolve a tool-call verdict for a workflow-restricted child. `None` when no
-/// workflow restriction is active for `name` (unrestricted or not registered).
-pub fn workflow_verdict(name: &str, tool: &str) -> Option<String> {
-    super::subagent::workflow_child_tool_verdict(name, tool)
 }
 
 fn parse_workflow_file(path: &Path) -> Option<Workflow> {

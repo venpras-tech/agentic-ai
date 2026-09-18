@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::logging;
@@ -161,9 +161,6 @@ pub struct ImageAttachment {
     /// `data:image/png;base64,...` (or similar). The media type is parsed from
     /// the data URL; the payload is the base64 body.
     pub data_url: String,
-    /// Optional short label / description the model can reference.
-    #[serde(default)]
-    pub alt: String,
 }
 
 /// A single streaming inference request (camelCase over the wire).
@@ -187,11 +184,27 @@ pub struct InferenceRequest {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// Nucleus `top-k` (Ivan: number of most likely tokens kept before
+    /// rescoring). `None` uses the llama.cpp default (40).
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// `min-p` absolute cutoff: tokens below `min_p * max_logit` are pruned.
+    /// 0.0 disables; llama.cpp default is 0.05.
+    #[serde(default)]
+    pub min_p: Option<f32>,
     /// Repetition-penalty multiplier applied over the last few tokens.
     /// `None` / <=1.0 disables it; values >1.0 suppress tokens that already
     /// appeared recently, which stops small models from degenerately looping
     /// (echoing prompt fragments forever). Defaults to [`REPEAT_PENALTY_DEFAULT`].
     pub repeat_penalty: Option<f32>,
+    /// Frequency penalty (0.0 disables): how much already-sampled tokens are
+    /// penalised on each repeat, dampening repetition over long generations.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// Presence penalty (0.0 disables): a flat penalty for tokens that have
+    /// appeared at all, encouraging a richer vocabulary.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
     pub seed: Option<u32>,
     pub stop_words: Option<Vec<String>>,
     /// Number of prompt tokens already present in the KV cache from a previous
@@ -202,10 +215,14 @@ pub struct InferenceRequest {
     pub cached_prefix_tokens: Option<usize>,
 }
 
-/// Default repetition penalty when a request does not specify one.
-pub const REPEAT_PENALTY_DEFAULT: f32 = 1.15;
-/// How many recent tokens the repetition penalty looks back at.
-const REPEAT_LAST_N: i32 = 64;
+/// Default repetition penalty when a request does not specify one. 1.3 is firm
+/// enough to break degenerate loops on small models without visibly hurting a
+/// quality instruct model.
+pub const REPEAT_PENALTY_DEFAULT: f32 = 1.3;
+/// How many recent tokens the repetition penalty looks back at. 256 (llama.cpp
+/// default) catches multi-token loops ("Solution Solution Solution …"); small
+/// windows like 64 let a degenerate small model echo phrases indefinitely.
+const REPEAT_LAST_N: i32 = 256;
 
 /// Snapshot of model metadata surfaced to the frontend (camelCase).
 #[derive(Debug, Clone, Serialize)]
@@ -443,54 +460,43 @@ struct EngineWorker {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime role routing (model hand-off).
+// Runtime role routing (model hand-off + per-role worker pools).
 //
 // The [`EnginePool`] is built from one backend (usually local GGUF). The
 // [`RuntimeRouter`] lets the orchestrator hand a generation off to a different
 // provider mid-task by role: e.g. a cheap/fast remote model plans while the
 // pool's flagship model edits. Local routes (the common case) borrow a worker
-// handle from the pool; non-local routes lazily spawn a [`RemoteGenerator`]
-// and cache one per role. The router is single-threaded by design (it lives on
-// the orchestrator's own thread), so no interior mutability is needed.
+// handle from the primary pool; remote-routed roles lazily spawn their own
+// small worker pool ([`ROLE_POOL_WORKERS`] workers each, one HTTP client per
+// worker) so a single role can serve several generations concurrently. All
+// routed steps hand out owned [`PoolGenerator`] handles, so the orchestrator
+// cannot tell a local from a remote generation. The router lives on the
+// orchestrator's own thread; the only shared state (the event channel) is
+// `Clone`-cheap.
 // ---------------------------------------------------------------------------
 
-/// A generator produced by [`RuntimeRouter::resolve`] for one routed step.
-pub enum RoutedGen<'a> {
-    /// A handle into the primary engine pool (local provider).
-    Pool(PoolGenerator),
-    /// A lazily-created remote generator cached for the role.
-    Remote(&'a mut dyn TextGenerator),
-}
-
-impl TextGenerator for RoutedGen<'_> {
-    fn info(&self) -> ModelInfo {
-        match self {
-            RoutedGen::Pool(g) => g.info(),
-            RoutedGen::Remote(g) => g.info(),
-        }
-    }
-
-    fn generate(
-        &mut self,
-        request: &InferenceRequest,
-        session_id: u64,
-        interrupt: &CancellationToken,
-        tx: &Sender<WorkerEvent>,
-    ) -> Result<GenerationOutcome, String> {
-        match self {
-            RoutedGen::Pool(g) => g.generate(request, session_id, interrupt, tx),
-            RoutedGen::Remote(g) => g.generate(request, session_id, interrupt, tx),
-        }
-    }
-}
+/// How many worker threads a routed remote role's pool starts with. Each
+/// worker owns its own HTTP client, so concurrent generations on one role
+/// (e.g. parallel Planner subtasks) don't block each other.
+const ROLE_POOL_WORKERS: usize = 2;
 
 /// Routes a generation to the provider assigned to a [`ProviderRole`] at
 /// runtime (see module docs above).
 pub struct RuntimeRouter<'a> {
+    /// The primary engine pool (usually the local GGUF).
     pool: &'a EnginePool,
+    /// Snapshot of the provider registry (+ role → provider map).
     registry: ProviderRegistry,
+    /// Worker-event channel cloned into every role-pool worker so remote
+    /// token streams surface in the UI exactly like local ones.
     event_tx: Sender<WorkerEvent>,
-    remote: HashMap<ProviderRole, Box<dyn TextGenerator>>,
+    /// Lazily spawned worker pool per routed remote role. A role that routes
+    /// to a Local provider (or has no provider → default fallback) never
+    /// spawns here and instead borrows the primary pool.
+    role_pools: HashMap<ProviderRole, EnginePool>,
+    /// Round-robin cursor per remote role so consecutive generations spread
+    /// across that role's workers.
+    next_idx: HashMap<ProviderRole, usize>,
 }
 
 impl<'a> RuntimeRouter<'a> {
@@ -504,34 +510,51 @@ impl<'a> RuntimeRouter<'a> {
             pool,
             registry,
             event_tx,
-            remote: HashMap::new(),
+            role_pools: HashMap::new(),
+            next_idx: HashMap::new(),
         }
     }
 
-    /// Return a generator suitable for role `role`. Local-routed roles get a
-    /// handle into the shared pool (so KV-cache/worker semantics are preserved);
-    /// remote-routed roles get a cached per-role [`RemoteGenerator`].
-    pub fn resolve(&mut self, role: ProviderRole) -> Result<RoutedGen<'_>, String> {
+    /// Return a generator handle suitable for role `role`. Local-routed roles
+    /// lease the primary pool's worker 0 (so KV-cache/worker semantics are
+    /// preserved); remote-routed roles lazily spawn a dedicated worker pool
+    /// and hand out a handle round-robin across its workers.
+    pub fn resolve(&mut self, role: ProviderRole) -> Result<PoolGenerator, String> {
         match self.registry.route(role) {
             Some(p) if p.kind != ProviderKind::Local => {
-                if !self.remote.contains_key(&role) {
+                if !self.role_pools.contains_key(&role) {
                     let cfg = p.to_remote_model_config().map_err(|e| {
                         format!("Role `{role}` provider `{}` is not usable: {e}", p.id)
                     })?;
-                    let gen = RemoteGenerator::new(cfg)
-                        .map(|g| Box::new(g) as Box<dyn TextGenerator>)?;
-                    self.remote.insert(role, gen);
+                    let event_tx = self.event_tx.clone();
+                    let pool = EnginePool::spawn_with(
+                        move || {
+                            RemoteGenerator::new(cfg.clone())
+                                .map(|g| Box::new(g) as Box<dyn TextGenerator>)
+                        },
+                        event_tx,
+                        ROLE_POOL_WORKERS,
+                    )?;
+                    self.role_pools.insert(role, pool);
                 }
-                Ok(RoutedGen::Remote(
-                    self.remote
-                        .get_mut(&role)
-                        .expect("provider inserted above")
-                        .as_mut(),
-                ))
+                let idx = self.next_idx.entry(role).or_insert(0);
+                let handle = self
+                    .role_pools
+                    .get(&role)
+                    .expect("role pool inserted above")
+                    .handle(*idx);
+                *idx = (*idx + 1) % ROLE_POOL_WORKERS;
+                Ok(handle)
             }
             // Local (or no matching provider → default fallback): reuse pool.
-            _ => Ok(RoutedGen::Pool(self.pool.handle(0))),
+            _ => Ok(self.pool.handle(0)),
         }
+    }
+
+    /// Number of workers in a routed role's remote pool (tests only).
+    #[cfg(test)]
+    fn role_pool_len(&self, role: ProviderRole) -> Option<usize> {
+        self.role_pools.get(&role).map(EnginePool::len)
     }
 }
 
@@ -668,6 +691,22 @@ impl LoadedModel {
     }
 }
 
+/// llama.cpp's backend can only be initialized once per process — the crate
+/// tracks that with a global flag and `LlamaBackend::init()` returns
+/// `BackendAlreadyInitialized` on any second call (e.g. when loading another
+/// model after unloading one). Cache a single instance for the app lifetime so
+/// every model load shares it instead of re-initializing.
+fn global_backend() -> Result<Arc<LlamaBackend>, String> {
+    static BACKEND: OnceLock<Result<Arc<LlamaBackend>, String>> = OnceLock::new();
+    BACKEND
+        .get_or_init(|| {
+            LlamaBackend::init()
+                .map(Arc::new)
+                .map_err(|e| format!("Failed to initialize the llama backend: {e}"))
+        })
+        .clone()
+}
+
 /// AppHandle-free model load used by tests and headless tooling. `on_progress`
 /// receives llama.cpp's load progress (0.0 → 1.0) and may cancel by returning
 /// `false`.
@@ -683,9 +722,21 @@ where
         return Err(format!("Model file does not exist: {}", path.display()));
     }
 
-    let backend = Arc::new(
-        LlamaBackend::init().map_err(|e| format!("Failed to initialize the llama backend: {e}"))?,
-    );
+    // `.imatrix.gguf` files are quantization calibration data, not models.
+    // Skip llama.cpp entirely so the user gets a clear message instead of
+    // the cryptic "null result from llama cpp".
+    let is_imatrix = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase().contains("imatrix"))
+        .unwrap_or(false);
+    if is_imatrix {
+        return Err(format!(
+            "{} is a quantization calibration (imatrix) file, not a loadable model — delete it and download the actual model (see the quantized GGUF rows in the hub instead)",
+            path.display()
+        ));
+    }
+
+    let backend = global_backend()?;
 
     let n_gpu_layers = params.n_gpu_layers.unwrap_or(0);
     let requested_ctx = params.context_size.unwrap_or(4096);
@@ -953,26 +1004,34 @@ pub fn run_generation(
 fn build_sampler(request: &InferenceRequest) -> LlamaSampler {
     let temperature = request.temperature.unwrap_or(0.8).clamp(0.0, 4.0);
     let top_p = request.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
+    let top_k = request.top_k.unwrap_or(40).clamp(1, 512);
+    let min_p = request.min_p.unwrap_or(0.05).clamp(0.0, 1.0);
     let repeat_penalty = request
         .repeat_penalty
         .unwrap_or(REPEAT_PENALTY_DEFAULT)
         .clamp(1.0, 2.0);
+    let frequency_penalty = request.frequency_penalty.unwrap_or(0.0).clamp(0.0, 2.0);
+    let presence_penalty = request.presence_penalty.unwrap_or(0.0).clamp(0.0, 2.0);
     let seed = request.seed.unwrap_or(u32::MAX);
 
-    let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(4);
-    if repeat_penalty > 1.0 {
+    let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(6);
+    if repeat_penalty > 1.0 || frequency_penalty > 0.0 || presence_penalty > 0.0 {
         samplers.push(LlamaSampler::penalties(
             REPEAT_LAST_N,
             repeat_penalty,
-            0.0,
-            0.0,
+            frequency_penalty,
+            presence_penalty,
         ));
     }
     if temperature > 0.0 {
         samplers.push(LlamaSampler::temp(temperature));
     }
+    samplers.push(LlamaSampler::top_k(top_k as i32));
     if top_p > 0.0 && top_p < 1.0 {
         samplers.push(LlamaSampler::top_p(top_p, 1));
+    }
+    if min_p > 0.0 {
+        samplers.push(LlamaSampler::min_p(min_p, 1));
     }
     samplers.push(if temperature <= 0.0 {
         LlamaSampler::greedy()
@@ -1084,7 +1143,11 @@ mod tests {
             max_tokens: 8,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: None,
             stop_words: None,
             cached_prefix_tokens: None,
@@ -1140,8 +1203,9 @@ mod tests {
             ProviderRole::Embed,
         ] {
             let gen = router.resolve(role).expect("local role resolves");
-            assert!(
-                matches!(gen, RoutedGen::Pool(_)),
+            assert_eq!(
+                gen.info().name,
+                "pool",
                 "role {role:?} must reuse the pool when no remote is routed"
             );
         }
@@ -1154,7 +1218,60 @@ mod tests {
         reg.add_provider(local.clone());
         reg.set_role_provider(ProviderRole::Editor, "my_local");
         let mut router2 = RuntimeRouter::new(&pool, reg, ev_tx);
-        assert!(matches!(router2.resolve(ProviderRole::Editor), Ok(RoutedGen::Pool(_))));
+        assert_eq!(
+            router2.resolve(ProviderRole::Editor).expect("editor routes").info().name,
+            "pool"
+        );
+    }
+
+    #[test]
+    fn runtime_router_spawns_worker_pool_per_remote_role() {
+        let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
+        let pool = EnginePool::spawn_with(
+            || {
+                Ok(Box::new(FakeGen {
+                    tag: "pool".into(),
+                }) as Box<dyn TextGenerator>)
+            },
+            ev_tx.clone(),
+            1,
+        )
+        .expect("spawn pool");
+
+        // Editor role routed to a remote provider → a dedicated worker pool is
+        // lazily built (no network touched at construction time). The local
+        // default keeps every unrouted role on the primary pool.
+        let mut reg = ProviderRegistry::with_defaults("qwen", None);
+        let lm = ProviderConfig::remote(
+            ProviderKind::LmStudio,
+            "lm",
+            "http://localhost:1234/v1",
+            "",
+            "code-model",
+        );
+        reg.add_provider(lm.clone());
+        reg.set_role_provider(ProviderRole::Editor, lm.id.clone());
+
+        let mut router = RuntimeRouter::new(&pool, reg, ev_tx);
+        let gen = router
+            .resolve(ProviderRole::Editor)
+            .expect("editor routes to a remote worker pool");
+        assert_eq!(gen.info().name, "code-model");
+        assert_eq!(router.role_pool_len(ProviderRole::Editor), Some(2));
+
+        // A second resolve for the same role hands out a fresh handle (the
+        // pool is cached, not rebuilt).
+        let gen2 = router
+            .resolve(ProviderRole::Editor)
+            .expect("second editor resolve reuses the pool");
+        assert_eq!(gen2.info().name, "code-model");
+        assert_eq!(router.role_pool_len(ProviderRole::Editor), Some(2));
+
+        // An unrouted/local role still borrows the primary pool.
+        let planner = router
+            .resolve(ProviderRole::Planner)
+            .expect("planner falls back to the primary pool");
+        assert_eq!(planner.info().name, "pool");
     }
 
     /// End-to-end headless chat test: load the real GGUF, run `run_generation`
@@ -1189,7 +1306,11 @@ mod tests {
             max_tokens: 48,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            top_k: None,
+            min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,
@@ -1229,7 +1350,11 @@ mod tests {
             max_tokens: 32,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            top_k: None,
+            min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,
@@ -1252,7 +1377,11 @@ mod tests {
             max_tokens: 24,
             temperature: Some(0.0),
             top_p: Some(1.0),
+            top_k: None,
+            min_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,

@@ -19,8 +19,7 @@ import TerminalPanel from "./components/TerminalPanel";
 import ResizeHandle from "./components/ResizeHandle";
 import BackgroundTasks from "./components/BackgroundTasks";
 import ChangesPanel from "./components/ChangesPanel";
-import SessionResumePanel from "./components/SessionResumePanel";
-import ThreadsPanel from "./components/ThreadsPanel";
+import SessionsPanel from "./components/SessionsPanel";
 import CommandPalette, {
   type PaletteAction,
   type PaletteSkill,
@@ -240,9 +239,14 @@ const invokeWorkflow = useCallback(
   // chat (per project) the composer writes into. null chat id = the default
   // (legacy) chat log.
   const [leftView, setLeftView] = useState<
-    "files" | "chats" | "changes" | "resume" | "threads"
+    "files" | "chats" | "changes" | "sessions"
   >("files");
+  const [sessionsTab, setSessionsTab] = useState<"resume" | "threads">("resume");
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  // Stale-safe mirror of activeChatId for event handlers (onDone/onError) that
+  // fire after the render closure may have captured an old chat id.
+  const activeChatIdRef = useRef(activeChatId);
+  activeChatIdRef.current = activeChatId;
   const [chatsRefresh, setChatsRefresh] = useState(0);
   // Chat turn lifecycle for the animated status line (lib/chatStatus.ts).
   const chatStatus = useChatStatusStore((s) => s.status);
@@ -371,8 +375,10 @@ const invokeWorkflow = useCallback(
       const entry: LedgerEntry = {
         sessionId: e.sessionId,
         label,
-        tokens: hasSteps ? (ledger.find((l) => l.sessionId === e.sessionId)?.tokens ?? 0) : e.done.totalTokens,
-        toolCalls: ledger.find((l) => l.sessionId === e.sessionId)?.toolCalls ?? 0,
+        tokens: hasSteps
+          ? (useTranscriptStore.getState().ledger.find((l) => l.sessionId === e.sessionId)?.tokens ?? 0)
+          : e.done.totalTokens,
+        toolCalls: useTranscriptStore.getState().ledger.find((l) => l.sessionId === e.sessionId)?.toolCalls ?? 0,
         elapsedMs: start != null ? Math.round(performance.now() - start) : e.done.elapsedMs,
       };
       dispatchTranscript({ type: "ledgerSet", entry });
@@ -407,7 +413,7 @@ const invokeWorkflow = useCallback(
           ts: Date.now(),
           done: e.done,
           ...(turnId ? { turnId } : {}),
-        }, activeChatId)
+        }, activeChatIdRef.current)
         .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
       dispatchChatStatus({ type: "done", sessionId: e.sessionId, at: performance.now() });
@@ -435,7 +441,7 @@ const invokeWorkflow = useCallback(
           content: body,
           ts: Date.now(),
           ...(turnId ? { turnId } : {}),
-        }, activeChatId)
+        }, activeChatIdRef.current)
         .then(() => setChatsRefresh((n) => n + 1))
         .catch(() => {});
     },
@@ -449,7 +455,8 @@ const invokeWorkflow = useCallback(
         at: performance.now(),
       });
       // Prefer the event's own session id when a matching turn exists; fall
-      // back to the active session so late events still land.
+      // back to the latest active session (read stale-safe via getState) so
+      // late events still land even if onDone has already fired.
       const targetSessionId = (() => {
         if (e.sessionId != null) {
           const hasTurn = messagesRef.current.some(
@@ -457,7 +464,7 @@ const invokeWorkflow = useCallback(
           );
           if (hasTurn) return e.sessionId;
         }
-        return activeSessionId;
+        return useAgentRunStore.getState().activeSessionId;
       })();
       if (targetSessionId == null) return;
       const sid = targetSessionId;
@@ -547,10 +554,8 @@ const invokeWorkflow = useCallback(
           same && prev.startedAt != null
             ? prev.startedAt
             : Date.now() - (e.subtask.elapsedMs ?? 0);
-        setCurrentSubtask({ index, total, title, model, tool, startedAt });
         upsertSubtask({ index, total, title, model, tool, startedAt });
       } else {
-        setCurrentSubtask(null);
         removeSubtask(e.subtask.index, e.subtask.total);
       }
     },
@@ -1304,6 +1309,7 @@ const invokeWorkflow = useCallback(
         decompose?: boolean;
         images?: ImageAttachment[];
         handoff?: HandoffChain;
+        workflowName?: string;
       },
     ) => {
       if (opts?.planMode) {
@@ -1322,6 +1328,7 @@ const invokeWorkflow = useCallback(
         verify: opts?.verify ?? verifyRef.current,
         decompose: opts?.decompose ?? false,
         agentMode: useCustomModes.getState().activeModeRef?.name ?? undefined,
+        workflow: opts?.workflowName,
         images: opts?.images,
       });
       sessionLabelRef.current.set(sessionId, text.slice(0, 48));
@@ -1358,6 +1365,7 @@ const invokeWorkflow = useCallback(
         decompose?: boolean;
         images?: ImageAttachment[];
         handoff?: HandoffChain;
+        workflowName?: string;
       },
     ) => {
       const trimmed = text.trim();
@@ -1499,15 +1507,30 @@ const invokeWorkflow = useCallback(
   // messages submitted while busy run serially instead of being dropped.
   const sendPromptRef = useRef(sendPrompt);
   sendPromptRef.current = sendPrompt;
+  // Guards against overlapping flushes: while a queued prompt is being (re)
+  // dispatched we skip further flush attempts, so concurrent effect runs can't
+  // double-run the same cue. Reset once the dispatch call yields control back.
+  const flushInFlightRef = useRef(false);
   // Mode-handoff continuation (onDone) calls through a ref so it always sees
   // the latest runAgentTask, never a stale render's closure.
   const runAgentTaskRef = useRef(runAgentTask);
   runAgentTaskRef.current = runAgentTask;
   useEffect(() => {
-    if (isStreaming) return;
+    if (isStreaming || flushInFlightRef.current) return;
     const next = useAgentRunStore.getState().shiftPrompt();
     if (!next) return;
-    void sendPromptRef.current(next.text, next.opts);
+    flushInFlightRef.current = true;
+    try {
+      void (async () => {
+        try {
+          await sendPromptRef.current(next.text, next.opts);
+        } finally {
+          flushInFlightRef.current = false;
+        }
+      })();
+    } catch {
+      flushInFlightRef.current = false;
+    }
   }, [isStreaming]);
 
   const approvePlan = useCallback(async () => {
@@ -1949,14 +1972,20 @@ const invokeWorkflow = useCallback(
         label: "Resume a session…",
         hint: "re-open a previous chat across projects",
         keywords: "resume session restore continue history reopen picker",
-        run: () => setLeftView("resume"),
+        run: () => {
+          setSessionsTab("resume");
+          setLeftView("sessions");
+        },
       },
       {
         id: "threads-panel",
         label: "Open threads / status",
         hint: "live agent run + background task status",
         keywords: "threads tasks sessions status background agent running",
-        run: () => setLeftView("threads"),
+        run: () => {
+          setSessionsTab("threads");
+          setLeftView("sessions");
+        },
       },
     ],
     [
@@ -1964,6 +1993,7 @@ const invokeWorkflow = useCallback(
       toggleTerminal, toggleGraph, clearGraph,
       openKnowledge, isStreaming, cancelInference, agentMode, setAgentMode,
       verify, setVerify, yolo, handleYoloChange, openFilePicker, setLeftView,
+      setSessionsTab,
     ],
   );
 
@@ -2065,8 +2095,7 @@ const invokeWorkflow = useCallback(
                   ["files", "Files"],
                   ["chats", "Chats"],
                   ["changes", "Diff"],
-                  ["threads", "Threads"],
-                  ["resume", "Resume"],
+                  ["sessions", "Sessions"],
                 ] as const
               ).map(([id, label]) => (
               <button
@@ -2147,15 +2176,13 @@ const invokeWorkflow = useCallback(
           {leftView === "changes" && (
             <ChangesPanel messages={messages} onDiffResolve={handleDiffResolve} />
           )}
-          {leftView === "resume" && (
-            <SessionResumePanel
+          {leftView === "sessions" && (
+            <SessionsPanel
+              tab={sessionsTab}
+              onTabChange={setSessionsTab}
               workspaceRoot={workspaceRoot}
               onResume={switchChat}
               onNewChat={newChat}
-            />
-          )}
-          {leftView === "threads" && (
-            <ThreadsPanel
               chatStatus={chatStatus}
               activeSessionId={activeSessionId}
               currentStep={currentStep}

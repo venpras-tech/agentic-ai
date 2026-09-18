@@ -343,6 +343,50 @@ impl KnowledgeState {
         .map(|s| s.name)
     }
 
+    /// Write a sample skill straight into the target skills dir from a
+    /// name + markdown body (used by the Settings → Skills "install sample"
+    /// button). Validates the written file parses; on error the file is
+    /// removed so the dir stays clean. Returns the parsed skill name.
+    pub fn install_sample(
+        &self,
+        workspace: &Path,
+        config_dir: &Path,
+        name: &str,
+        content: &str,
+        global: bool,
+    ) -> Result<String, String> {
+        let safe: String = name
+            .trim()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        if safe.is_empty() {
+            return Err("Skill name cannot be empty".to_string());
+        }
+        let dest_dir = if global {
+            config_dir.join("skills")
+        } else {
+            workspace.join(".ai").join("skills")
+        };
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|e| format!("Failed to create `{}`: {e}", dest_dir.display()))?;
+        let dest = dest_dir.join(format!("{safe}.md"));
+        if dest.exists() {
+            return Err(format!(
+                "`{safe}` already exists in the target skills directory"
+            ));
+        }
+        std::fs::write(&dest, content)
+            .map_err(|e| format!("Failed to write `{}`: {e}", dest.display()))?;
+        match parse_skill(&dest, &dest_dir) {
+            Ok(skill) => Ok(skill.name),
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(e)
+            }
+        }
+    }
+
     /// Delete a skill's backing file/folder from disk. Returns the removed
     /// path. Call `scan` afterwards so the in-memory map matches.
     pub fn uninstall(&self, name: &str) -> Result<PathBuf, String> {
@@ -390,11 +434,13 @@ impl KnowledgeState {
     /// Fetch the full content of any available skill by name (active or not).
     /// Used by the `read_skill` tool so the model can load the *untruncated*
     /// text of a skill that was clipped from the pinned context.
+    #[allow(dead_code)]
     pub fn get_skill(&self, name: &str) -> Option<Skill> {
         self.skills.lock().unwrap().get(name).cloned()
     }
 
     /// Names of every available skill, sorted (for error messages).
+    #[allow(dead_code)]
     pub fn skill_names(&self) -> Vec<String> {
         let skills = self.skills.lock().unwrap();
         let mut names: Vec<String> = skills.keys().cloned().collect();
@@ -403,6 +449,7 @@ impl KnowledgeState {
     }
 
     /// Sorted union of all skill tags (for the UI to filter by).
+    #[allow(dead_code)]
     pub fn tags(&self) -> Vec<String> {
         let skills = self.skills.lock().unwrap();
         let mut tags: Vec<String> = skills

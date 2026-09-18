@@ -6,8 +6,7 @@
 //! filters by `sessionId` to keep background turns separate from the chat).
 
 use crossbeam_channel::Sender;
-use tauri::AppHandle;
-use tauri::Emitter;
+use super::ToolContext;
 
 use super::context::ContextMessage;
 use super::interrupt::InterruptState;
@@ -24,7 +23,7 @@ use crate::remote::ProviderRegistry;
 pub fn start_background_task(
     pool: std::sync::Arc<EnginePool>,
     tool_state: &std::sync::Arc<ToolState>,
-    app: &AppHandle,
+    app: &ToolContext,
     interrupt_state: &InterruptState,
     tx: &Sender<WorkerEvent>,
     request: &AgentTaskRequest,

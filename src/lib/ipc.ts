@@ -166,6 +166,8 @@ export interface AgentTaskRequest {
   decompose?: boolean;
   /** Active user-defined agent mode name (`.ai/modes/*.md`), if any. */
   agentMode?: string;
+  /** Active user-defined workflow name (`.ai/workflows/*.md`), if any. */
+  workflow?: string;
   /** Base64 image attachments for vision-capable remote providers. */
   images?: ImageAttachment[];
 }

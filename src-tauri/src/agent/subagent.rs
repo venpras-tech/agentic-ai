@@ -179,6 +179,7 @@ pub fn tool_allowed(profile: &str, tool: &str) -> bool {
 
 /// Parent-only tool names (previously `CHILD_NEVER`) — never callable by a
 /// child, regardless of profile or custom-mode allow list.
+#[allow(dead_code)]
 pub fn child_never() -> Vec<&'static str> {
     super::registry::parent_only_names()
 }
@@ -465,13 +466,20 @@ pub fn current_mode_model_override() -> Option<String> {
 // Workflow tool restrictions (`.ai/workflows/*.md` `allowedTools:`).
 //
 // Workflows reuse the custom-mode tool gate so `/workflow-name` runs are
-// scoped to the workflow's declared tools. A workflow is registered under its
-// name for a single invocation; entries left in the registry after the run are
-// cleared by the next call. This keeps enforcement centralized in one place.
+// scoped to the workflow's declared tools. The registry is PROCESS-GLOBAL
+// (not thread-local) on purpose: the frontend registers the allow-list via the
+// `workflow_enforce_tools` command, which runs on an async Tauri worker thread,
+// while the orchestrator enforces it on ITS own thread — a thread-local store
+// would drop the registration between the two. A workflow is registered under
+// its name for a single invocation; re-registering a name replaces any earlier
+// entry, and an empty list clears it (restricted becomes unrestricted).
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static WORKFLOW_TOOLS: RefCell<Vec<(String, Vec<String>)>> = const { RefCell::new(Vec::new()) };
+static WORKFLOW_TOOLS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+    std::sync::OnceLock::new();
+
+fn workflow_tools() -> &'static std::sync::Mutex<Vec<(String, Vec<String>)>> {
+    WORKFLOW_TOOLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Register a workflow's tool allow-list for the current execution scope.
@@ -479,26 +487,29 @@ thread_local! {
 /// becomes unrestricted). Multiple registrations accumulate; enforcement looks
 /// up the most recently registered entry by name.
 pub fn register_workflow_tools(name: &str, allowed_tools: Vec<String>) {
-    WORKFLOW_TOOLS.with(|w| {
-        let mut guard = w.borrow_mut();
-        guard.retain(|(n, _)| n != name);
-        if !allowed_tools.is_empty() {
-            guard.push((name.to_string(), allowed_tools));
-        }
-    });
+    let mut guard = workflow_tools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|(n, _)| n != name);
+    if !allowed_tools.is_empty() {
+        guard.push((name.to_string(), allowed_tools));
+    }
 }
 
 /// Tool-call verdict for a workflow-restricted child: deny `tool` when the
 /// current name's workflow declares a non-empty allow-list that excludes it.
 /// Returns `None` when unrestricted (no workflow or empty allow-list).
 pub fn workflow_child_tool_verdict(name: &str, tool: &str) -> Option<String> {
-    let allowed = WORKFLOW_TOOLS.with(|w| {
-        w.borrow()
+    let allowed = {
+        let guard = workflow_tools()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
             .iter()
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, tools)| tools.clone())
-    });
+    };
     match allowed {
         None => None,
         Some(tools) if tools.is_empty() => None, // explicit unrestricted
@@ -684,6 +695,7 @@ fn seg_match(pat: &str, text: &str) -> bool {
 /// matching the signature expected by [`enter_child`]. The mode's allowed
 /// tools are enforced via the thread-local custom mode registry (see
 /// [`register_modes`]).
+#[allow(dead_code)]
 pub fn build_mode_profile(mode: &Mode) -> &'static SubagentProfile {
     let name: &'static str = Box::leak(mode.name.clone().into_boxed_str());
     let description: &'static str = Box::leak(mode.description.clone().into_boxed_str());
@@ -816,6 +828,36 @@ mod tests {
         }
         assert_eq!(current_depth(), 0);
         assert_eq!(current_profile(), None);
+    }
+
+    #[test]
+    fn workflow_tool_registry_is_global_and_verdicts_lookup_by_name() {
+        // Registration happened on no thread yet (fresh OnceLock) — empty
+        // verdict until something is registered.
+        assert!(workflow_child_tool_verdict("release-prep", "edit_file").is_none());
+
+        // Register a restricted allow-list.
+        register_workflow_tools(
+            "release-prep",
+            vec!["edit_file".into(), "run_tests".into(), "git_commit".into()],
+        );
+
+        // Allowed tool → None (permitted).
+        assert!(workflow_child_tool_verdict("release-prep", "edit_file").is_none());
+        assert!(workflow_child_tool_verdict("release-prep", "git_commit").is_none());
+
+        // Out-of-list tool → denial naming the workflow.
+        let reason = workflow_child_tool_verdict("release-prep", "browse_web").unwrap();
+        assert!(reason.contains("release-prep"));
+        assert!(reason.contains("allowedTools"));
+
+        // Unrelated workflow name → unrestricted (not registered).
+        assert!(workflow_child_tool_verdict("other-job", "browse_web").is_none());
+
+        // Re-registering replaces the previous entry; an empty list clears it
+        // back to unrestricted.
+        register_workflow_tools("release-prep", vec![]);
+        assert!(workflow_child_tool_verdict("release-prep", "browse_web").is_none());
     }
 
     #[test]

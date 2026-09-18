@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Command } from "cmdk";
 import { api, isTauriRuntime } from "../lib/ipc";
 import type { AgentMode, FileNode, SessionProjectInfo } from "../types";
 
@@ -27,6 +28,11 @@ interface GroupedItem {
   run: () => void;
 }
 
+interface Section {
+  heading: string;
+  items: GroupedItem[];
+}
+
 interface CommandPaletteProps {
   open: boolean;
   initialMode: "commands" | "files";
@@ -43,6 +49,16 @@ interface CommandPaletteProps {
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "target", "dist", ".ai"]);
+
+const GROUP_HEADING_CLASS =
+  "[&_[data-cmdk-group-heading]]:px-3 [&_[data-cmdk-group-heading]]:pb-1 " +
+  "[&_[data-cmdk-group-heading]]:pt-2 [&_[data-cmdk-group-heading]]:text-[10px] " +
+  "[&_[data-cmdk-group-heading]]:font-semibold [&_[data-cmdk-group-heading]]:uppercase " +
+  "[&_[data-cmdk-group-heading]]:tracking-wide [&_[data-cmdk-group-heading]]:text-text-dim";
+
+const ITEM_CLASS =
+  "flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-text " +
+  "data-[selected=true]:bg-accent/15";
 
 function buildGroups(
   mode: "commands" | "files",
@@ -170,12 +186,9 @@ export default function CommandPalette({
   const [query, setQuery] = useState("");
   const [files, setFiles] = useState<string[]>([]);
   const [sessions, setSessions] = useState<SessionProjectInfo[]>([]);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(() => {
     setQuery("");
-    setActiveIndex(0);
     if (isTauriRuntime() && workspaceRoot) {
       const walk = async (root: string, rel: string | null): Promise<string[]> => {
         const out: string[] = [];
@@ -207,47 +220,41 @@ export default function CommandPalette({
     } else {
       setSessions([]);
     }
-    requestAnimationFrame(() => inputRef.current?.focus());
   }, [workspaceRoot]);
 
   useEffect(() => {
     if (open) load();
   }, [open, load]);
 
-  const groups = useMemo(
-    () => buildGroups(initialMode, query, actions, files, sessions, skills, modes, activeMode, onOpenFile, onSwitchChat, onApplyMode, onToggleSkill),
-    [initialMode, query, actions, files, sessions, skills, modes, activeMode, onOpenFile, onSwitchChat, onApplyMode, onToggleSkill],
-  );
-
-  const selectable = groups;
-
-  useEffect(() => {
-    setActiveIndex((i) => Math.min(i, Math.max(selectable.length - 1, 0)));
-  }, [selectable.length]);
+  const sections = useMemo<Section[]>(() => {
+    const groups = buildGroups(
+      initialMode,
+      query,
+      actions,
+      files,
+      sessions,
+      skills,
+      modes,
+      activeMode,
+      onOpenFile,
+      onSwitchChat,
+      onApplyMode,
+      onToggleSkill,
+    );
+    const out: Section[] = [];
+    for (const g of groups) {
+      const last = out[out.length - 1];
+      if (last && last.heading === g.group) last.items.push(g);
+      else out.push({ heading: g.group, items: [g] });
+    }
+    return out;
+  }, [initialMode, query, actions, files, sessions, skills, modes, activeMode, onOpenFile, onSwitchChat, onApplyMode, onToggleSkill]);
 
   if (!open) return null;
 
-  const runIndex = (idx: number) => {
-    const item = selectable[idx];
-    if (!item) return;
+  const select = (item: GroupedItem) => {
     item.run();
     onClose();
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setActiveIndex((i) => Math.min(i + 1, selectable.length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setActiveIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      runIndex(activeIndex);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
-    }
   };
 
   return (
@@ -263,71 +270,61 @@ export default function CommandPalette({
         aria-modal="true"
         aria-label="Command palette"
       >
-        <div className="flex items-center gap-2 border-b border-panel-3 px-3 py-2.5">
-          <span className="text-text-dim">⌕</span>
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setActiveIndex(0);
-            }}
-            onKeyDown={onKeyDown}
-            placeholder={
-              initialMode === "files"
-                ? "Open a file… (Ctrl+Shift+P for commands)"
-                : "Type a command, file, chat, skill, or mode…"
+        <Command
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              onClose();
             }
-            className="flex-1 bg-transparent text-sm text-text focus:outline-none placeholder:text-text-dim"
-          />
-        </div>
-        <div className="max-h-[55vh] overflow-y-auto py-1">
-          {selectable.length === 0 ? (
-            <div className="px-4 py-6 text-center text-sm text-text-dim">
+          }}
+          className="flex flex-col"
+        >
+          <div className="flex items-center gap-2 border-b border-panel-3 px-3 py-2.5">
+            <span className="text-text-dim">⌕</span>
+            <Command.Input
+              value={query}
+              onValueChange={setQuery}
+              autoFocus
+              placeholder={
+                initialMode === "files"
+                  ? "Open a file… (Ctrl+Shift+P for commands)"
+                  : "Type a command, file, chat, skill, or mode…"
+              }
+              className="w-full flex-1 bg-transparent text-sm text-text focus:outline-none placeholder:text-text-dim"
+            />
+          </div>
+          <Command.List className="max-h-[55vh] overflow-y-auto py-1">
+            <Command.Empty className="px-4 py-6 text-center text-sm text-text-dim">
               No results
-            </div>
-          ) : (
-            (() => {
-              let lastHeader = "";
-              return selectable.map((g, i) => {
-                const header = g.group !== lastHeader ? g.group : null;
-                if (header) lastHeader = g.group;
-                return (
-                  <div key={g.key}>
-                    {header && (
-                      <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-text-dim">
-                        {header}
-                      </div>
+            </Command.Empty>
+            {sections.map((sec) => (
+              <Command.Group key={sec.heading} heading={sec.heading} className={GROUP_HEADING_CLASS}>
+                {sec.items.map((item) => (
+                  <Command.Item
+                    key={item.key}
+                    value={item.key}
+                    keywords={item.keywords ? item.keywords.split(/\s+/) : undefined}
+                    onSelect={() => select(item)}
+                    className={ITEM_CLASS}
+                  >
+                    <span className="w-4 shrink-0 text-center text-xs text-text-dim">
+                      {item.icon}
+                    </span>
+                    <span className="flex-1 truncate">{item.label}</span>
+                    {item.hint && (
+                      <span className="shrink-0 text-xs text-text-dim">{item.hint}</span>
                     )}
-                    <button
-                      type="button"
-                      onMouseEnter={() => setActiveIndex(i)}
-                      onClick={() => runIndex(i)}
-                      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${
-                        i === activeIndex ? "bg-accent/15" : ""
-                      }`}
-                    >
-                      <span className="w-4 shrink-0 text-center text-xs text-text-dim">
-                        {g.icon}
-                      </span>
-                      <span className="flex-1 truncate">{g.label}</span>
-                      {g.hint && (
-                        <span className="shrink-0 text-xs text-text-dim">
-                          {g.hint}
-                        </span>
-                      )}
-                    </button>
-                  </div>
-                );
-              });
-            })()
-          )}
-        </div>
-        <div className="flex items-center gap-3 border-t border-panel-3 px-3 py-1.5 text-[10px] text-text-dim">
-          <span>↑↓ navigate</span>
-          <span>↵ select</span>
-          <span>esc close</span>
-        </div>
+                  </Command.Item>
+                ))}
+              </Command.Group>
+            ))}
+          </Command.List>
+          <div className="flex items-center gap-3 border-t border-panel-3 px-3 py-1.5 text-[10px] text-text-dim">
+            <span>↑↓ navigate</span>
+            <span>↵ select</span>
+            <span>esc close</span>
+          </div>
+        </Command>
       </div>
     </div>
   );

@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 # `tray-icon` powers the BN-11 system tray (Show/Quit menu, built in main.rs).
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 # Auto-update support. The updater itself is only registered at runtime when a
 # signing key is configured (see main.rs); the process plugin powers
 # "restart to install". Permissions are wired in capabilities/default.json.
@@ -52,6 +53,9 @@ chrono = "0.4"
 trash = "5"
 # Filesystem watcher for auto-reload on external workspace changes.
 notify = "7"
+# Lightweight system introspection (RAM / CPU / disks) for the model-fit
+# estimator on the Hugging Face download page.
+sysinfo = "0.30"
 # Pinned exactly: llama-cpp-2 explicitly does not follow semver, so a lockstep
 # pin protects against API drift in the volatile llama.cpp bindings.
 # CPU-only baseline: `common` + `sampler`. GPU backends are opt-in Cargo

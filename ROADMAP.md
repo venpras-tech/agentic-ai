@@ -1,15 +1,20 @@
 # Roadmap — From "local chat + editor" to "super agentic coding agent"
 
-_Last updated: 2026-08-25 (**P2-12 background tasks shipped** — `/bg` prefix
+_Last updated: 2026-09-09 (**status-doc reconciliation** — removed now-stale
+"remaining" notes: tree-sitter queries, KV-cache reuse, token-budget fan-out
+caps, model hot-swap, and session branch/watch are all shipped; the neural
+embedder is intentionally replaced by a deterministic n-gram embedder). Earlier:
+P2-12 background tasks shipped — `/bg` prefix
 starts an independent agent task with per-task cancellation, pill UI, abort
-controls. Earlier: LLM sync overhaul, inline agentic UI, repeat-penalty
-hotfix, P1-8/P1-9/P1-10/P1-11, Bionic backlog BN-2…BN-8). Then: inline
+controls. Then: inline
 agentic UI + repeat-penalty hotfix; P1-9/P1-10/P1-11 shipped —
 blocking `ask_question` + `send_to_user`, extended git/GitHub tools via a
 generic `run_capture`, single-file `read_lints`; P1-8 first-class subagents.
-Bionic backlog BN-2…BN-8 verified complete. BN-9/BN-10 partial:
-neural embedder and Voice Keyboard overlay remain).
-Strategic plan derived from a full codebase audit (`src/` +
+Bionic backlog BN-2…BN-8 verified complete. BN-9 (neural embedder) deliberately
+resolved with a deterministic hashed n-gram embedder; BN-10 (Voice Keyboard
+overlay) remains the only unimplemented backlog item (low value for a desktop
+editor)._
+_Strategic plan derived from a full codebase audit (`src/` +
 `src-tauri/src/`). Companion to `PROJECT_STATUS.md` (session status / source of
 truth for what has shipped)._
 _Tick marks (`[x]`) = shipped; `[ ]` = remaining._
@@ -195,13 +200,19 @@ concurrent generations.
     blame/push/pull/create_branch + gh pr/ci status/create_pr via a generic
     capture runner; single-file `read_lints` (tree-sitter syntax errors,
     comment markers, empty-catch/debugger checks; delete was already BN-1).
-Remaining P1: `ast-grep`-style tree-sitter queries, token-budget-aware
-tool fan-out caps, KV-cache reuse across steps, model hot-swap.
+[The old "Remaining P1" line — `ast-grep` tree-sitter queries, token-budget
+fan-out caps, KV-cache reuse, model hot-swap — is now fully shipped: the
+`tree_sitter_query` tool (P2 legacy ✅), `MAX_PARALLEL_FANOUT` cap
+(orchestrator.rs, 2026-09-05), cross-step KV-cache prefix reuse (P0), and
+model hot-swap / selection UI (✅ table).]
 **P2-12 shipped (2026-08-25)**: background work + multitasking — `/bg` prefix
 starts an independent agent task; per-task `CancellationToken`; lifecycle
 events via `agent://bg-task-event`; pill UI with expandable task list and abort
-controls. Remaining P2: session management UI (list/fork/watch), modes
-(ASK/DEBUG/CUSTOM).
+controls. Session branch/watch shipped 2026-09-05 (`session_fork` with lineage
+via `.meta.json` sidecars; live "watch" via the stateless status poll). Session management
+UI shipped 2026-09-06: resume picker, threads/status panel, and a unified
+Sessions sidebar tab (history + live status) plus a real `cmdk` command
+palette; modes (ASK/DEBUG/CUSTOM + `.ai/modes/*.md`) shipped 2026-09-05.
 11. **Phase 2 P0 Agent Gaps (2026-08-29, all shipped)** — skills active flags
     persisted to `.ai/skills-state.json` (`save_active_state`/`load_active_state`);
     session permissions persisted to `.ai/session-permissions.json`
@@ -259,7 +270,10 @@ controls. Remaining P2: session management UI (list/fork/watch), modes
       editor-tab/agent-run domains — including replacing the `isStreamingRef`
       stale-closure mirror with a getState-backed `runStreaming()` helper;
       remaining: trailing inline JSX callback extraction + closing the
-      chatReducer↔agent-run coordination gap.
+      chatReducer↔agent-run coordination gap. **Both closed 2026-09-09** — the
+      remaining inline callbacks were audited and already stable, and the
+      coordination gap (stale-closure ledger/session/chat reads, non-atomic
+      subtask updates, guarded prompt-flush) shipped (see PROJECT_STATUS P1).
 
 _Design principle going forward (mirrors competitors): keep the **model boundary**
 (what the model sees: registry-driven tools, exact-token context) and the **UI
