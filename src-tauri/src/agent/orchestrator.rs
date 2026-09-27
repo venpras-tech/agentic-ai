@@ -29,9 +29,11 @@ use super::context::ContextMessage;
 use super::plan::{self, PlanState, PlanStatus};
 use super::subagent::{self, SubagentProfile};
 use super::{
-    core::parse_tool_calls, now_ms, tools, AgentToolEvent, ContextTrimmedEvent, PlanStepEvent,
-    ToolCall, ToolResult, ToolState,
+    core::{extract_hitl_gate, parse_tool_calls, HITL_DIRECTIVE},
+    now_ms, tools, AgentToolEvent, ContextTrimmedEvent, PlanStepEvent, ToolCall, ToolResult,
+    ToolState,
 };
+use crate::agent::SteerAppliedEvent;
 use crate::engine::{
     ChatTurn, EnginePool, GenerationOutcome, InferenceDone, InferenceRequest, ModelInfo,
     PoolGenerator, ProviderRole, RuntimeRouter, StepStat, SubtaskStat, TextGenerator, WorkerEvent,
@@ -66,6 +68,20 @@ const SUBAGENT_TITLE_CHARS: usize = 48;
 /// block (stage-3 compaction) instead of dropping it. Bounded because each
 /// pass costs a generation.
 const MAX_SUMMARIZATIONS: usize = 2;
+/// Local models below this parameter count are never asked to self-gate with
+/// the `<hitl_gate>` prose marker (see [`HITL_DIRECTIVE`]). For them the
+/// harness-side policy gate in `tools::dispatch` is the only approval path,
+/// matching Claude Code / Cursor / opencode: the model proposes tool calls and
+/// the harness gates them, rather than the model emitting approval markup.
+/// Remote providers report `n_params == 0` and are skipped as well (capable
+/// models do not need the crutch, and the parser still honors the marker if a
+/// provider emits it unprompted).
+const MODEL_GATE_MIN_PARAMS: u64 = 1_000_000_000;
+/// How many times the loop may bounce the model for echoing the previous
+/// assistant turn verbatim instead of taking an action. The first echo gets a
+/// correction; a second identical echo means the model is stuck and the loop
+/// stops with a "stuck" outcome instead of surfacing the repeated text.
+const MAX_REPEAT_BOUNCES: usize = 1;
 /// Max messages folded into one summary block.
 const SUMMARY_BLOCK_MAX_MSGS: usize = 6;
 /// Max chars of source text fed to the summarizer (protect the token budget).
@@ -112,12 +128,15 @@ fn is_refusal(text: &str) -> bool {
 /// tools? Returns `true` for messages that contain coding-related keywords or
 /// patterns, `false` for pure greetings / small talk.
 fn is_coding_task(message: &str) -> bool {
+    if super::smalltalk::is_ambiguous_short_probe(message) {
+        return false;
+    }
     let lower = message.to_lowercase();
     // Direct coding keywords — must be present for the task to qualify.
     let keywords = [
         "create", "build", "add", "fix", "refactor", "implement", "set up",
         "scaffold", "install", "configure", "write", "update", "modify",
-        "delete", "remove", "move", "rename", "copy", "test", "debug",
+        "delete", "remove", "move", "rename", "copy", "debug",
         "deploy", "migrate", "upgrade", "setup", "generate",
         "project", "app", "application", "component", "function", "class",
         "module", "file", "folder", "directory", "code", "script",
@@ -126,15 +145,24 @@ fn is_coding_task(message: &str) -> bool {
         "javascript", "html", "css", "sql", "api", "rest", "graphql",
     ];
     for kw in &keywords {
-        if lower.contains(kw) {
+        if word_contains(lower.as_str(), kw) {
             return true;
         }
+    }
+    if word_contains(lower.as_str(), "test") || word_contains(lower.as_str(), "tests") {
+        return lower.split_whitespace().count() > 1;
     }
     false
 }
 
+fn word_contains(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w == word)
+}
+
 /// Frontend → orchestrator task request (camelCase over the wire).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTaskRequest {
     /// The user's instruction. Kept for API symmetry; the authoritative prompt
@@ -143,20 +171,6 @@ pub struct AgentTaskRequest {
     pub prompt: String,
     /// Per-step generation ceiling.
     pub max_tokens: u32,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    #[serde(default)]
-    pub top_k: Option<u32>,
-    #[serde(default)]
-    pub min_p: Option<f32>,
-    /// Repetition-penalty multiplier; engine defaults when omitted.
-    #[serde(default)]
-    pub repeat_penalty: Option<f32>,
-    #[serde(default)]
-    pub frequency_penalty: Option<f32>,
-    #[serde(default)]
-    pub presence_penalty: Option<f32>,
-    pub seed: Option<u32>,
     /// How many tool-call rounds to allow (default 6).
     #[serde(default)]
     pub max_steps: Option<usize>,
@@ -352,11 +366,34 @@ pub fn run_agent_loop_pool(
     role_registry: Option<crate::remote::ProviderRegistry>,
     tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<AgentOutcome, String> {
-    let max_steps = request
+    let mut max_steps = request
         .max_steps
         .unwrap_or(DEFAULT_MAX_STEPS)
         .clamp(1, ABSOLUTE_MAX_STEPS);
+    let n_params = pool.info().n_params;
+    if n_params > 0 && n_params < 1_000_000_000 {
+        max_steps = max_steps.min(4);
+    }
     let mut messages: Vec<ContextMessage> = context_messages.to_vec();
+    // Teach the model the `<hitl_gate>` approval marker once per loop — but only
+    // for capable local models (skipped when the frontend already documented it,
+    // e.g. in a mode/system prompt). The real approval path is the harness-side
+    // policy gate in `tools::dispatch` (`policy::check` → `Ask` → user decision),
+    // exactly like Claude Code / Cursor / opencode, which gate at the tool call
+    // and never ask the model to self-gate in prose. Tiny local models mangle
+    // prose gate instructions into degenerate filler ("I understand… proceeding
+    // with approval") and emit the marker for trivial questions instead of tools.
+    if pool.info().n_params >= MODEL_GATE_MIN_PARAMS
+        && !messages
+            .iter()
+            .any(|m| m.content.contains("<hitl_gate") || m.content.contains(HITL_DIRECTIVE))
+    {
+        messages.push(ContextMessage {
+            role: "system".into(),
+            content: HITL_DIRECTIVE.to_string(),
+            pinned: false,
+        });
+    }
     let working_budget = (context_budget as f32 * super::context::EVICTION_THRESHOLD) as usize;
 
     // Runtime role router (P0 architecture gap 3): lets plan phases run on a
@@ -885,6 +922,11 @@ pub fn run_agent_loop_pool(
         request,
         &outcome.reason,
     );
+    // The run is over: drop anything still queued. A steer that never got a
+    // step boundary to land on would otherwise be picked up by the next run and
+    // silently applied to an unrelated conversation.
+    tool_state.clear_steers();
+
     finish_outcome(
         started,
         total_tokens,
@@ -979,10 +1021,16 @@ pub(crate) fn run_focused_steps(
     let mut self_heal_injections = 0usize;
     let mut todo_nudges = 0usize;
     let mut tool_use_enforcements = 0usize;
+    let mut repeat_bounces = 0usize;
     let mut verify_passes = 0usize;
     let mut summarize_count = 0usize;
     // Track previous prompt token count for KV-cache prefix reuse.
     let mut prev_prompt_tokens: Option<usize> = None;
+    // When the user steers mid-run, their message becomes the trailing `## User`
+    // section instead of the original `request.prompt`, so it is the last thing
+    // the model reads. Without this, `build_prompt` would see a non-matching
+    // tail and re-append the original request *after* the steer.
+    let mut steer_tail: Option<String> = None;
 
     'steps: for step in 0..max_steps {
         if interrupt.is_cancelled() {
@@ -995,6 +1043,35 @@ pub(crate) fn run_focused_steps(
         tool_state
             .step_checkpointed
             .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // ---- steering: fold in anything the user submitted while this run was
+        // already in flight. Drained at a step boundary, so the earliest a steer
+        // can land is the step after the one in progress.
+        //
+        // Subagent loops are skipped: a steer is addressed to the top-level
+        // conversation, and a child's `messages` vec is a separate history, so
+        // draining here would both apply the steer to the wrong conversation
+        // and consume it before the parent ever saw it.
+        if !is_child {
+            let steers = tool_state.take_steers(session_id);
+            for s in &steers {
+                messages.push(ContextMessage {
+                    role: "user".into(),
+                    content: s.text.clone(),
+                    pinned: false,
+                });
+                steer_tail = Some(s.text.clone());
+                let _ = app.emit(
+                    "agent://steer-applied",
+                    SteerAppliedEvent {
+                        id: s.id.clone(),
+                        session_id,
+                        text: s.text.clone(),
+                        step,
+                    },
+                );
+            }
+        }
 
         // ---- self-healing: when the previous step's tools all failed, force a
         // critical self-assessment so the next attempt is a correction, not a
@@ -1021,7 +1098,7 @@ pub(crate) fn run_focused_steps(
             .map(|m| tok_count(&tokenizer, &m.content))
             .sum();
         if over_budget > working_budget && summarize_count < MAX_SUMMARIZATIONS {
-            if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+            if summarize_old_block(gen, interrupt, tx, session_id, messages) {
                 summarize_count += 1;
             }
         }
@@ -1041,7 +1118,8 @@ pub(crate) fn run_focused_steps(
                 );
             }
         }
-        let mut prompt = build_prompt(messages, &request.prompt);
+        let tail_user = steer_tail.as_deref().unwrap_or(request.prompt.trim());
+        let mut prompt = build_prompt(messages, tail_user);
         if let Some(focus) = focus {
             prompt.push_str("\n## Current subtask\n");
             prompt.push_str(focus);
@@ -1054,16 +1132,9 @@ pub(crate) fn run_focused_steps(
             messages: Some(chat_turns(messages, focus)),
             images: request.images.clone(),
             max_tokens: request.max_tokens.max(1),
-            temperature: request.temperature,
-            top_p: request.top_p,
-            top_k: request.top_k,
-            min_p: request.min_p,
-            repeat_penalty: request.repeat_penalty,
-            frequency_penalty: request.frequency_penalty,
-            presence_penalty: request.presence_penalty,
-            seed: request.seed,
             stop_words: request.stop_words.clone(),
             cached_prefix_tokens: prev_prompt_tokens,
+            ..Default::default()
         };
 
         let outcome = gen
@@ -1106,6 +1177,72 @@ pub(crate) fn run_focused_steps(
 
         let mut warns = Vec::new();
         let calls = parse_tool_calls(&text, &mut |w| warns.push(w));
+
+        // ---- Degenerate-repeat guard: a small local model sometimes echoes the
+        // previous assistant turn verbatim (identical text, no tool calls), which
+        // makes every request look like it returned the same canned reply. Bounce
+        // once with a correction; a second identical echo means the model is stuck,
+        // so stop with a clean indication instead of surfacing the repeated text.
+        if calls.is_empty() {
+            let last_assistant = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .map(|m| m.content.trim());
+            let echoed = last_assistant.is_some_and(|prev| prev == text.as_str());
+            if echoed && repeat_bounces >= MAX_REPEAT_BOUNCES {
+                final_reason = "stuck".to_string();
+                break;
+            }
+            if echoed {
+                repeat_bounces += 1;
+                messages.push(ContextMessage {
+                    role: "system".into(),
+                    content: "Your previous reply repeated itself verbatim and did nothing. \
+                             Produce a fresh, concrete response or an <execute_tool> call now."
+                        .into(),
+                    pinned: false,
+                });
+                continue;
+            }
+        }
+
+        // ---- Human-in-the-loop gate (`<hitl_gate>`): the model may pause the
+        // batch to ask for approval before destructive/irreversible work. Freeze
+        // here and emit `agent://hitl-gate`; the run resumes only once the user
+        // answers via `agent_respond_hitl`. On denial, fold a "denied" tool
+        // observation into the history and bounce the model toward an
+        // alternative instead of executing anything.
+        if let Some(reason) = extract_hitl_gate(&text) {
+            let call_refs: Vec<&ToolCall> = calls.iter().collect();
+            let approved = rt.block_on(tools::hitl_gate(
+                tool_state,
+                app,
+                session_id,
+                &reason,
+                &call_refs,
+            ))?;
+            if !approved {
+                let actions: Vec<String> = calls.iter().map(|c| c.summary()).collect();
+                let listed = if actions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (blocked actions: {})",
+                        actions.join("; ")
+                    )
+                };
+                messages.push(ContextMessage {
+                    role: "tool".into(),
+                    content: format!(
+                        "You requested approval for [{reason}] but the user DENIED it{listed}. \
+                         Do NOT perform this action. Propose a safer alternative or reroute."
+                    ),
+                    pinned: false,
+                });
+                continue;
+            }
+        }
 
         // ---- Refusal handling: when the model emits tool calls but also
         // contains refusal language (safety training override), strip the
@@ -2443,7 +2580,7 @@ fn plan_subtasks(
     tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<Option<Vec<Subtask>>, String> {
 // Stage-3 compaction before the stage-2 eviction pass below.
-        if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+        if summarize_old_block(gen, interrupt, tx, session_id, messages) {
             crate::logging::info(
                 Some(session_id),
                 "llm.summarize",
@@ -2483,16 +2620,9 @@ fn plan_subtasks(
         }),
         images: None,
         max_tokens: request.max_tokens.clamp(1, 1024),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        min_p: request.min_p,
-        repeat_penalty: request.repeat_penalty,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        seed: request.seed,
         stop_words: request.stop_words.clone(),
         cached_prefix_tokens: None,
+        ..Default::default()
     };
     let outcome = gen
         .generate(&gen_request, session_id, interrupt, tx)
@@ -2521,7 +2651,7 @@ fn run_summary(
     tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<FocusOutcome, String> {
 // Stage-3 compaction before the stage-2 eviction pass below.
-        if summarize_old_block(gen, interrupt, tx, session_id, messages, request) {
+        if summarize_old_block(gen, interrupt, tx, session_id, messages) {
             crate::logging::info(
                 Some(session_id),
                 "llm.summarize",
@@ -2560,16 +2690,9 @@ fn run_summary(
         }),
         images: None,
         max_tokens: request.max_tokens.max(1),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        min_p: request.min_p,
-        repeat_penalty: request.repeat_penalty,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        seed: request.seed,
         stop_words: request.stop_words.clone(),
         cached_prefix_tokens: None,
+        ..Default::default()
     };
     let outcome = gen
         .generate(&gen_request, session_id, interrupt, tx)
@@ -2663,16 +2786,9 @@ fn maybe_extract_memory(
         }]),
         images: None,
         max_tokens: 256,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        min_p: request.min_p,
-        repeat_penalty: request.repeat_penalty,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        seed: request.seed,
         stop_words: None,
         cached_prefix_tokens: None,
+        ..Default::default()
     };
     let Ok(outcome) = gen
         .generate(&gen_request, session_id, interrupt, tx)
@@ -2867,7 +2983,6 @@ fn summarize_old_block(
     tx: &Sender<WorkerEvent>,
     session_id: u64,
     messages: &mut Vec<ContextMessage>,
-    request: &AgentTaskRequest,
 ) -> bool {
     let Some((start, len, src)) = oldest_unpinned_block(messages, SUMMARY_BLOCK_MAX_MSGS, SUMMARY_BLOCK_MAX_CHARS)
     else {
@@ -2888,16 +3003,9 @@ fn summarize_old_block(
         }]),
         images: None,
         max_tokens: 800,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        min_p: request.min_p,
-        repeat_penalty: request.repeat_penalty,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        seed: request.seed,
         stop_words: None,
         cached_prefix_tokens: None,
+        ..Default::default()
     };
     let outcome = match gen.generate(&gen_request, session_id, interrupt, tx) {
         Ok(o) => o,
@@ -3375,28 +3483,7 @@ mod tests {
         ];
         let interrupt = tokio_util::sync::CancellationToken::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let req = AgentTaskRequest {
-            prompt: "do the task".into(),
-            max_tokens: 2048,
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-                        repeat_penalty: Some(1.0),
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            top_k: None,
-            min_p: None,
-            max_steps: None,
-            stop_words: None,
-            plan_mode: false,
-            verify: false,
-            decompose: false,
-            token_budget: None,
-            agent_mode: None,
-            workflow: None,
-            images: None,
-        };
-        let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs, &req);        assert!(ok, "summary generation returns true");
+        let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs);        assert!(ok, "summary generation returns true");
         // The two oldest unpinned turns collapse into one pinned system summary.
         assert_eq!(msgs.len(), 3);
         assert!(msgs[1].pinned);
@@ -3410,14 +3497,6 @@ mod tests {
         let base = || AgentTaskRequest {
             prompt: "hi".into(),
             max_tokens: 2048,
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-            repeat_penalty: Some(1.0),
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            top_k: None,
-            min_p: None,
             max_steps: None,
             stop_words: None,
             plan_mode: false,
@@ -3427,6 +3506,7 @@ mod tests {
             agent_mode: None,
             workflow: None,
             images: None,
+            ..Default::default()
         };
         assert!(should_shortcut_smalltalk(&base()), "greeting qualifies");
 

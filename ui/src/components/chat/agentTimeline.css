@@ -1,0 +1,114 @@
+.agent-timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 12px;
+  margin: 0 0 8px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  border-radius: 8px;
+  background: var(--panel, rgba(128, 128, 128, 0.06));
+  font-size: 12px;
+}
+
+.tl-section {
+  flex: 1 1 200px;
+  min-width: 180px;
+}
+
+.tl-title {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.tl-count {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.tl-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tl-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0;
+  line-height: 1.4;
+}
+
+.tl-icon {
+  flex: 0 0 auto;
+  width: 1em;
+  opacity: 0.8;
+}
+
+.tl-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tl-completed .tl-text {
+  opacity: 0.6;
+}
+
+.tl-failed .tl-icon,
+.tl-error {
+  color: #e5534b;
+}
+
+.tl-in_progress .tl-icon {
+  color: #3b82f6;
+}
+
+.tl-bg-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tl-bg-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 999px;
+}
+
+.tl-bg-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tl-bg-running {
+  border-color: #3b82f6;
+}
+
+.tl-bg-error {
+  border-color: #e5534b;
+}
+
+.tl-bg-abort {
+  border: 0;
+  padding: 0 2px;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.tl-bg-abort:hover {
+  opacity: 1;
+}

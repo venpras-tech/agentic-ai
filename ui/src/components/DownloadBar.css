@@ -1,0 +1,169 @@
+.download-bar {
+  flex-shrink: 0;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--accent);
+  box-shadow: 0 2px 12px rgba(14, 165, 233, 0.15);
+  padding: 6px 12px;
+  z-index: 100;
+}
+
+.download-bar-loading {
+  font-size: 0.75rem;
+  color: var(--accent);
+  padding-bottom: 6px;
+}
+
+.download-bar-error {
+  font-size: 0.75rem;
+  color: var(--status-error);
+  padding-bottom: 6px;
+}
+
+.download-bar-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.download-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.download-bar-row.success {
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 8px;
+  padding: 5px 10px;
+}
+
+.download-bar-check {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #22c55e;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.download-bar-done-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #15803d;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.download-bar-load {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.download-bar-load:hover:not(:disabled) { background: var(--accent-hover); }
+.download-bar-load:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.download-bar-link {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.download-bar-link:hover { background: var(--bg-sidebar); color: var(--accent); }
+
+.download-bar-file {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+  flex-shrink: 0;
+}
+
+.download-bar-pct {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent);
+  width: 36px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.download-bar-track {
+  flex: 1;
+  min-width: 80px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.download-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+.download-bar-bytes {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.download-bar-speed {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.download-bar-btn {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: background 0.12s, color 0.12s;
+}
+
+.download-bar-btn:hover {
+  background: var(--bg-sidebar);
+  color: var(--accent);
+  border-color: var(--border-hover);
+}
+
+.download-bar-cancel:hover {
+  color: var(--status-error);
+  border-color: rgba(220, 38, 38, 0.5);
+}

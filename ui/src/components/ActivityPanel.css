@@ -1,0 +1,95 @@
+.activity-wrap {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.activity-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 2px;
+  min-height: 28px;
+}
+
+.activity-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.activity-status-live {
+  flex: 1;
+  font-size: 0.75rem;
+  color: #2563eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-toggle {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  margin: 0;
+  font-size: 0.7rem;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.activity-toggle:hover {
+  color: var(--text-primary);
+}
+
+.activity-wrap.collapsed .activity {
+  max-height: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.activity-wrap.collapsed .activity-toggle {
+  transform: rotate(-90deg);
+}
+
+.activity {
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 8px 16px;
+  padding-right: 120px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  transition: max-height 0.2s ease;
+}
+
+.activity:empty {
+  display: none;
+}
+
+.activity-item {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  align-items: flex-start;
+}
+
+.activity-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  font-size: 0.75rem;
+}
+
+.activity-status .activity-label { color: #2563eb; }
+.activity-tool .activity-label { color: #16a34a; }
+.activity-error .activity-label { color: var(--status-error); }
+.activity-index .activity-label { color: #ca8a04; }
+.activity-log .activity-label { color: var(--text-muted); }
+
+.activity-body {
+  word-break: break-word;
+}

@@ -1,0 +1,95 @@
+.perm-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 12px 10px;
+  padding: 12px;
+  border: 1px solid #d29922;
+  border-radius: 8px;
+  background: rgba(210, 153, 34, 0.08);
+}
+
+.perm-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.perm-tool {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(210, 153, 34, 0.2);
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.perm-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.perm-summary {
+  margin: 0;
+  padding: 8px;
+  max-height: 160px;
+  overflow: auto;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.perm-review {
+  margin: 0;
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.perm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.perm-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.4));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.perm-btn:hover:not(:disabled) {
+  border-color: currentColor;
+}
+
+.perm-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.perm-allow {
+  border-color: #2ea043;
+  color: #2ea043;
+}
+
+.perm-deny {
+  border-color: #e5534b;
+  color: #e5534b;
+}
+
+.perm-input {
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 4px 8px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.4));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+}

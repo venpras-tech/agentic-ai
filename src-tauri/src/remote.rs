@@ -40,6 +40,16 @@ pub enum RemoteProvider {
     Xai,
     Groq,
     Mistral,
+    Together,
+    Fireworks,
+    Cerebras,
+    SambaNova,
+    Perplexity,
+    Nvidia,
+    HuggingFace,
+    Moonshot,
+    Zai,
+    Hyperbolic,
     Custom,
 }
 
@@ -65,6 +75,16 @@ impl RemoteProvider {
             "xai" => Self::Xai,
             "groq" => Self::Groq,
             "mistral" => Self::Mistral,
+            "together" => Self::Together,
+            "fireworks" => Self::Fireworks,
+            "cerebras" => Self::Cerebras,
+            "sambanova" => Self::SambaNova,
+            "perplexity" => Self::Perplexity,
+            "nvidia" => Self::Nvidia,
+            "huggingface" => Self::HuggingFace,
+            "moonshot" => Self::Moonshot,
+            "zai" => Self::Zai,
+            "hyperbolic" => Self::Hyperbolic,
             _ => Self::Custom,
         }
     }
@@ -81,6 +101,16 @@ impl RemoteProvider {
             Self::Xai => "xai",
             Self::Groq => "groq",
             Self::Mistral => "mistral",
+            Self::Together => "together",
+            Self::Fireworks => "fireworks",
+            Self::Cerebras => "cerebras",
+            Self::SambaNova => "sambanova",
+            Self::Perplexity => "perplexity",
+            Self::Nvidia => "nvidia",
+            Self::HuggingFace => "huggingface",
+            Self::Moonshot => "moonshot",
+            Self::Zai => "zai",
+            Self::Hyperbolic => "hyperbolic",
             Self::Custom => "custom",
         }
     }
@@ -97,6 +127,16 @@ impl RemoteProvider {
             Self::Xai => "xAI (Grok)",
             Self::Groq => "Groq",
             Self::Mistral => "Mistral",
+            Self::Together => "Together AI",
+            Self::Fireworks => "Fireworks AI",
+            Self::Cerebras => "Cerebras",
+            Self::SambaNova => "SambaNova",
+            Self::Perplexity => "Perplexity",
+            Self::Nvidia => "NVIDIA NIM",
+            Self::HuggingFace => "Hugging Face",
+            Self::Moonshot => "Moonshot (Kimi)",
+            Self::Zai => "Z.ai (GLM)",
+            Self::Hyperbolic => "Hyperbolic",
             Self::Custom => "Custom (OpenAI-compatible)",
         }
     }
@@ -118,6 +158,47 @@ fn default_provider() -> String {
     RemoteProvider::Custom.as_str().into()
 }
 
+/// Canonical base URL per provider id (mirrors the frontend presets). Used when
+/// the user leaves the endpoint blank so a known provider still works.
+pub fn default_base_url(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "google" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        "ollama" => Some("http://localhost:11434/v1"),
+        "lmstudio" => Some("http://localhost:1234/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "together" => Some("https://api.together.xyz/v1"),
+        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
+        "cerebras" => Some("https://api.cerebras.ai/v1"),
+        "sambanova" => Some("https://api.sambanova.ai/v1"),
+        "perplexity" => Some("https://api.perplexity.ai"),
+        "nvidia" => Some("https://integrate.api.nvidia.com/v1"),
+        "huggingface" => Some("https://router.huggingface.co/v1"),
+        "moonshot" => Some("https://api.moonshot.cn/v1"),
+        "zai" => Some("https://api.z.ai/api/paas/v4"),
+        "hyperbolic" => Some("https://api.hyperbolic.xyz/v1"),
+        _ => None,
+    }
+}
+
+/// Effective base URL for a provider: the user's value when non-empty,
+/// otherwise the provider preset (empty only for `custom`).
+pub fn resolve_base_url(provider: &str, base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    default_base_url(provider)
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// User-supplied remote endpoint settings (camelCase over the wire).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,7 +210,9 @@ pub struct RemoteModelConfig {
     pub base_url: String,
     /// Bearer / `x-api-key` token. Memory-only; never persisted.
     pub api_key: String,
-    /// Model identifier, e.g. `gpt-4o-mini`, `qwen3:8b`.
+    /// Model identifier, e.g. `gpt-4o-mini`, `qwen3:8b`. Optional for
+    /// list-only probes (empty is rejected downstream at generation time).
+    #[serde(default)]
     pub model: String,
     /// Assumed context budget for the eviction engine (default 128k).
     #[serde(default)]
@@ -276,7 +359,7 @@ fn est_input_tokens(request: &InferenceRequest) -> u64 {
 /// requires `x-api-key` + `anthropic-version` headers.
 pub async fn list_models(config: &RemoteModelConfig) -> Result<Vec<String>, String> {
     let provider = RemoteProvider::from_str(&config.provider);
-    let base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    let base_url = resolve_base_url(&config.provider, &config.base_url);
     if base_url.is_empty() {
         return Err("Enter a base URL first".into());
     }
@@ -426,7 +509,7 @@ pub struct RemoteGenerator {
 impl RemoteGenerator {
     pub fn new(config: RemoteModelConfig) -> Result<Self, String> {
         let provider = RemoteProvider::from_str(&config.provider);
-        let base_url = config.base_url.trim().trim_end_matches('/').to_string();
+        let base_url = resolve_base_url(&config.provider, &config.base_url);
         if base_url.is_empty() {
             return Err("Remote model needs a base URL".into());
         }
@@ -539,24 +622,7 @@ impl RemoteGenerator {
             "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
             "max_tokens": request.max_tokens,
-            "temperature": request.temperature.unwrap_or(0.8),
-            "top_p": request.top_p.unwrap_or(0.95),
         });
-        if let Some(k) = request.top_k {
-            body["top_k"] = json!(k.min(512));
-        }
-        if let Some(p) = request.min_p {
-            body["min_p"] = json!(p.clamp(0.0, 1.0));
-        }
-        if let Some(p) = request.frequency_penalty {
-            body["frequency_penalty"] = json!(p.clamp(0.0, 2.0));
-        }
-        if let Some(p) = request.presence_penalty {
-            body["presence_penalty"] = json!(p.clamp(0.0, 2.0));
-        }
-        if let Some(seed) = request.seed {
-            body["seed"] = json!(seed);
-        }
         let stop = request.stop_words.clone().unwrap_or_default();
         let stop: Vec<Value> = stop
             .into_iter()
@@ -662,13 +728,9 @@ impl RemoteGenerator {
         let mut body = json!({
             "model": self.model,
             "max_tokens": request.max_tokens,
-            "temperature": request.temperature.unwrap_or(0.8),
             "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
         });
-        if let Some(k) = request.top_k {
-            body["top_k"] = json!(k.min(512));
-        }
         let stop = request.stop_words.clone().unwrap_or_default();
         let stop: Vec<Value> = stop
             .into_iter()
@@ -821,6 +883,16 @@ pub enum ProviderKind {
     Xai,
     Groq,
     Mistral,
+    Together,
+    Fireworks,
+    Cerebras,
+    SambaNova,
+    Perplexity,
+    Nvidia,
+    HuggingFace,
+    Moonshot,
+    Zai,
+    Hyperbolic,
     Custom,
 }
 
@@ -838,6 +910,16 @@ impl ProviderKind {
             Self::Xai => "xai",
             Self::Groq => "groq",
             Self::Mistral => "mistral",
+            Self::Together => "together",
+            Self::Fireworks => "fireworks",
+            Self::Cerebras => "cerebras",
+            Self::SambaNova => "sambanova",
+            Self::Perplexity => "perplexity",
+            Self::Nvidia => "nvidia",
+            Self::HuggingFace => "huggingface",
+            Self::Moonshot => "moonshot",
+            Self::Zai => "zai",
+            Self::Hyperbolic => "hyperbolic",
             Self::Custom => "custom",
         }
     }
@@ -856,6 +938,16 @@ impl ProviderKind {
             "xai" => Self::Xai,
             "groq" => Self::Groq,
             "mistral" => Self::Mistral,
+            "together" => Self::Together,
+            "fireworks" => Self::Fireworks,
+            "cerebras" => Self::Cerebras,
+            "sambanova" => Self::SambaNova,
+            "perplexity" => Self::Perplexity,
+            "nvidia" => Self::Nvidia,
+            "huggingface" => Self::HuggingFace,
+            "moonshot" => Self::Moonshot,
+            "zai" => Self::Zai,
+            "hyperbolic" => Self::Hyperbolic,
             _ => Self::Custom,
         }
     }
@@ -874,6 +966,16 @@ impl ProviderKind {
             Self::Xai => "xAI (Grok)",
             Self::Groq => "Groq",
             Self::Mistral => "Mistral",
+            Self::Together => "Together AI",
+            Self::Fireworks => "Fireworks AI",
+            Self::Cerebras => "Cerebras",
+            Self::SambaNova => "SambaNova",
+            Self::Perplexity => "Perplexity",
+            Self::Nvidia => "NVIDIA NIM",
+            Self::HuggingFace => "Hugging Face",
+            Self::Moonshot => "Moonshot (Kimi)",
+            Self::Zai => "Z.ai (GLM)",
+            Self::Hyperbolic => "Hyperbolic",
             Self::Custom => "Custom (OpenAI-compatible)",
         }
     }
@@ -949,11 +1051,7 @@ impl ProviderConfig {
         if self.kind == ProviderKind::Local {
             return Err("Local providers cannot produce a RemoteModelConfig".into());
         }
-        let base_url = self
-            .base_url
-            .as_deref()
-            .unwrap_or("")
-            .to_string();
+        let base_url = resolve_base_url(self.kind.as_str(), self.base_url.as_deref().unwrap_or(""));
         if base_url.is_empty() {
             return Err(format!("Provider '{}' has no base_url", self.id));
         }
@@ -1253,6 +1351,16 @@ mod registry_tests {
             ProviderKind::Xai,
             ProviderKind::Groq,
             ProviderKind::Mistral,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Cerebras,
+            ProviderKind::SambaNova,
+            ProviderKind::Perplexity,
+            ProviderKind::Nvidia,
+            ProviderKind::HuggingFace,
+            ProviderKind::Moonshot,
+            ProviderKind::Zai,
+            ProviderKind::Hyperbolic,
             ProviderKind::Custom,
         ] {
             assert_eq!(ProviderKind::from_str(kind.as_str()), kind);

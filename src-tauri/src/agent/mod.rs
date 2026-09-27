@@ -24,6 +24,7 @@ pub mod interrupt;
 pub mod mcp;
 pub mod orchestrator;
 pub mod plan;
+pub mod prompt;
 pub mod policy;
 pub mod rag;
 pub mod registry;
@@ -34,7 +35,7 @@ pub mod todo;
 pub mod tools;
 pub mod workflows;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -868,6 +869,26 @@ pub struct QuestionRequestEvent {
     pub timestamp_ms: u64,
 }
 
+/// Event emitted on `agent://hitl-gate` when the model emits a `<hitl_gate>`
+/// marker ahead of its tool-call batch. The harness blocks the loop until the
+/// user answers via `agent_respond_hitl` (or a 10-minute timeout fires).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HitlGateEvent {
+    pub request_id: String,
+    pub session_id: u64,
+    pub reason: String,
+    /// Human-readable summaries of the tool calls waiting on this decision.
+    pub tools: Vec<String>,
+    pub timestamp_ms: u64,
+}
+
+/// The user's verdict on a pending `<hitl_gate>` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HitlDecision {
+    pub approve: bool,
+}
+
 /// Event telling the frontend a file was changed by the agent (for editor sync
 /// and diff preview).
 #[derive(Debug, Clone, Serialize)]
@@ -916,6 +937,29 @@ pub struct ContextTrimmedEvent {
     pub session_id: u64,
     pub dropped: usize,
     pub remaining: usize,
+}
+
+/// A user message submitted while the agent was already running, waiting to be
+/// folded into the conversation at the next step boundary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerMessage {
+    /// Correlates with the `agent://steer-applied` event.
+    pub id: String,
+    pub session_id: u64,
+    pub text: String,
+}
+
+/// Emitted once a queued steer has been folded into the running conversation,
+/// so the UI can move it out of the queue and show it as a real user turn.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerAppliedEvent {
+    pub id: String,
+    pub session_id: u64,
+    pub text: String,
+    /// Agent step the steer landed on, for ordering in the timeline.
+    pub step: usize,
 }
 
 /// How a human answered a policy-`ask` permission request. Carried over the
@@ -1077,9 +1121,12 @@ pub struct ToolState {
     /// Pending permission requests keyed by request id (see `policy::check`).
     pub permission_requests:
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>>,
-    /// Pending `ask_question` requests keyed by request id (P1-9). The agent
+/// Pending `ask_question` requests keyed by request id (P1-9). The agent
     /// blocks on the channel until the user answers via `agent_respond_question`.
     pub pending_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// Pending `<hitl_gate>` approval requests keyed by request id. The agent
+    /// loop blocks on the channel until `agent_respond_hitl` arrives.
+    pub pending_hitl: Mutex<HashMap<String, tokio::sync::oneshot::Sender<HitlDecision>>>,
     /// Monotonic permission request id counter.
     pub request_id: AtomicU64,
     /// Tools the user "allowed for this session" (see `PermissionDecision`).
@@ -1123,6 +1170,14 @@ pub struct ToolState {
     /// agent step. Set to `false` at the start of each step; the first
     /// file-editing tool call auto-checkpoints and sets this to `true`.
     pub step_checkpointed: std::sync::atomic::AtomicBool,
+    /// User messages submitted mid-run, waiting to be folded into the
+    /// conversation at the top of the next agent step.
+    ///
+    /// The step loop's `messages` vec is private to the running thread, so a
+    /// message pushed through `ContextState` would never be seen by a run that
+    /// is already in flight. Queueing here and draining inside the loop is what
+    /// makes "steer" take effect on a turn that is already running.
+    pub steer_queue: std::sync::Mutex<VecDeque<SteerMessage>>,
 }
 
 impl Default for ToolState {
@@ -1133,8 +1188,9 @@ impl Default for ToolState {
             path_grants: std::sync::Mutex::new(Vec::new()),
             mcp_servers: Mutex::new(HashMap::new()),
             id: AtomicU64::new(1),
-            permission_requests: Mutex::new(HashMap::new()),
+permission_requests: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
+            pending_hitl: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
             session_allow: std::sync::Mutex::new(HashSet::new()),
             knowledge: std::sync::Arc::new(skills::KnowledgeState::default()),
@@ -1149,6 +1205,7 @@ impl Default for ToolState {
             sem_index: std::sync::Mutex::new(None),
             repo_graph: tokio::sync::Mutex::new(HashMap::new()),
             step_checkpointed: std::sync::atomic::AtomicBool::new(false),
+            steer_queue: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -1158,13 +1215,65 @@ impl ToolState {
         format!("tool-{}", self.id.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// Queue a user message for injection at the top of the next agent step.
+    ///
+    /// Returns the id assigned to it so the UI can correlate the eventual
+    /// `agent://steer-applied` event with the message it sent.
+    pub fn enqueue_steer(&self, session_id: u64, text: String) -> String {
+        let id = format!("steer-{}", self.id.fetch_add(1, Ordering::SeqCst));
+        let msg = SteerMessage {
+            id: id.clone(),
+            session_id,
+            text,
+        };
+        if let Ok(mut q) = self.steer_queue.lock() {
+            q.push_back(msg);
+        }
+        id
+    }
+
+    /// Take every queued steer addressed to `session_id`, oldest first.
+    ///
+    /// Steers for other sessions are left in place: a stale message must not
+    /// leak into the next chat's run. This drains at a step boundary, so a steer
+    /// submitted mid-generation takes effect from the following step.
+    pub fn take_steers(&self, session_id: u64) -> Vec<SteerMessage> {
+        let Ok(mut q) = self.steer_queue.lock() else {
+            return Vec::new();
+        };
+        let mut mine = Vec::new();
+        let mut kept = VecDeque::new();
+        while let Some(m) = q.pop_front() {
+            if m.session_id == session_id {
+                mine.push(m);
+            } else {
+                kept.push_back(m);
+            }
+        }
+        *q = kept;
+        mine
+    }
+
+    /// Drop queued steers, e.g. when a run ends or is aborted so they do not
+    /// leak into the next turn.
+    pub fn clear_steers(&self) {
+        if let Ok(mut q) = self.steer_queue.lock() {
+            q.clear();
+        }
+    }
+
     pub fn next_request_id(&self) -> String {
         format!("perm-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// Fresh id for a pending `ask_question` request.
+/// Fresh id for a pending `ask_question` request.
     pub fn next_question_id(&self) -> String {
         format!("q-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Fresh id for a pending `<hitl_gate>` approval request.
+    pub fn next_hitl_id(&self) -> String {
+        format!("hitl-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Remember which session is running the agent loop, so the `execute_plan`
@@ -1283,3 +1392,70 @@ pub fn session_scratchpad(session_id: u64) -> PathBuf {
     scratchpad_root().join(format!("session-{session_id}"))
 }
 
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+
+    #[test]
+    fn enqueued_steer_is_returned_in_order() {
+        let s = ToolState::default();
+        let a = s.enqueue_steer(7, "first".into());
+        let b = s.enqueue_steer(7, "second".into());
+
+        let got = s.take_steers(7);
+        assert_eq!(got.len(), 2, "both steers should be delivered");
+        assert_eq!(got[0].text, "first");
+        assert_eq!(got[1].text, "second");
+        assert_eq!(got[0].id, a);
+        assert_eq!(got[1].id, b);
+    }
+
+    #[test]
+    fn take_steers_drains_so_a_second_take_is_empty() {
+        let s = ToolState::default();
+        s.enqueue_steer(1, "once".into());
+        assert_eq!(s.take_steers(1).len(), 1);
+        assert!(
+            s.take_steers(1).is_empty(),
+            "a steer must not be applied twice"
+        );
+    }
+
+    #[test]
+    fn steers_do_not_leak_across_sessions() {
+        let s = ToolState::default();
+        s.enqueue_steer(1, "for session one".into());
+        s.enqueue_steer(2, "for session two".into());
+
+        // Session 2 drains only its own; session 1's message survives so a
+        // still-running session 1 does not lose it.
+        let two = s.take_steers(2);
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].text, "for session two");
+
+        let one = s.take_steers(1);
+        assert_eq!(one.len(), 1, "session 1's steer must still be queued");
+        assert_eq!(one[0].text, "for session one");
+    }
+
+    #[test]
+    fn clear_steers_drops_everything() {
+        let s = ToolState::default();
+        s.enqueue_steer(1, "a".into());
+        s.enqueue_steer(1, "b".into());
+        s.clear_steers();
+        assert!(
+            s.take_steers(1).is_empty(),
+            "a finished run must not leak steers into the next one"
+        );
+    }
+
+    #[test]
+    fn ids_are_unique_per_steer() {
+        let s = ToolState::default();
+        let a = s.enqueue_steer(1, "x".into());
+        let b = s.enqueue_steer(1, "y".into());
+        assert_ne!(a, b, "ids must be distinct so the UI can match them up");
+    }
+}

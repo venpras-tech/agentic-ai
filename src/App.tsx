@@ -2094,7 +2094,7 @@ const invokeWorkflow = useCallback(
                 [
                   ["files", "Files"],
                   ["chats", "Chats"],
-                  ["changes", "Diff"],
+                  ["changes", "Changes"],
                   ["sessions", "Sessions"],
                 ] as const
               ).map(([id, label]) => (
@@ -2112,6 +2112,14 @@ const invokeWorkflow = useCallback(
               </button>
             ))}
             <div className="flex-1" />
+            <button
+              onClick={newChat}
+              title="New chat (Ctrl+N)"
+              aria-label="New chat"
+              className="flex items-center gap-0.5 rounded bg-accent px-2 py-0.5 text-[10px] font-semibold text-white transition-colors hover:bg-cyan-500"
+            >
+              + New
+            </button>
             {leftView === "files" && (
               <div className="flex items-center gap-0.5">
                 <button

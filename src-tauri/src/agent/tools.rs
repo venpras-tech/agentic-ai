@@ -36,7 +36,7 @@ use streaming_iterator::StreamingIterator;
 use crate::engine::{ChatTurn, InferenceRequest, TextGenerator, WorkerEvent};
 use super::{
     now_ms, mcp, plan, policy, rag, skills, todo,
-    AgentToolEvent, FileChangedEvent, PermissionDecision, PermissionRequestEvent,
+    AgentToolEvent, FileChangedEvent, HitlGateEvent, PermissionDecision, PermissionRequestEvent,
     QuestionRequestEvent, ToolCall, ToolResult, TodoUpdateEvent, ToolState,
 };
 
@@ -118,6 +118,26 @@ pub async fn dispatch(
         Some(elapsed),
         detail,
     );
+
+    // Deliver the tool's captured output to the UI so the mini terminal drawer
+    // can render it with the completion event (the `agent://tool-output` event
+    // payload carries stdout so the frontend never needs the full ToolResult).
+    if let Ok(r) = &result {
+        if let Some(out) = r.stdout.as_ref() {
+            if !out.is_empty() {
+                let _ = app.emit(
+                    "agent://tool-output",
+                    serde_json::json!({
+                        "id": id,
+                        "tool": tool,
+                        "status": status,
+                        "output": out,
+                        "sessionId": state.session_id.load(std::sync::atomic::Ordering::SeqCst),
+                    }),
+                );
+            }
+        }
+    }
 
     let workspaces = state.workspace.lock().await.clone();
     let primary = workspaces.first().cloned();
@@ -265,16 +285,9 @@ async fn llm_brief(
         ]),
         images: None,
         max_tokens,
-        temperature: Some(0.2),
-        top_p: None,
-        top_k: None,
-        min_p: None,
-        repeat_penalty: Some(1.05),
-        frequency_penalty: None,
-        presence_penalty: None,
-        seed: None,
         stop_words: None,
         cached_prefix_tokens: None,
+        ..Default::default()
     };
     let (tx, _rx) = crossbeam_channel::unbounded::<WorkerEvent>();
     let itok = CancellationToken::new();
@@ -3241,6 +3254,48 @@ async fn ask_question(
         Some(answer),
         None,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Human-in-the-loop gate (<hitl_gate>)
+// ---------------------------------------------------------------------------
+
+/// Block the agent loop until the user approves or denies a pending action
+/// batch. The '<hitl_gate>' reasoning marker before the tool-call batch makes
+/// the model pause; this function is what actually freezes execution at that
+/// seam. The frontend listens on `agent://hitl-gate` and replies through the
+/// `agent_respond_hitl` command. Mapped to `Ok(true)` = approved,
+/// `Ok(false)` = denied (loop then reroutes instead of dispatching).
+pub async fn hitl_gate(
+    state: &ToolState,
+    app: &ToolContext,
+    session_id: u64,
+    reason: &str,
+    pending: &[&ToolCall],
+) -> Result<bool, String> {
+    let request_id = state.next_hitl_id();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_hitl.lock().await.insert(request_id.clone(), tx);
+    let tools: Vec<String> = pending.iter().map(|c| c.summary()).collect();
+    let _ = app.emit(
+        "agent://hitl-gate",
+        HitlGateEvent {
+            request_id: request_id.clone(),
+            session_id,
+            reason: reason.to_string(),
+            tools,
+            timestamp_ms: now_ms(),
+        },
+    );
+    let decision = tokio::time::timeout(Duration::from_secs(600), rx)
+        .await
+        .map_err(|_| {
+            "The approval request timed out before you decided — treat as denied."
+                .to_string()
+        })?
+        .map_err(|_| "The approval channel closed before you decided.".to_string())?;
+    state.pending_hitl.lock().await.remove(&request_id);
+    Ok(decision.approve)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,105 @@
+.model-prompt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(2px);
+}
+
+.model-prompt-modal {
+  width: min(520px, 92vw);
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-top: 3px solid var(--accent);
+  border-radius: 14px;
+  padding: 22px 24px;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.32);
+}
+
+.model-prompt-badge {
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.model-prompt-title {
+  margin: 0 0 8px;
+  font-size: 1.05rem;
+  color: var(--text-primary);
+}
+
+.model-prompt-model {
+  margin: 0 0 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.model-prompt-reason {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-hover);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--status-error);
+  white-space: pre-wrap;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+}
+
+.model-prompt-hint {
+  margin: 0 0 18px;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.model-prompt-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.model-prompt-proceed {
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.model-prompt-proceed:hover {
+  background: var(--accent-hover);
+}
+
+.model-prompt-proceed:active {
+  transform: scale(0.98);
+}
+
+.model-prompt-dismiss {
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.model-prompt-dismiss:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}

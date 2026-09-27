@@ -313,7 +313,7 @@ pub(crate) fn build_local_pool(
     event_tx: Sender<WorkerEvent>,
     app: &AppHandle,
 ) -> Result<EnginePool, String> {
-    let workers = params.n_workers.unwrap_or(2).clamp(1, 8) as usize;
+    let workers = params.n_workers.unwrap_or(2).clamp(1, 32) as usize;
     let app_progress = app.clone();
     let mut last_progress = 0.0f32;
     let model = engine::load_model_with_progress(path, params, move |progress: f32| {
@@ -375,8 +375,13 @@ pub(crate) async fn install_local_model(
         .parent()
         .map(|d| d.join("tokenizer.json"))
         .filter(|p| p.is_file());
+    // Fold the legacy settings, the persisted `"default"` config and the
+    // per-path config together, then persist the resolved result under this
+    // path so it becomes the baseline for future loads of the same model.
+    let resolved =
+        crate::commands::settings::resolve_and_persist(&app, &path_for_state, &params).await;
     let pool = tokio::task::spawn_blocking(move || {
-        build_local_pool(&path, &params, event_tx, &app_for_load)
+        build_local_pool(&path, &resolved, event_tx, &app_for_load)
     })
     .await
     .map_err(|e| format!("Model load task panicked: {e}"))?
@@ -434,10 +439,57 @@ pub(crate) async fn install_local_model(
         }
     }
 
-    // Keep the API server's view of the engine in sync.
+    // Keep the API server's view of the engine in sync, and auto-start the
+    // loopback OpenAI-compatible server when the `localApiServer` setting is
+    // enabled (default). An already-running server keeps its own port.
     if let Some(api) = api {
         let shared_pool = inference.pool.lock().await.clone();
         api.engine.set(shared_pool);
+        let local_api = crate::commands::settings::read_settings(&app).local_api_server();
+        if local_api.enabled && api.server.lock().await.is_none() {
+            match crate::api_server::start(api.engine.clone(), local_api.port) {
+                Ok(handle) => {
+                    let port = handle.port;
+                    *api.server.lock().await = Some(handle);
+                    logging::info(
+                        None,
+                        "api",
+                        &format!("local OpenAI-compatible server listening on 127.0.0.1:{port}/v1"),
+                    );
+                }
+                Err(e) => logging::warn(
+                    None,
+                    "api",
+                    &format!("local API server failed to start: {e}"),
+                ),
+            }
+        }
+
+        // Route the in-app assistant through the loopback server exactly like
+        // an Ollama/LM Studio connection: the API server keeps serving the
+        // native pool above, while the assistant's pool becomes an
+        // OpenAI-compatible client pointed at it. Generation output flows back
+        // through the server verbatim, so the response text is unchanged.
+        if local_api.enabled && local_api.route_assistant {
+            let server_port = {
+                let guard = api.server.lock().await;
+                guard.as_ref().map(|h| h.port)
+            };
+            if let Some(port) = server_port {
+                if let Ok(pool) = build_local_route_pool(&app, inference, &info, port).await {
+                    *inference.pool.lock().await = Some(Arc::new(pool));
+                    logging::info(
+                        None,
+                        "api",
+                        &format!(
+                            "assistant routed via http://127.0.0.1:{port}/v1 (OpenAI-compatible), \
+                             model '{}'",
+                            info.name
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     let _ = app.emit_to(
@@ -452,6 +504,37 @@ pub(crate) async fn install_local_model(
     let _ = app.emit("model-path", &path_for_event);
     crate::commands::settings::persist_model_path(&app, &path_for_event).await;
     Ok(info)
+}
+
+/// Build the assistant pool for loopback routing: an OpenAI-compatible client
+/// pointed at `http://127.0.0.1:{port}/v1`, which serves the just-loaded local
+/// model. The in-app chat therefore takes the identical path an Ollama / LM
+/// Studio connection takes (one client per worker, like `configure_remote_model`).
+async fn build_local_route_pool(
+    app: &AppHandle,
+    inference: &InferenceState,
+    info: &ModelInfo,
+    port: u16,
+) -> Result<EnginePool, String> {
+    let workers = 4usize;
+    let event_tx = inference
+        .worker_tx
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| spawn_emitter(app.clone()));
+    let config = crate::remote::RemoteModelConfig {
+        provider: "custom".into(),
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        api_key: String::new(),
+        model: info.name.clone(),
+        context_size: Some(info.context_size),
+    };
+    let factory = || {
+        crate::remote::RemoteGenerator::new(config.clone())
+            .map(|g| Box::new(g) as Box<dyn TextGenerator>)
+    };
+    EnginePool::spawn_with(factory, event_tx, workers)
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +737,7 @@ pub fn run() {
             commands::model::hf_list_active,
             commands::model::hf_cancel_download,
             commands::model::list_downloaded_models,
+            commands::model::delete_downloaded_model,
             commands::misc::system_info,
             commands::model::api_server_start,
             commands::model::api_server_stop,
@@ -678,6 +762,7 @@ pub fn run() {
             commands::agent::autocomplete_generate,
             commands::agent::cancel_inference,
             commands::agent::abort_agent_execution,
+            commands::agent::agent_steer,
             commands::editor::terminal_spawn,
             commands::editor::terminal_write,
             commands::editor::terminal_kill,
@@ -692,6 +777,7 @@ pub fn run() {
             commands::editor::read_text_file,
             commands::editor::write_text_file,
             commands::editor::revert_file,
+            commands::editor::path_exists,
             commands::editor::save_file_as,
             commands::editor::save_file_as_bytes,
             commands::editor::agent_set_workspace,
@@ -717,6 +803,7 @@ pub fn run() {
             commands::agent::workflow_enforce_tools,
             commands::agent::agent_respond_permission,
             commands::agent::agent_respond_question,
+            commands::agent::agent_respond_hitl,
             commands::agent::agent_audit_log,
             commands::agent::agent_policy_snapshot,
             commands::agent::agent_set_yolo,
@@ -728,6 +815,10 @@ pub fn run() {
             commands::agent::agent_checkpoint_names_cmd,
             commands::settings::settings_load,
             commands::settings::settings_save,
+            commands::settings::models_dir_info,
+            commands::settings::open_models_dir,
+            commands::settings::local_model_configs_load,
+            commands::settings::local_model_config_save,
             commands::session::session_append,
             commands::session::session_load,
             commands::session::session_projects,

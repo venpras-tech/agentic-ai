@@ -21,7 +21,7 @@ export default function TitleBar() {
           AI Editor
         </span>
         <span className="hidden text-[10px] text-zinc-400 sm:inline">
-          local-first · llama.cpp
+          local-first · agent-powered
         </span>
       </div>
       <div className="flex h-full items-stretch">

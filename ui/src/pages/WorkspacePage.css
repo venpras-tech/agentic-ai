@@ -1,0 +1,96 @@
+.workspace-view {
+  flex: 1;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+
+.workspace-pane {
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-tree,
+.workspace-editor {
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-tree .editor-tree-panel,
+.workspace-editor .editor-main-panel {
+  flex: 1;
+}
+
+.workspace-divider {
+  cursor: col-resize;
+  background: transparent;
+}
+
+.workspace-divider:hover,
+.workspace-divider.dragging {
+  background: var(--border-hover);
+}
+
+.workspace-chat {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-primary);
+}
+
+.workspace-chat-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.workspace-chat-header .btn-index {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  text-transform: none;
+  letter-spacing: 0;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-chat-scroll {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  padding: 8px 12px 20px;
+  scroll-behavior: smooth;
+  position: relative;
+}
+
+.workspace-chat-empty {
+  padding: 24px 8px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.workspace-composer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+}
+
+.workspace-composer .input-row-wrap {
+  padding: 8px 12px;
+}
+
+.workspace-composer .status-bar-top {
+  display: none;
+}

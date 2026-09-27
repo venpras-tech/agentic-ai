@@ -1,9 +1,92 @@
 # AI Code Editor — Project Status
 
-**Last Updated**: 2026-09-09 (chatReducer↔agent-run coordination race fixes: stale-closure ledger/activeSessionId/activeChatId reads, atomic subtask updates, guarded prompt-flush)
+**Last Updated**: 2026-09-20 (full-codebase audit: current `ui/` + `src-tauri/src/commands/` architecture; new P0/P1/P2 todo list below. Note: most entries below this section describe the **legacy `src/` UI / monolithic `main.rs`** that has since been replaced — see the 2026-09-20 Audit section for current-state findings.)
+**Last Updated (prev)**: 2026-09-09 (chatReducer↔agent-run coordination race fixes: stale-closure ledger/activeSessionId/activeChatId reads, atomic subtask updates, guarded prompt-flush)
 **Stack**: Tauri 2 (Rust) + React 19 + Vite 6 + Tailwind v4 + Monaco editor
 **Inference**: llama.cpp GGUF (local) + OpenAI-compatible SSE (remote), multi-provider routing (Planner/Editor/Autocomplete/Embed roles)
 **Agent**: ReAct loop with 48+ tools, 4 subagent profiles (explore/implement/review/debug), plan mode, decompose mode, background tasks, custom modes, auto-memory extraction, multi-stage context compaction, repo-map (PageRank), skill auto-suggest
+
+---
+
+## 2026-09-20 Audit — Current Architecture (`ui/` + `src-tauri/src/commands/`)
+
+Full sweep of the *current* codebase: React 19 three-panel UI (`ui/src`) and the
+`src-tauri/src/commands/*` backend (post-split from the legacy monolithic
+`main.rs`). All items below are NEW todos for the current architecture. Items
+already shipped for the legacy `src/` UI (cmdk palette, xterm terminal,
+Sessions/Resume, context breakdown, execution DAG, export, etc.) must be
+**re-verified** in the new UI — most were not ported (see P1-6).
+
+### P0 — Correctness / Security / Broken Core Channels
+
+- [ ] **Policy `ask` permission requests are unanswerable** (`tools.rs:167-233` `triage_permission`, emit `agent://permission-request` at `tools.rs:184`)
+  - Any tool whose policy verdict is `ask` inserts a oneshot into `permission_requests` and waits 300s (`tools.rs:194`). The new UI has **no** `agent://permission-request` listener and no `agent_respond_permission` IPC, so mutating tools under a non-YOLO default stall for 5 minutes then fail `"Timed out waiting for approval"`.
+  - Fix: either re-route `ask` verdicts into the live `agent://hitl-gate` channel (frontend already answers via `api.hitlRespond`), or add a subscription + respond command + dialog. Test with the `default-ask` policy set.
+
+- [ ] **`ask_question` tool stalls with no UI answerer** (`tools.rs:3233-3264`)
+  - Emits `agent://question-request`, waits 600s on `pending_questions`; no frontend listener and no question-answer command exist in `ipc.ts`. The tool is effectively unusable.
+  - Fix: add `questionAnswer` IPC (mirrors `agent_respond_hitl`) + a small question dialog fed from the existing engine event subscription.
+
+- [ ] **HITL parser-fallback desync can re-open the gate** (`useAgentStream.ts:127-142`)
+  - The static gate-text parser guards with `resolvedKeyRef` keyed `|${reason}` (line 134) but `resolveGate` writes `${gate.requestId}|${reason}` (line 148) — the keys never match, so the guard never short-circuits. If the backend marker remains in the streamed text after resolution, the modal re-opens with an empty `requestId` and the fallback path (abort + re-issue prompt, lines 155-161) triggers. The backend `agent://hitl-gate` channel (tools.rs:3276-3306) is wired and responsive; remove the text-parser fallback entirely and gate purely on the event.
+
+- [ ] **API keys stored in plaintext localStorage / device localStorage** (`AppContext.tsx:536-547` lastModel.apiKey, `ProviderRegistry.tsx:293-294`)
+  - `rememberLastModel` and provider drafts persist raw keys readable by any renderer JS or anyone with disk access. Fix: OS keychain (Tauri `stronghold`/system keyring) or at minimum backend-only storage in `settings.json`.
+
+- [ ] **`run_gh` tool actually executes the `git` binary** (`tools.rs:1949-1952`)
+  - The GH tool is misnamed and its git(1) wrapper has GH-specific semantics missing; model-facing schema advertises `run_gh` behavior it does not deliver. Fix: implement real `gh` CLI calls, or rename/remove the schema entry.
+
+- [ ] **`download_file` absolute-destination escape** (`tools.rs:3182-3227`)
+  - An absolute `dst` bypasses the workspace join (comment `tools.rs:3206` "must have been policy-vetted already" is an unwritten invariant — nothing gates it). Scope absolute targets through `call_target_paths`/allowlist like the other FS tools.
+
+### P1 — Important (Missing / Broken Functionality)
+
+- [ ] **Session save/load not wired in the new UI** (`ipc.ts:198` `sessionLoad` is never called)
+  - HistoryPanel "Open chat" does nothing end-to-end; messages are held only in `AppContext` memory and not persisted per-chat. Restore session load + save, and merge `session_load` replay with the restore flow.
+
+- [ ] **Feature-parity regression vs the legacy `src/` UI** — verify (& re-port where missing) in the new `ui/`:
+  - command palette (cmdk was shipped 2026-09-06 for old UI) — no `CommandPalette` in `ui/src`;
+  - terminal panel (`terminal.rs` backend exists; no panel/entry point in new UI);
+  - Sessions/Resume panel + session resume picker;
+  - context-window breakdown bar (was `ContextBreakdownBar`);
+  - execution-graph DAG panel;
+  - chat export (PDF/DOCX/CSV);
+  - message-list virtualization (react-virtuoso) — new MessageList renders every message on every token delta.
+
+- [ ] **Monolithic single-state `AppContext` re-renders the whole tree** (`context/AppContext.tsx`)
+  - All pages/components pull from one huge provider; every activity line, poll tick, and keystroke re-renders everything. The legacy UI had split Zustand stores (chatReducer/execGraph/chatStatus/agentRun) — the rewrite regressed to one provider. Split by domain (chat, model, providers, sessions, settings) or selectively memoize consumers.
+
+- [ ] **Duplicated event subscription + polling** (`AppContext.tsx:263` and `useAgentStream.ts:24` both call `subscribeEngineEvents`; model status polled in both StatusBanners and Sidebar)
+  - Two live event subscriptions double-fire activities and, under StrictMode, leak duplicate activity/gate entries. Consolidate to one subscription exposed via a store/hook; dedupe the status poll to a single timer.
+
+- [ ] **`chatAbortRef` is vestigial + no guard when switching chats mid-run** (`AppContext.tsx:230`)
+  - `chatAbortRef` is exposed but never assigned an `AbortController`; the real cancel path is `api.abortAgentExecution()` (correct). But `newChatSession` during an active agent does not abort the backend first — the run keeps streaming into the reset transcript. Add abort-then-switch.
+
+- [ ] **Duplicated `ChatMessage` type across files** (`MessageList.tsx`, `context/AppContext.tsx`, `lib/chatParse.ts`)
+  - Single canonical type + parser contract to prevent field drift (the tool-segment `output` vs `text` bug this session was one instance).
+
+- [ ] **Remote providers have no tool-calling support** (`remote.rs`)
+  - The agentic tool loop is local-only; OpenAI-compatible `chat.completions` calls never send `tools:`/`tool_choice`, so a remote Editor provider can't invoke tools (the "no model loaded" bug fixed this session only gets remote *chat* working). This is the single biggest capability gap vs Cursor/Claude for remote users.
+
+- [ ] **`session_allow` persistence is load-only** (`agent/mod.rs:~880`, `.ai/session-permissions.json`)
+  - The new command paths restore session permissions but do not save new `AllowSession` decisions; users re-approve every session. Persist on each decision like the legacy path did.
+
+- [ ] **KV-cache reuse & compaction claims need re-verification** (`PROJECT_STATUS` legacy P0 vs current `orchestrator.rs`)
+  - The doc marks `cached_prefix_tokens` reuse and the multi-stage compaction pipeline as shipped, but the current orchestrator's reuse logic appears effectively inert (param threaded, never seeded) and some compaction/breakdown helpers are unwired in the flat loop. Implement properly or downgrade the doc claims — don't advertise caching that isn't happening.
+
+- [ ] **MCP only over stdio** — no HTTP/SSE transport, so remote MCP servers can't connect. (Feature gap, low urgency.)
+
+### P2 — Improvements / Enhancements
+
+- [ ] **Icon-only action buttons in MessageList** (explicit user request) — copy/edit currently render icon+text labels; collapse to small icons with `aria-label` + tooltip.
+- [ ] **SSE partial-line buffering** for remote streams (skip jagged/partial JSON lines instead of surfacing them).
+- [ ] **Backpressure on the engine event channel** (unbounded `EngineMsg`; long tool runs accumulate in memory).
+- [ ] **File-watcher batching/debounce** (2s polling can emit duplicate/overlapping change events; `.ai` internal files are watched too).
+- [ ] **Async-runtime blocking calls**: `system_info` runs `nvidia-smi` on the async runtime; `autocomplete_generate`/`llm_brief` call CPU-bound `gen.generate` inline — move to `spawn_blocking`/worker channel.
+- [ ] **Naming collisions**: `debug` builtin mode vs `debug` subagent profile id (`subagent.rs:PROFILES`) confuse prompt construction; `list_directory` is a misnomer for a single-dir listing.
+- [ ] **Dead code sweep** in the new UI: `chatAbortRef`, unused `sessionLoad`, dead `LogsPage` tabs, `ProjectPage` dead dropdown buttons, `ModelHubPage` stale-closure on unmount, unreachable terminal.
+- [ ] **Keyboard/discoverability**: no command palette in new UI, no mouse-free history navigation, dialogs need focus-trap + Escape parity with the legacy UI.
+- [ ] **Accessibility/UX polish**: `role="log"`/`aria-live` on the message list, `aria-label` on all icon-only buttons, virtualization + memo for long transcripts.
 
 ---
 

@@ -51,12 +51,27 @@ fn normalize(input: &str) -> &str {
         .trim_end_matches(['!', '.', '?', ',', ';', ':'])
 }
 
+/// Single-word pings (e.g. "test", "ping") — not coding tasks; must not trigger
+/// tool-use enforcement or latch onto prompt examples that mention "test".
+pub fn is_ambiguous_short_probe(input: &str) -> bool {
+    let bare = normalize(input);
+    if bare.is_empty() || bare.contains(' ') {
+        return false;
+    }
+    let lower = bare.to_ascii_lowercase();
+    const PROBES: &[&str] = &["test", "ping", "ok", "help", "check"];
+    lower.len() <= 12 && PROBES.contains(&lower.as_str())
+}
+
 /// Returns `true` when `input` is trivial small talk that should get a canned
 /// conversational reply instead of burning generation tokens.
 pub fn is_smalltalk(input: &str) -> bool {
     let bare = normalize(input);
     if bare.is_empty() {
         return false;
+    }
+    if is_ambiguous_short_probe(input) {
+        return true;
     }
     let lower = bare.to_ascii_lowercase();
     if PHRASES.contains(&lower.as_str()) {
@@ -88,6 +103,14 @@ pub fn reply_for(input: &str) -> String {
     {
         "I'm doing great, thanks! Ready to help with your code. What would you like to work on?"
             .to_string()
+    } else if lower == "test" || lower == "ping" {
+        "I'm here and responding. Pick a project folder and tell me what to change in your code \
+         (for example: \"add a README\" or \"fix the login form\")."
+            .to_string()
+    } else if lower == "help" {
+        "I can read and edit files in your workspace, run commands, and run tests. Use Agent mode \
+         with a project folder open, then describe the change you want."
+            .to_string()
     } else {
         "Hi there! I'm your AI coding assistant. I can help you explore, edit, test, and fix your codebase. What would you like to work on?".to_string()
     }
@@ -99,7 +122,7 @@ mod tests {
 
     #[test]
     fn greetings_match() {
-        for s in ["Hello", "hi!", "Hey there", "how are you", "Thanks!"] {
+        for s in ["Hello", "hi!", "Hey there", "how are you", "Thanks!", "test", "ping"] {
             assert!(is_smalltalk(s), "`{s}` should be small talk");
         }
     }

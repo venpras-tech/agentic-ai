@@ -78,6 +78,58 @@ pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
+/// System-prompt directive teaching the model the `<hitl_gate>` pause marker.
+/// Injected once at the start of an agent loop so small local models also know
+/// they can stop and ask before destructive/irreversible actions.
+pub const HITL_DIRECTIVE: &str = "HUMAN APPROVAL: Before performing a destructive or \
+     irreversible action (committing or pushing to git, deleting files or folders, \
+     downloading or installing anything, sending network requests, or any command with \
+     side effects outside the workspace), you MUST pause for approval: emit a \
+     `<hitl_gate reason=\"short why\">...</hitl_gate>` marker BEFORE your \
+     `<execute_tool>` blocks in the same step. The harness blocks execution until the \
+     human approves or denies. If denied, revise your plan and try a safer alternative.";
+
+/// Pull a human-readable reason out of a `<hitl_gate>` marker:
+/// `<hitl_gate reason="why">…</hitl_gate>` (attribute wins) or the inner body.
+pub fn extract_hitl_gate(markdown: &str) -> Option<String> {
+    let lower = &markdown.to_lowercase();
+    let start = lower.find("<hitl_gate")?;
+    let rest = &lower[start..];
+    let close = rest.find('>')?;
+    let head = &rest[..close];
+
+    // `<hitl_gate reason="why">…` — attribute takes priority.
+    if let Some(attr_off) = head.find("reason") {
+        if let Some(eq_off) = head[attr_off..].find('=') {
+            let skip = attr_off + eq_off + 1;
+            let after_eq = head[skip..].trim_start();
+            let val = if let Some(v) = after_eq.strip_prefix('"') {
+                v.split('"').next()
+            } else if let Some(v) = after_eq.strip_prefix('\'') {
+                v.split('\'').next()
+            } else {
+                after_eq.split_whitespace().next()
+            };
+            if let Some(v) = val {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+
+    // Fall back to the inner body text.
+    let after_tag = &rest[close + 1..];
+    if let Some(end) = after_tag.find("</hitl_gate>") {
+        let body = after_tag[..end].trim();
+        if !body.is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    None
+}
+
 /// JSON schema descriptions for each tool, for orchestrator-side validation.
 ///
 /// Derived entirely from the canonical [`registry`](super::registry) table so

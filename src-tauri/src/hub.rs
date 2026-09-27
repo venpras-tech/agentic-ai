@@ -452,43 +452,71 @@ pub async fn download_file(
     }
 }
 
-/// List every completed `*.gguf` under `models_dir` (recursive, shallow depth).
+/// A file that can actually be loaded as a model: a `*.gguf` that is neither a
+/// calibration artifact (`imatrix`) nor a multimodal vision projector
+/// (`mmproj`), both of which cannot run standalone.
+fn is_runnable_gguf(p: &Path) -> bool {
+    if !p
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    !name.contains("imatrix") && !name.contains("mmproj")
+}
+
+/// List every runnable `*.gguf` under `models_dir`: one level of repo folders
+/// (`{author}--{repo}/file.gguf`, created by the hub downloader) plus any
+/// GGUFs placed directly in the folder.
 pub fn list_downloaded(models_dir: &Path) -> Vec<DownloadedModel> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(models_dir) else {
         return out;
     };
-    for repo in entries.flatten() {
-        let repo_path = repo.path();
-        if !repo_path.is_dir() {
-            continue;
-        }
-        if let Ok(files) = std::fs::read_dir(&repo_path) {
-            for f in files.flatten() {
-                let p = f.path();
-                let is_gguf = p.extension()
-                    .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false);
-                // imatrix files are calibration artifacts, not runnable models.
-                let is_imatrix = p.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase().contains("imatrix"))
-                    .unwrap_or(false);
-                if is_gguf && !is_imatrix {
-                    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    out.push(DownloadedModel {
-                        repo_id: repo.file_name().to_string_lossy().replace("--", "/"),
-                        file_name: p
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        path: p.to_string_lossy().into_owned(),
-                        size_bytes: size,
-                    });
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let repo_id = entry.file_name().to_string_lossy().replace("--", "/");
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for f in files.flatten() {
+                    let p = f.path();
+                    if is_runnable_gguf(&p) {
+                        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        out.push(DownloadedModel {
+                            repo_id: repo_id.clone(),
+                            file_name: p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            path: p.to_string_lossy().into_owned(),
+                            size_bytes: size,
+                        });
+                    }
                 }
             }
+        } else if is_runnable_gguf(&path) {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(DownloadedModel {
+                repo_id: "local".to_string(),
+                file_name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: size,
+            });
         }
     }
-    out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    out.sort_by(|a, b| {
+        a.repo_id
+            .cmp(&b.repo_id)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
     out
 }
 
@@ -536,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn list_downloaded_scans_repo_folders() {
+    fn list_downloaded_scans_repo_folders_and_top_level() {
         let dir = std::env::temp_dir().join(format!("ai-hub-list-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let repo = dir.join("acme--demo-gguf");
@@ -544,13 +572,20 @@ mod tests {
         std::fs::write(repo.join("q4.gguf"), "12345").unwrap();
         std::fs::write(repo.join("notes.txt"), "ignore me").unwrap();
         std::fs::write(repo.join("calib.imatrix.gguf"), "x").unwrap();
-        // Stray top-level file must be ignored.
-        std::fs::write(dir.join("loose.gguf"), "x").unwrap();
+        // mmproj projectors are not standalone models and must be ignored.
+        std::fs::write(repo.join("mmproj-demo-f16.gguf"), "x").unwrap();
+        // A GGUF placed directly in the folder is listed under repo "local".
+        std::fs::write(dir.join("loose.gguf"), "xy").unwrap();
+        std::fs::write(dir.join("mmproj-loose.gguf"), "x").unwrap();
 
         let found = list_downloaded(&dir);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].repo_id, "acme/demo-gguf");
-        assert_eq!(found[0].size_bytes, 5);
+        assert_eq!(found.len(), 2);
+        let repo_hit = found.iter().find(|m| m.repo_id == "acme/demo-gguf").unwrap();
+        assert_eq!(repo_hit.file_name, "q4.gguf");
+        assert_eq!(repo_hit.size_bytes, 5);
+        let local_hit = found.iter().find(|m| m.repo_id == "local").unwrap();
+        assert_eq!(local_hit.file_name, "loose.gguf");
+        assert_eq!(local_hit.size_bytes, 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1293,19 +1293,40 @@ agentMode,
       </header>
 
       {messages.length === 0 && !isStreaming && (
-        <div className="min-h-0 flex-1 overflow-y-auto py-2 pl-3 pr-6 text-[12.5px]">
-          <p className="mt-6 text-center text-[11px] leading-relaxed text-zinc-400">
-            Load a model and ask it anything.
-            <br />
-            Enter = send · Shift+Enter = newline
-            <br />
-            Try <span className="text-accent">/plan</span>,{" "}
-            <span className="text-accent">/fix</span>,{" "}
-            <span className="text-accent">/bug</span>,{" "}
-            <span className="text-accent">/review</span>,{" "}
-            <span className="text-accent">/test</span> or{" "}
-            <span className="text-accent">/commit</span>
-          </p>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-8">
+          <div className="mx-auto max-w-md text-center">
+            <div className="mb-3 text-2xl font-semibold text-zinc-700">
+              What can I build?
+            </div>
+            <p className="mb-6 text-[12px] leading-relaxed text-zinc-400">
+              {modelName
+                ? `${modelName} is ready. Ask me to write, debug, refactor, or explain code.`
+                : "Load a model from the top bar to get started."}
+            </p>
+            <div className="mb-6 flex flex-wrap justify-center gap-2">
+              {[
+                { label: "Add a login form", prompt: "Add a login form to the app" },
+                { label: "Find auth logic", prompt: "Find where authentication is handled" },
+                { label: "Run tests & fix", prompt: "Run the test suite and fix any failures" },
+              ].map((q) => (
+                <button
+                  key={q.label}
+                  onClick={() => {
+                    setComposerText(q.prompt);
+                    scrollRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "smooth" });
+                  }}
+                  className="rounded-lg border border-border bg-panel-2 px-3 py-1.5 text-[11px] text-zinc-600 transition-colors hover:border-accent/50 hover:text-accent"
+                >
+                  {q.label}
+                </button>
+              ))}
+            </div>
+            <div className="text-[10px] text-zinc-400">
+              <kbd className="rounded border border-border px-1 py-0.5 font-mono text-[9px]">Enter</kbd> send ·{" "}
+              <kbd className="rounded border border-border px-1 py-0.5 font-mono text-[9px]">Shift+Enter</kbd> newline ·{" "}
+              <kbd className="rounded border border-border px-1 py-0.5 font-mono text-[9px]">/</kbd> commands
+            </div>
+          </div>
         </div>
       )}
       {messages.length > 0 && (
@@ -1480,39 +1501,41 @@ agentMode,
             ))}
           </div>
         )}
-        <div className="mb-1.5 flex items-center gap-1.5">
-          <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
-            Mode
-          </label>
-          <select
-            value={mode}
-            onChange={(e) => setMode(e.target.value as SendMode)}
-            title="Stamps the next message with a mode — no need to type /plan, /act, …"
-            className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
-          >
-            {MODE_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value} title={o.title}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="mb-1.5 flex items-center gap-1.5">
-          <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
-            Handoff
-          </label>
-          <select
-            value={handoff}
-            onChange={(e) => setHandoff(e.target.value as HandoffChain)}
-            title="Automatically chain phases: plan → execute → review"
-            className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
-          >
-            {HANDOFF_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value} title={o.title}>
-                {o.label}
-              </option>
-            ))}
-          </select>
+        <div className="mb-1.5 flex items-center gap-2">
+          <div className="flex items-center gap-1">
+            <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
+              Mode
+            </label>
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value as SendMode)}
+              title="Stamps the next message with a mode — no need to type /plan, /act, …"
+              className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
+            >
+              {MODE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value} title={o.title}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
+            <label className="text-[9px] font-semibold uppercase tracking-wider text-zinc-400">
+              Chain
+            </label>
+            <select
+              value={handoff}
+              onChange={(e) => setHandoff(e.target.value as HandoffChain)}
+              title="Automatically chain phases: plan → execute → review"
+              className="rounded border border-border bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-ink outline-none hover:border-accent/50 focus:border-accent/60"
+            >
+              {HANDOFF_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value} title={o.title}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
         <ComposerPrimitive.Input
           maxLength={MAX_INPUT_CHARS}
@@ -1624,43 +1647,48 @@ agentMode,
           </p>
         )}
         <div className="mt-2 flex items-center justify-between">
-          {onAttachClick && (
+          <div className="flex items-center gap-1">
+            {onAttachClick && (
+              <button
+                type="button"
+                onClick={onAttachClick}
+                title="Attach a text file for semantic search (RAG)"
+                aria-label="Attach a text file for semantic search"
+                className="flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-zinc-500 hover:border-accent/50 hover:text-accent"
+              >
+                📎 <span className="hidden sm:inline">Attach</span>
+              </button>
+            )}
             <button
               type="button"
-              onClick={onAttachClick}
-              title="Attach a text file for semantic search (RAG)"
-              aria-label="Attach a text file for semantic search"
-              className="mr-1 rounded border border-border px-1.5 py-0.5 text-[11px] text-zinc-500 hover:border-accent/50 hover:text-accent"
+              onClick={() => void toggleDictation()}
+              disabled={transcribing}
+              aria-label={
+                transcribing
+                  ? "Transcribing"
+                  : recording
+                    ? "Stop recording and transcribe"
+                    : "Dictate (requires local whisper and ffmpeg)"
+              }
+              title={
+                transcribing
+                  ? "Transcribing…"
+                  : recording
+                    ? "Stop recording and transcribe"
+                    : "Dictate (requires local whisper + ffmpeg)"
+              }
+              className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors ${
+                recording
+                  ? "border-red-400 bg-red-500/15 text-red-600"
+                  : "border-border text-zinc-500 hover:border-accent/50 hover:text-accent"
+              } disabled:opacity-50`}
             >
-              📎
+              {recording ? "■" : transcribing ? "…" : "🎤"}{" "}
+              <span className="hidden sm:inline">
+                {recording ? "Stop" : transcribing ? "…" : "Voice"}
+              </span>
             </button>
-          )}
-          <button
-            type="button"
-            onClick={() => void toggleDictation()}
-            disabled={transcribing}
-            aria-label={
-              transcribing
-                ? "Transcribing"
-                : recording
-                  ? "Stop recording and transcribe"
-                  : "Dictate (requires local whisper and ffmpeg)"
-            }
-            title={
-              transcribing
-                ? "Transcribing…"
-                : recording
-                  ? "Stop recording and transcribe"
-                  : "Dictate (requires local whisper + ffmpeg)"
-            }
-            className={`mr-1 rounded border px-1.5 py-0.5 text-[11px] transition-colors ${
-              recording
-                ? "border-red-400 bg-red-500/15 text-red-600"
-                : "border-border text-zinc-500 hover:border-accent/50 hover:text-accent"
-            } disabled:opacity-50`}
-          >
-            {recording ? "■" : transcribing ? "…" : "🎤"}
-          </button>
+          </div>
           {isStreaming ? (
             <button
               type="button"

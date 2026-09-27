@@ -1,0 +1,60 @@
+.provider-registry-role-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin: 4px 0 16px;
+}
+
+.provider-registry-role-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.provider-registry-role-label {
+  text-transform: capitalize;
+}
+
+.provider-registry-role-check {
+  text-transform: capitalize;
+}
+
+.provider-registry-id {
+  margin-left: 6px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.provider-registry-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 4px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.provider-registry-item-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.provider-registry-item-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.provider-registry-role-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  background: var(--bg-hover, rgba(128, 128, 128, 0.12));
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: capitalize;
+  color: var(--text-secondary);
+}

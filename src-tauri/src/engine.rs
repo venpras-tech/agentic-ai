@@ -14,15 +14,19 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::logging;
 use crate::remote::RemoteGenerator;
 use crossbeam_channel::Sender;
 use encoding_rs::UTF_8;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
+use llama_cpp_sys_2::llama_flash_attn_type as LlamaFlashAttnType;
+use llama_cpp_sys_2::{
+    LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED,
+};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -54,10 +58,146 @@ extern "C" fn native_model_log(
             continue;
         }
         match level {
-            llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => logging::error(None, "model", line),
-            llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => logging::warn(None, "model", line),
+            llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => {
+                push_load_diag(line);
+                logging::error(None, "model", line)
+            }
+            llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => {
+                push_load_diag(line);
+                logging::warn(None, "model", line)
+            }
             _ => logging::info(None, "model", line),
         }
+    }
+}
+
+/// Recent native WARN/ERROR lines.
+///
+/// `llama_model_load` only ever hands the Rust wrapper a null pointer, so the
+/// actual reason ("tensor name 4 is too long: 71 >= 64", "unexpected EOF",
+/// ...) exists solely on this log channel. Keeping the tail lets a failed load
+/// report the real cause instead of "null result from llama cpp".
+static LOAD_DIAG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const LOAD_DIAG_CAP: usize = 16;
+
+/// Serializes `llama_model_load` calls.
+///
+/// llama.cpp's log hook is process-global, so the diagnostic lines a load
+/// produces cannot be attributed to it unless loads do not interleave. This
+/// also guards the backend against two loads mutating shared global state at
+/// once, which llama.cpp does not support.
+static LOAD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lock that survives a poisoning panic, so one failed load cannot wedge every
+/// later attempt.
+fn lock_load() -> std::sync::MutexGuard<'static, ()> {
+    LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn push_load_diag(line: &str) {
+    if let Ok(mut diag) = LOAD_DIAG.lock() {
+        if diag.len() >= LOAD_DIAG_CAP {
+            diag.remove(0);
+        }
+        diag.push(line.to_string());
+    }
+}
+
+/// Drain the diagnostics collected so far.
+fn take_load_diag() -> Vec<String> {
+    match LOAD_DIAG.lock() {
+        Ok(mut diag) => std::mem::take(&mut *diag),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Strip llama.cpp's `module: ` tag from the front of a line.
+///
+/// A prefix only counts as a module tag when it looks like one (all lowercase
+/// letters/underscores), so a sentence such as "Tensor data is missing" is left
+/// alone.
+fn strip_module_tag(line: &str) -> &str {
+    match line.find(": ") {
+        Some(i) if line[..i].chars().all(|c| c.is_ascii_lowercase() || c == '_') => {
+            line[i + 2..].trim()
+        }
+        _ => line.trim(),
+    }
+}
+
+/// The concrete failure causes to report, in the order llama.cpp emitted them.
+///
+/// llama.cpp logs cause → consequence → summary (e.g. "tensor name 4 is too
+/// long: 71 >= 64", "failed to read tensor info", "error loading model: …"), so
+/// the *earliest* lines carry the actionable detail and the trailing summary
+/// just repeats "failed to load model". Take the first couple, de-duplicated.
+fn load_diag_causes(diag: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in diag {
+        let cleaned = strip_module_tag(line);
+        if cleaned.is_empty() || out.iter().any(|c| c == cleaned) {
+            continue;
+        }
+        out.push(cleaned.to_string());
+        if out.len() == 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// Extra guidance for failure modes we can recognise, so the message says what
+/// to do next rather than only what went wrong.
+fn load_hint(diag: &str) -> Option<&'static str> {
+    let d = diag.to_ascii_lowercase();
+    if d.contains("split file idx") || d.contains("must be loaded with the first split") {
+        return Some(
+            "this file is one shard of a split model, and only the first shard can be opened on its \
+             own. Download every shard (…-00001-of-0000N.gguf, …-00002-of-0000N.gguf, …) into the \
+             same folder, then load the -00001-of-0000N.gguf file.",
+        );
+    }
+    if d.contains("is too long") && d.contains("tensor name") {
+        return Some(
+            "this build of llama.cpp cannot read this GGUF: one of its tensor names exceeds the 64-byte \
+             format limit. It is likely a vision/image model or a newer format than the bundled \
+             llama.cpp supports — pick a text-only GGUF quant from the hub instead.",
+        );
+    }
+    if d.contains("unexpected eof")
+        || d.contains("failed to read tensor data")
+        || d.contains("file is too short")
+        || d.contains("incomplete")
+    {
+        return Some(
+            "the file on disk is truncated or incomplete — re-download it. If it is one shard of a \
+             split model (…-00001-of-0000N.gguf), every shard must be present in the same folder \
+             and only the first shard is loadable on its own.",
+        );
+    }
+    if d.contains("unknown architecture") || d.contains("unsupported arch") {
+        return Some(
+            "this model's architecture is not supported by the bundled llama.cpp — try a GGUF built \
+             for a widely supported architecture (llama, qwen2, qwen3, phi, gemma, …).",
+        );
+    }
+    None
+}
+
+/// Turn a load failure into a message a user can act on.
+fn format_load_error(
+    e: llama_cpp_2::LlamaModelLoadError,
+    diag: &[String],
+) -> String {
+    let causes = load_diag_causes(diag);
+    if causes.is_empty() {
+        // No native diagnostics: fall back to whatever the wrapper reported.
+        return format!("Failed to load model: {e}");
+    }
+    let reason = causes.join(" / ");
+    match load_hint(&reason) {
+        Some(hint) => format!("Failed to load model: {reason} — {hint}"),
+        None => format!("Failed to load model: {reason}"),
     }
 }
 
@@ -93,6 +233,15 @@ pub struct StandaloneEngine {
     /// reuses a cache only up to the first divergent token. Generated output
     /// tokens that don't round-trip identically are simply not reused.
     cached_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Seed used for local generations when the request carries no seed
+    /// (`None` = random per request).
+    default_seed: Option<u32>,
+    /// Custom chat template from the config, replacing the model's baked-in
+    /// one when set.
+    chat_template_override: Option<String>,
+    /// Optional instruction prepended to the rendered prompt (set from the
+    /// "reasoning budget" advanced setting).
+    reasoning_budget: Option<String>,
 }
 
 // Safety: all llama.cpp calls are serialized by the owning async mutex and the
@@ -127,25 +276,393 @@ fn model_info(model: &LlamaModel, n_ctx: u32) -> ModelInfo {
     }
 }
 
-/// User-supplied model loading parameters (camelCase over the wire).
-#[derive(Debug, Clone, Default, Deserialize)]
+/// User-supplied model loading parameters (camelCase over the wire and under
+/// the persisted `localModelConfigs` map in `settings.json`).
+///
+/// Every field is optional: `None` means "runtime default / auto" so old
+/// callers and legacy settings keep working unchanged. Newer callers send the
+/// full normalized config produced by the Local Model settings page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInitParams {
     /// Layers offloaded to the GPU (0 = CPU only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_gpu_layers: Option<u32>,
     /// Requested context (KV cache) size in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// Compute threads; defaults to all available cores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_threads: Option<u32>,
     /// How many parallel engine workers (each with its own context) to spawn.
     /// Defaults to 2; threads are split across workers so the machine is not
     /// oversubscribed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_workers: Option<u32>,
+    /// Evaluation batch size (llama.cpp `n_batch`). Defaults to 512.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_batch: Option<u32>,
+    /// Physical batch size (llama.cpp `n_ubatch`). Defaults to `n_batch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ubatch: Option<u32>,
+    /// Unified KV cache (uKVC). Defaults to the runtime's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unified_kv: Option<bool>,
+    /// Flash attention. `None` lets the runtime decide (AUTO).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash_attn: Option<bool>,
+    /// Offload the KV cache to GPU memory (llama.cpp `--no-kv-offload`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload_kqv: Option<bool>,
+    /// Try memory-mapping the weights (`--mmap`). Defaults to on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_mmap: Option<bool>,
+    /// Keep the model locked in memory (`--mlock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_mlock: Option<bool>,
+    /// RoPE frequency base override. `None` = automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_freq_base: Option<f32>,
+    /// RoPE frequency scale override. `None` = automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_freq_scale: Option<f32>,
+    /// K-cache quantization type (e.g. `Q8_0`, `Q4_0`, `F16`). `None` = auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_k: Option<String>,
+    /// V-cache quantization type (e.g. `Q8_0`, `Q4_0`, `F16`). `None` = auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_v: Option<String>,
+    /// Seed used for local generations when the request itself has no seed.
+    /// `None` = random per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    /// Generation default: max output tokens when a request leaves it unset.
+    /// Signed so the frontend's `-1` (infinite) round-trips; `None` (unset)
+    /// also means infinite/context-limited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    /// Speculative decoding mode. Only `"off"`/`None` is currently available;
+    /// the field is kept so future modes (draft model, MTP) slot in without a
+    /// schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<String>,
+    /// Number of context checkpoints (llama.cpp `--n-kv-checkpoints`).
+    /// Not exposed by the bundled llama.cpp bindings yet; reserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_checkpoints: Option<u32>,
+    /// Custom chat template used in place of the model's embedded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template: Option<String>,
+    /// Optional instruction message prepended to the rendered prompt for
+    /// reasoning-budget behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget: Option<String>,
+    /// Raw llama.cpp argument overrides (space separated). Recognized flags
+    /// map straight onto the fields above and take precedence over them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_args: Option<String>,
+}
+
+impl ModelInitParams {
+    /// Overlay the non-`None` fields of `explicit` on top of `self`, returning
+    /// the merged result. Used to resolve: defaults ← legacy settings ←
+    /// persisted per-model config ← explicit load call.
+    pub fn merge(&self, explicit: &ModelInitParams) -> ModelInitParams {
+        let mut out = self.clone();
+        if let Some(v) = explicit.n_gpu_layers {
+            out.n_gpu_layers = Some(v);
+        }
+        if let Some(v) = explicit.context_size {
+            out.context_size = Some(v);
+        }
+        if let Some(v) = explicit.n_threads {
+            out.n_threads = Some(v);
+        }
+        if let Some(v) = explicit.n_workers {
+            out.n_workers = Some(v);
+        }
+        if let Some(v) = explicit.n_batch {
+            out.n_batch = Some(v);
+        }
+        if let Some(v) = explicit.n_ubatch {
+            out.n_ubatch = Some(v);
+        }
+        if let Some(v) = explicit.unified_kv {
+            out.unified_kv = Some(v);
+        }
+        if let Some(v) = explicit.flash_attn {
+            out.flash_attn = Some(v);
+        }
+        if let Some(v) = explicit.offload_kqv {
+            out.offload_kqv = Some(v);
+        }
+        if let Some(v) = explicit.use_mmap {
+            out.use_mmap = Some(v);
+        }
+        if let Some(v) = explicit.use_mlock {
+            out.use_mlock = Some(v);
+        }
+        if let Some(v) = explicit.rope_freq_base {
+            out.rope_freq_base = Some(v);
+        }
+        if let Some(v) = explicit.rope_freq_scale {
+            out.rope_freq_scale = Some(v);
+        }
+        if let Some(v) = &explicit.cache_type_k {
+            out.cache_type_k = Some(v.clone());
+        }
+        if let Some(v) = &explicit.cache_type_v {
+            out.cache_type_v = Some(v.clone());
+        }
+        if let Some(v) = explicit.seed {
+            out.seed = Some(v);
+        }
+        if let Some(v) = explicit.max_tokens {
+            out.max_tokens = Some(v);
+        }
+        if let Some(v) = &explicit.speculative {
+            out.speculative = Some(v.clone());
+        }
+        if let Some(v) = explicit.context_checkpoints {
+            out.context_checkpoints = Some(v);
+        }
+        if let Some(v) = &explicit.chat_template {
+            out.chat_template = Some(v.clone());
+        }
+        if let Some(v) = &explicit.reasoning_budget {
+            out.reasoning_budget = Some(v.clone());
+        }
+        if let Some(v) = &explicit.llama_args {
+            out.llama_args = Some(v.clone());
+        }
+        out
+    }
+
+    /// Basic range validation before the model is handed to llama.cpp. Keeps
+    /// obviously-broken configurations from surfacing as cryptic runtime
+    /// errors. Context and GPU-layer clamping against the actual model happens
+    /// after load (see [`load_model_with_progress`]).
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(v) = self.n_gpu_layers {
+            if v > 16_384 {
+                return Err(format!("GPU layers out of range: {v} (max 16384)"));
+            }
+        }
+        if let Some(v) = self.n_threads {
+            if !(1..=1024).contains(&v) {
+                return Err(format!("Threads must be between 1 and 1024 (got {v})"));
+            }
+        }
+        if let Some(v) = self.n_workers {
+            if !(1..=32).contains(&v) {
+                return Err(format!("Max concurrent must be between 1 and 32 (got {v})"));
+            }
+        }
+        for (label, v) in [("Evaluation batch size", self.n_batch), ("Physical batch size", self.n_ubatch)] {
+            if let Some(v) = v {
+                if v < 1 || v > 1_048_576 {
+                    return Err(format!("{label} out of range: {v} (1..1048576)"));
+                }
+            }
+        }
+        if let (Some(batch), Some(ubatch)) = (self.n_batch, self.n_ubatch) {
+            if ubatch > batch {
+                return Err(format!(
+                    "Physical batch size ({ubatch}) cannot exceed the evaluation batch size ({batch})"
+                ));
+            }
+        }
+        if let Some(v) = self.rope_freq_base {
+            if !(0.1..=1_000_000.0).contains(&v) {
+                return Err(format!("RoPE frequency base out of range: {v} (0.1..1000000)"));
+            }
+        }
+        if let Some(v) = self.rope_freq_scale {
+            if !(0.01..=1_000.0).contains(&v) {
+                return Err(format!("RoPE frequency scale out of range: {v} (0.01..1000)"));
+            }
+        }
+        for (label, v) in [("K-cache quantization", self.cache_type_k.as_deref()), ("V-cache quantization", self.cache_type_v.as_deref())] {
+            if let Some(v) = v {
+                if parse_cache_type(v).is_none() {
+                    return Err(format!(
+                        "Unsupported {label} type `{v}` (expected one of: {})",
+                        CACHE_TYPES.join(", ")
+                    ));
+                }
+            }
+        }
+        if let Some(v) = self.seed {
+            if v >= u32::MAX {
+                return Err(format!("Seed must be below {0} (got {v})", u32::MAX));
+            }
+        }
+        if let Some(spec) = self.speculative.as_deref() {
+            if !matches!(spec, "off" | "") {
+                return Err(format!(
+                    "Speculative decoding mode `{spec}` is not supported (only \"off\" is available)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a raw llama.cpp argument string: each recognized flag is parsed
+    /// and folded onto the matching field (taking precedence over the UI
+    /// value). Unknown flags are rejected so a typo can never be silently
+    /// ignored. See [`apply_llama_args`].
+    pub fn apply_llama_args(&mut self, args: &str) -> Result<(), String> {
+        apply_llama_args(self, args)
+    }
+}
+
+/// Cache quantization types accepted by the KV-cache override controls.
+pub const CACHE_TYPES: &[&str] = &["F16", "F32", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "IQ4_NL"];
+
+/// Map a cache-quantization type name onto the crate's [`KvCacheType`].
+pub fn parse_cache_type(name: &str) -> Option<KvCacheType> {
+    match &name.trim().to_uppercase().replace('.', "_")[..] {
+        "F16" => Some(KvCacheType::F16),
+        "F32" => Some(KvCacheType::F32),
+        "Q4_0" => Some(KvCacheType::Q4_0),
+        "Q4_1" => Some(KvCacheType::Q4_1),
+        "Q5_0" => Some(KvCacheType::Q5_0),
+        "Q5_1" => Some(KvCacheType::Q5_1),
+        "Q8_0" => Some(KvCacheType::Q8_0),
+        "Q8_1" => Some(KvCacheType::Q8_1),
+        "Q2_K" => Some(KvCacheType::Q2_K),
+        "Q3_K" => Some(KvCacheType::Q3_K),
+        "Q4_K" => Some(KvCacheType::Q4_K),
+        "Q5_K" => Some(KvCacheType::Q5_K),
+        "Q6_K" => Some(KvCacheType::Q6_K),
+        "Q8_K" => Some(KvCacheType::Q8_K),
+        "IQ1_S" => Some(KvCacheType::IQ1_S),
+        "IQ2_S" => Some(KvCacheType::IQ2_S),
+        "IQ2_XS" => Some(KvCacheType::IQ2_XS),
+        "IQ2_XXS" => Some(KvCacheType::IQ2_XXS),
+        "IQ3_S" => Some(KvCacheType::IQ3_S),
+        "IQ3_XXS" => Some(KvCacheType::IQ3_XXS),
+        "IQ4_NL" => Some(KvCacheType::IQ4_NL),
+        "IQ4_XS" => Some(KvCacheType::IQ4_XS),
+        "IQ1_M" => Some(KvCacheType::IQ1_M),
+        "BF16" => Some(KvCacheType::BF16),
+        _ => None,
+    }
+}
+
+/// Parse a raw `llama.cpp` argument override string onto [`ModelInitParams`].
+/// Values are applied last, so a flag here overrides the corresponding UI
+/// field. Flag aliases mirror llama.cpp's own CLI. Unknown flags produce a
+/// clear error instead of being silently dropped.
+fn apply_llama_args(params: &mut ModelInitParams, args: &str) -> Result<(), String> {
+    let mut tokens = args.split_whitespace();
+    let need_next = |flag: &str, tokens: &mut std::str::SplitWhitespace| -> Result<String, String> {
+        tokens
+            .next()
+            .ok_or_else(|| format!("`{flag}` requires a value"))
+            .map(|v| v.to_string())
+    };
+    while let Some(tok) = tokens.next() {
+        let (flag, inline_val) = match tok.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_string())),
+            None => (tok, None),
+        };
+        let take = |tokens: &mut std::str::SplitWhitespace| -> Result<String, String> {
+            match inline_val.clone() {
+                Some(v) => Ok(v),
+                None => need_next(flag, tokens),
+            }
+        };
+        match flag {
+            "-c" | "--ctx-size" | "--context-size" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--ctx-size` must be a number".to_string())?;
+                params.context_size = Some(v);
+            }
+            "-t" | "--threads" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--threads` must be a number".to_string())?;
+                params.n_threads = Some(v);
+            }
+            "-ngl" | "--gpu-layers" | "--n-gpu-layers" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--gpu-layers` must be a number".to_string())?;
+                params.n_gpu_layers = Some(v);
+            }
+            "-b" | "--batch-size" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--batch-size` must be a number".to_string())?;
+                params.n_batch = Some(v);
+            }
+            "-ub" | "--ubatch-size" | "--physical-batch" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--ubatch-size` must be a number".to_string())?;
+                params.n_ubatch = Some(v);
+            }
+            "-np" | "--parallel" | "--concurrency" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--parallel` must be a number".to_string())?;
+                params.n_workers = Some(v);
+            }
+            "-s" | "--seed" => {
+                let v = take(&mut tokens)?
+                    .parse::<u32>()
+                    .map_err(|_| "`--seed` must be a number between 0 and 4294967294".to_string())?;
+                params.seed = Some(v);
+            }
+            "--rope-freq-base" | "--rope-frequency-base" => {
+                let v = take(&mut tokens)?
+                    .parse::<f32>()
+                    .map_err(|_| "`--rope-freq-base` must be a number".to_string())?;
+                params.rope_freq_base = Some(v);
+            }
+            "--rope-freq-scale" | "--rope-frequency-scale" => {
+                let v = take(&mut tokens)?
+                    .parse::<f32>()
+                    .map_err(|_| "`--rope-freq-scale` must be a number".to_string())?;
+                params.rope_freq_scale = Some(v);
+            }
+            "--cache-type-k" => {
+                let v = take(&mut tokens)?;
+                params.cache_type_k = Some(v);
+            }
+            "--cache-type-v" => {
+                let v = take(&mut tokens)?;
+                params.cache_type_v = Some(v);
+            }
+            "--chat-template" => {
+                let v = take(&mut tokens)?;
+                params.chat_template = Some(v);
+            }
+            "--flash-attn" | "--flash-attention" => params.flash_attn = Some(true),
+            "--no-flash-attn" | "--no-flash-attention" => params.flash_attn = Some(false),
+            "--kv-offload" | "--offload-kqv" => params.offload_kqv = Some(true),
+            "--no-kv-offload" | "--no-offload-kqv" => params.offload_kqv = Some(false),
+            "--mmap" => params.use_mmap = Some(true),
+            "--no-mmap" => params.use_mmap = Some(false),
+            "--mlock" => params.use_mlock = Some(true),
+            "--no-mlock" => params.use_mlock = Some(false),
+            "--unified-kv" | "--ukvc" | "--use-unified-kv" => params.unified_kv = Some(true),
+            "--no-unified-kv" => params.unified_kv = Some(false),
+            other => {
+                return Err(format!(
+                    "Unsupported llama.cpp argument override `{other}`. Supported flags: --ctx-size/-c, --threads/-t, --gpu-layers/-ngl, --batch-size/-b, --ubatch-size/-ub, --parallel/-np, --seed/-s, --rope-freq-base, --rope-freq-scale, --cache-type-k, --cache-type-v, --chat-template, --flash-attn/--no-flash-attn, --kv-offload/--no-kv-offload, --mmap/--no-mmap, --mlock/--no-mlock, --unified-kv/--no-unified-kv"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One structured conversation turn used to render the prompt through the
 /// model's own chat template (see [`InferenceRequest::messages`]).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ChatTurn {
     pub role: String,
     pub content: String,
@@ -164,7 +681,7 @@ pub struct ImageAttachment {
 }
 
 /// A single streaming inference request (camelCase over the wire).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceRequest {
     /// Flat fallback prompt. Used verbatim when [`Self::messages`] is absent
@@ -182,30 +699,6 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub images: Option<Vec<ImageAttachment>>,
     pub max_tokens: u32,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    /// Nucleus `top-k` (Ivan: number of most likely tokens kept before
-    /// rescoring). `None` uses the llama.cpp default (40).
-    #[serde(default)]
-    pub top_k: Option<u32>,
-    /// `min-p` absolute cutoff: tokens below `min_p * max_logit` are pruned.
-    /// 0.0 disables; llama.cpp default is 0.05.
-    #[serde(default)]
-    pub min_p: Option<f32>,
-    /// Repetition-penalty multiplier applied over the last few tokens.
-    /// `None` / <=1.0 disables it; values >1.0 suppress tokens that already
-    /// appeared recently, which stops small models from degenerately looping
-    /// (echoing prompt fragments forever). Defaults to [`REPEAT_PENALTY_DEFAULT`].
-    pub repeat_penalty: Option<f32>,
-    /// Frequency penalty (0.0 disables): how much already-sampled tokens are
-    /// penalised on each repeat, dampening repetition over long generations.
-    #[serde(default)]
-    pub frequency_penalty: Option<f32>,
-    /// Presence penalty (0.0 disables): a flat penalty for tokens that have
-    /// appeared at all, encouraging a richer vocabulary.
-    #[serde(default)]
-    pub presence_penalty: Option<f32>,
-    pub seed: Option<u32>,
     pub stop_words: Option<Vec<String>>,
     /// Number of prompt tokens already present in the KV cache from a previous
     /// generation call on the same worker. When set, the engine skips clearing
@@ -214,15 +707,6 @@ pub struct InferenceRequest {
     #[serde(default)]
     pub cached_prefix_tokens: Option<usize>,
 }
-
-/// Default repetition penalty when a request does not specify one. 1.3 is firm
-/// enough to break degenerate loops on small models without visibly hurting a
-/// quality instruct model.
-pub const REPEAT_PENALTY_DEFAULT: f32 = 1.3;
-/// How many recent tokens the repetition penalty looks back at. 256 (llama.cpp
-/// default) catches multi-token loops ("Solution Solution Solution …"); small
-/// windows like 64 let a degenerate small model echo phrases indefinitely.
-const REPEAT_LAST_N: i32 = 256;
 
 /// Snapshot of model metadata surfaced to the frontend (camelCase).
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +842,13 @@ pub trait TextGenerator: Send {
         interrupt: &CancellationToken,
         tx: &Sender<WorkerEvent>,
     ) -> Result<GenerationOutcome, String>;
+    /// Render `request.messages` through this backend's chat template, when it
+    /// has one. Defaults to `None` (remote generators ship their own message
+    /// formatting); the local engine renders through the model's embedded
+    /// template or the configured override.
+    fn render_chat(&mut self, _request: &InferenceRequest) -> Option<String> {
+        None
+    }
 }
 
 /// Local llama.cpp backend: thin wrapper over [`StandaloneEngine`].
@@ -385,6 +876,10 @@ impl TextGenerator for LocalGenerator {
     ) -> Result<GenerationOutcome, String> {
         run_generation(&mut self.engine, request, session_id, interrupt, tx)
     }
+
+    fn render_chat(&mut self, request: &InferenceRequest) -> Option<String> {
+        render_chat_template(&self.engine, request)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +901,24 @@ pub enum EngineMsg {
         session_id: u64,
         interrupt: CancellationToken,
         reply: crossbeam_channel::Sender<Result<GenerationOutcome, String>>,
+    },
+    /// Streaming generation that routes token events to a caller-supplied
+    /// channel instead of the pool's shared UI bus. Used by the local
+    /// OpenAI-compatible server so an HTTP SSE stream owns its own events.
+    Stream {
+        request: InferenceRequest,
+        session_id: u64,
+        interrupt: CancellationToken,
+        events: crossbeam_channel::Sender<WorkerEvent>,
+        reply: crossbeam_channel::Sender<Result<GenerationOutcome, String>>,
+    },
+    /// Render the model's chat template for a message list (local models only;
+    /// remote generators answer `None`). Needed by the API server so
+    /// `POST /v1/chat/completions` feeds the model the exact instruction format
+    /// it was tuned with — the same template the agent loop uses.
+    RenderChat {
+        request: InferenceRequest,
+        reply: crossbeam_channel::Sender<Option<String>>,
     },
     Stop,
 }
@@ -450,6 +963,58 @@ impl TextGenerator for PoolGenerator {
         reply_rx
             .recv()
             .map_err(|_| "Engine worker is gone".to_string())?
+    }
+}
+
+impl PoolGenerator {
+    /// Streaming generation routed to caller-owned event + outcome channels.
+    /// The events channel carries [`WorkerEvent::Token`] deltas (tagged with
+    /// `session_id`) and ends with [`WorkerEvent::Done`]; the outcome channel
+    /// yields the final [`GenerationOutcome`]. Both channels are closed by the
+    /// worker when the generation finishes or the engine is unloaded.
+    pub fn stream(
+        &self,
+        request: InferenceRequest,
+        session_id: u64,
+        interrupt: CancellationToken,
+    ) -> Result<
+        (
+            crossbeam_channel::Receiver<WorkerEvent>,
+            crossbeam_channel::Receiver<Result<GenerationOutcome, String>>,
+        ),
+        String,
+    > {
+        let (events_tx, events_rx) = crossbeam_channel::unbounded::<WorkerEvent>();
+        let (reply_tx, reply_rx) =
+            crossbeam_channel::bounded::<Result<GenerationOutcome, String>>(1);
+        self.tx
+            .send(EngineMsg::Stream {
+                request,
+                session_id,
+                interrupt,
+                events: events_tx,
+                reply: reply_tx,
+            })
+            .map_err(|_| "Engine worker is gone".to_string())?;
+        Ok((events_rx, reply_rx))
+    }
+
+    /// Render `request.messages` through the model's chat template on the
+    /// worker. `None` when the backend is remote or carries no template — the
+    /// API server then falls back to its flat-prompt flattening.
+    pub fn render_chat(&self, request: &InferenceRequest) -> Option<String> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Option<String>>(1);
+        if self
+            .tx
+            .send(EngineMsg::RenderChat {
+                request: request.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.recv().ok().flatten()
     }
 }
 
@@ -596,6 +1161,21 @@ impl EnginePool {
                                 inner.generate(&request, session_id, &interrupt, &event_tx);
                             let _ = reply.send(result);
                         }
+                        EngineMsg::Stream {
+                            request,
+                            session_id,
+                            interrupt,
+                            events,
+                            reply,
+                        } => {
+                            let result =
+                                inner.generate(&request, session_id, &interrupt, &events);
+                            let _ = reply.send(result);
+                        }
+                        EngineMsg::RenderChat { request, reply } => {
+                            let rendered = inner.render_chat(&request);
+                            let _ = reply.send(rendered);
+                        }
                         EngineMsg::Stop => break,
                     }
                 }
@@ -659,17 +1239,52 @@ pub struct LoadedModel {
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
     n_ctx: u32,
+    /// The (validated, llama-args folded) config this model was loaded with;
+    /// `new_engine_with_threads` builds every pool context from it.
+    config: ModelInitParams,
 }
 
 impl LoadedModel {
+    fn flash_policy(flash: Option<bool>) -> LlamaFlashAttnType {
+        match flash {
+            Some(true) => LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            Some(false) => LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            None => LLAMA_FLASH_ATTN_TYPE_AUTO,
+        }
+    }
+
     /// Create a new standalone engine (own context) using a specific thread
     /// count (used to split compute across pool workers).
     pub fn new_engine_with_threads(&self, threads: i32) -> Result<StandaloneEngine, String> {
-        let ctx_params = LlamaContextParams::default()
+        let c = &self.config;
+        let n_batch = c.n_batch.unwrap_or(512);
+        let n_ubatch = c.n_ubatch.unwrap_or(n_batch);
+
+        let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(self.n_ctx))
             .with_n_threads(threads)
             .with_n_threads_batch(threads)
-            .with_n_batch(512);
+            .with_n_batch(n_batch)
+            .with_n_ubatch(n_ubatch)
+            .with_flash_attention_policy(Self::flash_policy(c.flash_attn));
+        if let Some(unified) = c.unified_kv {
+            ctx_params = ctx_params.with_kv_unified(unified);
+        }
+        if let Some(v) = c.offload_kqv {
+            ctx_params = ctx_params.with_offload_kqv(v);
+        }
+        if let Some(v) = c.rope_freq_base {
+            ctx_params = ctx_params.with_rope_freq_base(v);
+        }
+        if let Some(v) = c.rope_freq_scale {
+            ctx_params = ctx_params.with_rope_freq_scale(v);
+        }
+        if let Some(kind) = c.cache_type_k.as_deref().and_then(parse_cache_type) {
+            ctx_params = ctx_params.with_type_k(kind);
+        }
+        if let Some(kind) = c.cache_type_v.as_deref().and_then(parse_cache_type) {
+            ctx_params = ctx_params.with_type_v(kind);
+        }
 
         let context = self
             .model
@@ -687,6 +1302,9 @@ impl LoadedModel {
             model: self.model.clone(),
             _backend: self.backend.clone(),
             cached_tokens: Vec::new(),
+            default_seed: c.seed.filter(|s| *s != u32::MAX),
+            chat_template_override: c.chat_template.clone().filter(|t| !t.trim().is_empty()),
+            reasoning_budget: c.reasoning_budget.clone().filter(|m| !m.trim().is_empty()),
         })
     }
 }
@@ -738,25 +1356,48 @@ where
 
     let backend = global_backend()?;
 
-    let n_gpu_layers = params.n_gpu_layers.unwrap_or(0);
-    let requested_ctx = params.context_size.unwrap_or(4096);
+    // Validate the requested config before touching llama.cpp so a bad value
+    // surfaces as a readable error instead of a crash mid-load. Raw llama.cpp
+    // argument overrides are folded in first (they take precedence over the
+    // UI fields), then the merged result is validated.
+    let mut config = params.clone();
+    if let Some(args) = config.llama_args.take() {
+        config
+            .apply_llama_args(&args)
+            .map_err(|e| format!("llama.cpp arguments override failed: {e}"))?;
+    }
+    config.validate()?;
 
-    let model_params = LlamaModelParams::default()
+    let n_gpu_layers = config.n_gpu_layers.unwrap_or(0);
+    let requested_ctx = config.context_size.unwrap_or(4096);
+
+    let mut model_params = LlamaModelParams::default()
         .with_n_gpu_layers(n_gpu_layers)
-        .with_use_mmap(true)
+        .with_use_mmap(config.use_mmap.unwrap_or(true))
         .with_progress_callback(move |progress: f32| on_progress(progress));
+    if config.use_mlock == Some(true) {
+        model_params = model_params.with_use_mlock(true);
+    }
 
-    let model = LlamaModel::load_from_file(&backend, path, &model_params)
-        .map_err(|e| format!("Failed to load model: {e}"))?;
+    // Loads are serialized so the process-global log hook's lines can be
+    // attributed to this attempt. Start from a clean slate so diagnostics from
+    // an earlier attempt are not carried over.
+    let _load_guard = lock_load();
+    take_load_diag();
+    let loaded = LlamaModel::load_from_file(&backend, path, &model_params);
+    let diag = take_load_diag();
+    let model = loaded.map_err(|e| format_load_error(e, &diag))?;
 
     // Clamp the KV cache to what the model was trained on (never silently
     // allocate more than `n_ctx_train`).
-    let n_ctx = requested_ctx.clamp(64, model.n_ctx_train().max(64));
+    let n_ctx_train = model.n_ctx_train();
+    let n_ctx = requested_ctx.clamp(64, n_ctx_train.max(64));
 
     Ok(LoadedModel {
         backend,
         model: Arc::new(model),
         n_ctx,
+        config,
     })
 }
 
@@ -769,25 +1410,39 @@ fn render_chat_template(engine: &StandaloneEngine, request: &InferenceRequest) -
     if msgs.is_empty() {
         return None;
     }
-    let template = engine.model.chat_template(None).ok()?;
+    // A configured reasoning-budget instruction becomes a leading system turn
+    // so it is always the first thing in the rendered prompt.
+    let mut chat: Vec<LlamaChatMessage> = Vec::with_capacity(msgs.len() + 1);
+    if let Some(reasoning) = engine.reasoning_budget.as_deref() {
+        if let Ok(m) = LlamaChatMessage::new("system".to_string(), reasoning.to_string()) {
+            chat.push(m);
+        }
+    }
     // Chat templates only understand system / user / assistant roles; our
     // extra roles (context, rules, skill, plan, tool …) carry their section
     // headers inside the content, so they map safely onto `system`.
-    let chat: Vec<LlamaChatMessage> = msgs
-        .iter()
-        .filter(|t| !t.content.trim().is_empty())
-        .filter_map(|t| {
-            let role = match t.role.as_str() {
-                "user" => "user",
-                "assistant" => "assistant",
-                _ => "system",
-            };
-            LlamaChatMessage::new(role.to_string(), t.content.clone()).ok()
-        })
-        .collect();
+    for t in msgs.iter().filter(|t| !t.content.trim().is_empty()) {
+        let role = match t.role.as_str() {
+            "user" => "user",
+            "assistant" => "assistant",
+            _ => "system",
+        };
+        if let Ok(m) = LlamaChatMessage::new(role.to_string(), t.content.clone()) {
+            chat.push(m);
+        }
+    }
     if chat.is_empty() {
         return None;
     }
+    // A configured custom template replaces the model's baked-in one; it wins
+    // even when the model carries no template metadata.
+    let template = match engine.chat_template_override.as_deref() {
+        Some(raw) => match llama_cpp_2::model::LlamaChatTemplate::new(raw) {
+            Ok(t) => t,
+            Err(_) => return None,
+        },
+        None => engine.model.chat_template(None).ok()?,
+    };
     // add_ass = true leaves the assistant tag open so completion continues it.
     engine
         .model
@@ -842,7 +1497,7 @@ pub fn run_generation(
     let prefix_len = 0usize;
     engine.context.reset_timings();
 
-    let mut sampler = build_sampler(request);
+    let mut sampler = build_sampler(engine.default_seed);
 
     // The prompt can easily exceed a single LlamaBatch (capacity = n_batch,
     // 512). Chunk it so every `decode` call stays within the batch capacity;
@@ -1001,44 +1656,20 @@ pub fn run_generation(
 /// Build the sampler chain. Must end with a token-selecting sampler
 /// (`greedy` or `dist`); penalties/temperature/`top_p` are applied beforehand,
 /// mirroring llama.cpp's own default chain order.
-fn build_sampler(request: &InferenceRequest) -> LlamaSampler {
-    let temperature = request.temperature.unwrap_or(0.8).clamp(0.0, 4.0);
-    let top_p = request.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
-    let top_k = request.top_k.unwrap_or(40).clamp(1, 512);
-    let min_p = request.min_p.unwrap_or(0.05).clamp(0.0, 1.0);
-    let repeat_penalty = request
-        .repeat_penalty
-        .unwrap_or(REPEAT_PENALTY_DEFAULT)
-        .clamp(1.0, 2.0);
-    let frequency_penalty = request.frequency_penalty.unwrap_or(0.0).clamp(0.0, 2.0);
-    let presence_penalty = request.presence_penalty.unwrap_or(0.0).clamp(0.0, 2.0);
-    let seed = request.seed.unwrap_or(u32::MAX);
-
-    let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(6);
-    if repeat_penalty > 1.0 || frequency_penalty > 0.0 || presence_penalty > 0.0 {
-        samplers.push(LlamaSampler::penalties(
-            REPEAT_LAST_N,
-            repeat_penalty,
-            frequency_penalty,
-            presence_penalty,
-        ));
-    }
-    if temperature > 0.0 {
-        samplers.push(LlamaSampler::temp(temperature));
-    }
-    samplers.push(LlamaSampler::top_k(top_k as i32));
-    if top_p > 0.0 && top_p < 1.0 {
-        samplers.push(LlamaSampler::top_p(top_p, 1));
-    }
-    if min_p > 0.0 {
-        samplers.push(LlamaSampler::min_p(min_p, 1));
-    }
-    samplers.push(if temperature <= 0.0 {
-        LlamaSampler::greedy()
-    } else {
-        LlamaSampler::dist(seed)
-    });
-    LlamaSampler::chain_simple(samplers)
+/// Build the exact sampler chain llama.cpp uses by default (`temp 0.8`,
+/// `top_k 40`, `top_p 0.95`, `min_p 0.05`, repetition penalty 1.1 over the
+/// last 64 tokens) and terminate it with a distribution sampler. No request
+/// or model settings can alter it: the local model runs "as is".
+fn build_sampler(default_seed: Option<u32>) -> LlamaSampler {
+    let seed = default_seed.unwrap_or(u32::MAX).min(u32::MAX - 1);
+    LlamaSampler::chain_simple(vec![
+        LlamaSampler::penalties(64, 1.1, 0.0, 0.0),
+        LlamaSampler::top_k(40),
+        LlamaSampler::top_p(0.95, 1),
+        LlamaSampler::min_p(0.05, 1),
+        LlamaSampler::temp(0.8),
+        LlamaSampler::dist(seed),
+    ])
 }
 
 fn has_stop_suffix(text: &str, stop_words: &[String]) -> bool {
@@ -1051,6 +1682,173 @@ fn has_stop_suffix(text: &str, stop_words: &[String]) -> bool {
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+
+    #[test]
+    fn load_diag_causes_take_the_earliest_concrete_lines() {
+        let diag = vec![
+            "gguf_init_from_reader: tensor name 4 is too long: 71 >= 64".to_string(),
+            "gguf_init_from_reader: failed to read tensor info".to_string(),
+            "llama_model_load: error loading model: llama_model_loader: failed to load model from /x/y.gguf"
+                .to_string(),
+        ];
+        // The trailing line is only a summary, so the actionable cause leads.
+        assert_eq!(
+            load_diag_causes(&diag),
+            vec![
+                "tensor name 4 is too long: 71 >= 64".to_string(),
+                "failed to read tensor info".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn load_diag_causes_strip_only_the_module_tag() {
+        let diag = vec!["llama_model_load: error loading model: bad arch".to_string()];
+        assert_eq!(
+            load_diag_causes(&diag),
+            vec!["error loading model: bad arch".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_diag_causes_keep_a_sentence_starting_with_a_capital() {
+        // A prefix is only a module tag when it is all-lowercase/underscore.
+        let diag = vec!["Tensor data is missing".to_string()];
+        assert_eq!(load_diag_causes(&diag), vec!["Tensor data is missing"]);
+    }
+
+    #[test]
+    fn load_diag_causes_skip_duplicates_and_blanks() {
+        let diag = vec![
+            "gguf_init_from_reader: same".to_string(),
+            "gguf_init_from_reader: same".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(load_diag_causes(&diag), vec!["same".to_string()]);
+    }
+
+    #[test]
+    fn load_diag_causes_are_empty_without_diagnostics() {
+        assert!(load_diag_causes(&[]).is_empty());
+    }
+
+    #[test]
+    fn load_hint_flags_split_model_shards() {
+        for d in [
+            "llama_model_load: error loading model: illegal split file idx: 2 (file: /x/-00003-of-00003.gguf), model must be loaded with the first split",
+            "model must be loaded with the first split",
+        ] {
+            let hint = load_hint(d).unwrap_or_else(|| panic!("expected a hint for {d}"));
+            assert!(hint.contains("first shard"), "hint should point at shard 1: {hint}");
+        }
+    }
+
+    #[test]
+    fn load_hint_flags_oversized_tensor_names() {
+        let d = "tensor name 4 is too long: 71 >= 64";
+        let hint = load_hint(d).expect("expected a hint");
+        assert!(hint.contains("64-byte"));
+    }
+
+    #[test]
+    fn load_hint_flags_truncated_downloads() {
+        for d in [
+            "unexpected EOF while reading tensor data",
+            "failed to read tensor data",
+            "file is too short",
+        ] {
+            let hint = load_hint(d).unwrap_or_else(|| panic!("expected a hint for {d}"));
+            assert!(hint.contains("truncated") || hint.contains("shard"));
+        }
+    }
+
+    #[test]
+    fn load_hint_flags_unknown_architecture() {
+        let hint = load_hint("unknown architecture 'foo'").expect("expected a hint");
+        assert!(hint.contains("architecture"));
+    }
+
+    #[test]
+    fn load_hint_is_none_for_unrecognised_failures() {
+        assert!(load_hint("out of memory").is_none());
+    }
+
+    #[test]
+    fn load_diag_buffer_is_bounded_and_drainable() {
+        // Same lock the real load path takes, so a concurrent load cannot
+        // interleave its lines into this buffer.
+        let _guard = lock_load();
+        take_load_diag();
+        for i in 0..(LOAD_DIAG_CAP * 2) {
+            push_load_diag(&format!("line {i}"));
+        }
+        let drained = take_load_diag();
+        assert_eq!(drained.len(), LOAD_DIAG_CAP);
+        // Draining empties the buffer so a later load cannot inherit it.
+        assert!(take_load_diag().is_empty());
+    }
+
+    #[test]
+    fn load_error_uses_native_reason_over_the_generic_null_result() {
+        let diag = vec![
+            "gguf_init_from_reader: tensor name 4 is too long: 71 >= 64".to_string(),
+            "llama_model_load: error loading model: failed to load model".to_string(),
+        ];
+        let msg = format_load_error(llama_cpp_2::LlamaModelLoadError::NullResult, &diag);
+        assert!(msg.contains("failed to load model"));
+        assert!(!msg.contains("null result from llama cpp"));
+    }
+
+    #[test]
+    fn load_error_falls_back_to_the_wrapper_message_without_diagnostics() {
+        let msg = format_load_error(llama_cpp_2::LlamaModelLoadError::NullResult, &[]);
+        assert!(msg.contains("null result from llama cpp"));
+    }
+
+    /// Same check for a shard of a split model: it must report the shard rule
+    /// rather than the generic null pointer. Ignored by default.
+    #[test]
+    #[ignore = "requires a split GGUF shard on disk"]
+    fn load_error_on_real_split_shard() {
+        install_native_model_logs();
+        let path = std::path::Path::new(
+            r"D:\ai\models\Qwen--Qwen2.5-Coder-7B-Instruct-GGUF\qwen2.5-coder-7b-instruct-q8_0-00003-of-00003.gguf",
+        );
+        if !path.is_file() {
+            panic!("sample not present: {}", path.display());
+        }
+        let err =
+            match load_model_with_progress(path, &ModelInitParams::default(), |_| true) {
+                Ok(_) => panic!("a non-first shard must not load"),
+                Err(e) => e,
+            };
+        println!("USER-FACING ERROR: {err}");
+        assert!(!err.contains("null result from llama cpp"), "generic message leaked");
+        assert!(err.contains("first shard"), "missing shard guidance: {err}");
+    }
+
+    /// End-to-end check of the user-facing message against a real unloadable
+    /// GGUF. Ignored by default because it needs a specific file on disk; run
+    /// with `cargo test -- --ignored load_error_on_real_bad_gguf`.
+    #[test]
+    #[ignore = "requires an unloadable GGUF on disk"]
+    fn load_error_on_real_bad_gguf() {
+        install_native_model_logs();
+        let path = std::path::Path::new(
+            r"D:\delete\models\hub\models--unsloth--Qwen-Image-2.1-GGUF\snapshots\2c31ccd392b367a6637841a143813320a02dff55\qwen-image-2.1-Q2_K.gguf",
+        );
+        if !path.is_file() {
+            panic!("sample not present: {}", path.display());
+        }
+        let err = match load_model_with_progress(path, &ModelInitParams::default(), |_| true)
+        {
+            Ok(_) => panic!("this GGUF must not load"),
+            Err(e) => e,
+        };
+        println!("USER-FACING ERROR: {err}");
+        assert!(!err.contains("null result from llama cpp"), "generic message leaked");
+        assert!(err.contains("tensor name"), "missing root cause: {err}");
+    }
 
     /// The frontend sends camelCase JSON; `messages` must deserialize when
     /// present AND default to `None` when absent (older callers).
@@ -1141,16 +1939,9 @@ mod tests {
             messages: None,
             images: None,
             max_tokens: 8,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            min_p: None,
-            repeat_penalty: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
             stop_words: None,
             cached_prefix_tokens: None,
+            ..Default::default()
         };
         let interrupt = CancellationToken::new();
 
@@ -1293,6 +2084,7 @@ mod tests {
             n_threads: Some(4),
             n_gpu_layers: Some(0),
             n_workers: None,
+            ..Default::default()
         };
         let model = load_model_with_progress(&path, &params, |_| true).expect("load model");
         let mut engine = model.new_engine_with_threads(4).expect("build engine");
@@ -1304,16 +2096,9 @@ mod tests {
             messages: None,
             images: None,
             max_tokens: 48,
-            temperature: Some(0.0),
-            top_p: Some(1.0),
-            top_k: None,
-            min_p: None,
-            repeat_penalty: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,
+            ..Default::default()
         };
         let outcome = run_generation(&mut engine, &request, 1, &interrupt, &tx)
             .expect("generation must not fail");
@@ -1348,16 +2133,9 @@ mod tests {
             messages: None,
             images: None,
             max_tokens: 32,
-            temperature: Some(0.0),
-            top_p: Some(1.0),
-            top_k: None,
-            min_p: None,
-            repeat_penalty: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,
+            ..Default::default()
         };
         let _ = run_generation(&mut engine, &request2, 1, &interrupt, &tx)
             .expect("second generation must not fail");
@@ -1375,16 +2153,9 @@ mod tests {
             messages: None,
             images: None,
             max_tokens: 24,
-            temperature: Some(0.0),
-            top_p: Some(1.0),
-            top_k: None,
-            min_p: None,
-            repeat_penalty: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: Some(42),
             stop_words: Some(vec![]),
             cached_prefix_tokens: None,
+            ..Default::default()
         };
         let big = run_generation(&mut engine, &big_request, 1, &interrupt, &tx)
             .expect("long-prompt generation must not fail");
@@ -1393,5 +2164,163 @@ mod tests {
             big.done.total_tokens, big.done.stop_reason
         );
         assert!(!big.full_text.trim().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelInitParams — wire compat, merging, validation, llama.cpp args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_init_params_wire_roundtrip() {
+        let cfg = ModelInitParams {
+            n_gpu_layers: Some(29),
+            context_size: Some(8192),
+            n_threads: Some(3),
+            n_workers: Some(4),
+            n_batch: Some(2048),
+            n_ubatch: Some(512),
+            unified_kv: Some(true),
+            flash_attn: Some(true),
+            offload_kqv: Some(false),
+            use_mmap: Some(true),
+            use_mlock: Some(false),
+            rope_freq_base: Some(1_000_000.0),
+            rope_freq_scale: Some(1.0),
+            cache_type_k: Some("Q8_0".into()),
+            cache_type_v: Some("Q8_0".into()),
+            seed: Some(1234),
+            speculative: None,
+            context_checkpoints: Some(32),
+            chat_template: Some("chatml".into()),
+            reasoning_budget: Some("prefer short answers".into()),
+            llama_args: Some("--no-mmap".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        // camelCase over the wire + options preserved.
+        assert!(json.contains("\"nGpuLayers\":29"), "{json}");
+        assert!(json.contains("\"cacheTypeK\":\"Q8_0\""), "{json}");
+        assert!(json.contains("\"reasoningBudget\""), "{json}");
+        let back: ModelInitParams = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.n_gpu_layers, Some(29));
+        assert_eq!(back.context_size, Some(8192));
+        assert_eq!(back.cache_type_k.as_deref(), Some("Q8_0"));
+        assert_eq!(back.reasoning_budget.as_deref(), Some("prefer short answers"));
+        assert_eq!(back.llama_args.as_deref(), Some("--no-mmap"));
+
+        // An old payload without the newer fields must still parse to `None`
+        // (backward compatibility — old settings.json / old frontends).
+        let old: ModelInitParams = serde_json::from_str(r#"{"contextSize":4096}"#)
+            .expect("legacy subset parses");
+        assert_eq!(old.context_size, Some(4096));
+        assert!(old.n_batch.is_none());
+        assert!(old.reasoning_budget.is_none());
+    }
+
+    #[test]
+    fn model_init_params_merge_precedence() {
+        let base = ModelInitParams {
+            context_size: Some(1024),
+            n_gpu_layers: Some(0),
+            n_threads: Some(2),
+            n_workers: Some(1),
+            ..Default::default()
+        };
+        let explicit = ModelInitParams {
+            context_size: Some(8192),
+            cache_type_k: Some("Q4_0".into()),
+            llama_args: Some("--no-mmap".into()),
+            ..Default::default()
+        };
+        let merged = base.merge(&explicit);
+        assert_eq!(merged.context_size, Some(8192), "explicit wins");
+        assert_eq!(merged.n_gpu_layers, Some(0), "base kept where explicit is None");
+        assert_eq!(merged.cache_type_k.as_deref(), Some("Q4_0"));
+        assert_eq!(merged.n_threads, Some(2));
+        assert!(merged.unified_kv.is_none());
+    }
+
+    #[test]
+    fn model_init_params_validate_ranges() {
+        let ok = ModelInitParams {
+            n_threads: Some(4),
+            n_workers: Some(4),
+            n_batch: Some(512),
+            n_ubatch: Some(256),
+            rope_freq_base: Some(10_000.0),
+            cache_type_k: Some("Q8_0".into()),
+            seed: Some(42),
+            speculative: Some("off".into()),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        for bad in [
+            ModelInitParams { n_threads: Some(0), ..Default::default() },
+            ModelInitParams { n_workers: Some(33), ..Default::default() },
+            ModelInitParams { n_batch: Some(0), ..Default::default() },
+            ModelInitParams { n_gpu_layers: Some(20_000), ..Default::default() },
+            ModelInitParams { rope_freq_base: Some(0.0), ..Default::default() },
+            ModelInitParams { cache_type_k: Some("BRPF".into()), ..Default::default() },
+            ModelInitParams { seed: Some(u32::MAX), ..Default::default() },
+            ModelInitParams { speculative: Some("mtp".into()), ..Default::default() },
+        ] {
+            assert!(bad.validate().is_err(), "expected error for {bad:?}");
+        }
+        // ubatch cannot exceed batch.
+        let ubatch_big = ModelInitParams {
+            n_batch: Some(128),
+            n_ubatch: Some(256),
+            ..Default::default()
+        };
+        assert!(ubatch_big.validate().is_err());
+    }
+
+    #[test]
+    fn parse_cache_type_cases() {
+        assert!(matches!(parse_cache_type("Q8_0"), Some(KvCacheType::Q8_0)));
+        assert!(matches!(parse_cache_type("q4_0"), Some(KvCacheType::Q4_0)));
+        assert!(matches!(parse_cache_type("F16"), Some(KvCacheType::F16)));
+        assert!(parse_cache_type("WAT").is_none());
+    }
+
+    #[test]
+    fn apply_llama_args_mapping_and_errors() {
+        let mut p = ModelInitParams {
+            context_size: Some(1024),
+            ..Default::default()
+        };
+        p.apply_llama_args("--ctx-size 4096 --threads 6 --gpu-layers 24 --batch-size 1024 --ubatch-size 128 --parallel 4 --seed 7 --rope-freq-base=1000000 --cache-type-k Q8_0 --flash-attn --mlock")
+            .expect("valid args parse");
+        assert_eq!(p.context_size, Some(4096), "flag overrides UI value");
+        assert_eq!(p.n_threads, Some(6));
+        assert_eq!(p.n_gpu_layers, Some(24));
+        assert_eq!(p.n_batch, Some(1024));
+        assert_eq!(p.n_ubatch, Some(128));
+        assert_eq!(p.n_workers, Some(4));
+        assert_eq!(p.seed, Some(7));
+        assert_eq!(p.rope_freq_base, Some(1_000_000.0));
+        assert_eq!(p.cache_type_k.as_deref(), Some("Q8_0"));
+        assert_eq!(p.flash_attn, Some(true));
+        assert_eq!(p.use_mlock, Some(true));
+
+        let unknown = ModelInitParams::default().apply_llama_args("--nonsense 3");
+        assert!(unknown.is_err());
+        assert!(unknown.unwrap_err().contains("--nonsense"));
+
+        let missing_value = ModelInitParams::default().apply_llama_args("--ctx-size");
+        assert!(missing_value.is_err());
+        assert!(missing_value.unwrap_err().contains("requires a value"));
+
+        assert!(ModelInitParams::default()
+            .apply_llama_args("--no-mmap --no-flash-attn --cache-type-v F16")
+            .is_ok());
+    }
+
+    #[test]
+    fn flash_policy_mapping() {
+        assert_eq!(LoadedModel::flash_policy(Some(true)), LLAMA_FLASH_ATTN_TYPE_ENABLED);
+        assert_eq!(LoadedModel::flash_policy(Some(false)), LLAMA_FLASH_ATTN_TYPE_DISABLED);
+        assert_eq!(LoadedModel::flash_policy(None), LLAMA_FLASH_ATTN_TYPE_AUTO);
     }
 }

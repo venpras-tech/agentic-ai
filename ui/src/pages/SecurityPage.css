@@ -1,0 +1,137 @@
+.security-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 24px;
+  overflow: auto;
+  height: 100%;
+}
+
+.security-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.security-title {
+  margin: 0 0 2px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.security-subtitle {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.security-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.security-yolo {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.security-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+}
+
+.security-tab {
+  padding: 6px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.security-tab.active {
+  border-bottom-color: currentColor;
+  opacity: 1;
+  font-weight: 600;
+}
+
+.security-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.security-empty {
+  padding: 16px;
+  border: 1px dashed var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 8px;
+  font-size: 13px;
+  text-align: center;
+  opacity: 0.7;
+}
+
+.security-error {
+  padding: 8px 12px;
+  border: 1px solid #e5534b;
+  border-radius: 6px;
+  background: rgba(229, 83, 75, 0.1);
+  font-size: 12px;
+}
+
+.security-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.security-table th,
+.security-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.18));
+  text-align: left;
+  vertical-align: top;
+}
+
+.security-table th {
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+.cell-time {
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
+.cell-summary {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-failed {
+  background: rgba(229, 83, 75, 0.07);
+}
+
+.decision-allow,
+.decision-allow_once,
+.decision-allow_session,
+.decision-always_allow {
+  color: #2ea043;
+}
+
+.decision-ask {
+  color: #d29922;
+}
+
+.decision-deny {
+  color: #e5534b;
+}

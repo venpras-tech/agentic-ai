@@ -1,0 +1,36 @@
+.connecting-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  width: 100%;
+  box-sizing: border-box;
+  background: #f0f9ff;
+  border-bottom: 1px solid #bae6fd;
+  color: #0369a1;
+  font-size: 0.875rem;
+}
+
+html.theme-dark .connecting-banner {
+  background: rgba(56, 189, 248, 0.1);
+  border-bottom-color: var(--border-color);
+  color: var(--accent);
+}
+
+html.theme-dark .connecting-spinner {
+  border-color: var(--border-color);
+  border-top-color: var(--accent);
+}
+
+.connecting-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #bae6fd;
+  border-top-color: #0284c7;
+  border-radius: 50%;
+  animation: connecting-spin 0.8s linear infinite;
+}
+
+@keyframes connecting-spin {
+  to { transform: rotate(360deg); }
+}

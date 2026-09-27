@@ -10,8 +10,11 @@
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:dev": "node scripts/dev.mjs",
+    "tauri:dev:raw": "tauri dev",
+    "tauri:build": "tauri build --features custom-protocol",
+    "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
+    "install:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.18",
