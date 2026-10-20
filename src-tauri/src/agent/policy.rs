@@ -86,13 +86,17 @@ pub fn load_policy(workspace: Option<&Path>) -> PolicyConfig {
     cfg.rules.insert(
         0,
         PolicyRule {
-            tool: "__red_zone__".into(),
+            tool: RED_ZONE_TOOL.into(),
             policy: "deny".into(),
             command_patterns: red_zone_patterns(),
         },
     );
     cfg
 }
+
+/// Sentinel tool name for the always-denied red-zone rule. It is injected by
+/// [`load_policy`] rather than read from the file, so it is never persisted.
+pub const RED_ZONE_TOOL: &str = "__red_zone__";
 
 /// Substrings that flag a command as destructive / irreversible. Matched
 /// case-insensitively against the raw command string.
@@ -167,7 +171,7 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
         for pattern in &cfg
             .rules
             .iter()
-            .find(|r| r.tool == "__red_zone__")
+            .find(|r| r.tool == RED_ZONE_TOOL)
             .unwrap()
             .command_patterns
         {

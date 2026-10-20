@@ -1,39 +1,16 @@
-import { type ReactNode, useState } from "react";
+import { memo, type ReactNode, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { parseChatSegments } from "../lib/chatParse";
 import type { ChatSegment } from "../lib/chatParse";
+import { messageKey } from "../lib/messageKey";
+import type { ChatMessage, LiveToolState } from "../context/types";
 import ReasoningAccordion from "./chat/ReasoningAccordion";
 import ToolExecutionBadge from "./chat/ToolExecutionBadge";
 import type { ToolStatus } from "./chat/ToolExecutionBadge";
 import DiffViewer from "./chat/DiffViewer";
 import CodeBlock from "./chat/CodeBlock";
 import "./MessageList.css";
-
-export interface ChatMessage {
-  role: "user" | "assistant" | "error";
-  content: string;
-  streaming?: boolean;
-  ts?: number;
-  /** Snapshot of the model/provider that produced this turn. */
-  model?: { name: string; provider: string };
-  done?: {
-    outcome?: string;
-    outputTokens?: number;
-    inputTokens?: number;
-    tokensPerSec?: number;
-    elapsedMs?: number;
-    stopReason?: string;
-  };
-}
-
-export interface LiveToolState {
-  id: string;
-  tool: string;
-  status: string;
-  summary: string;
-  output?: string;
-}
 
 const markdownComponents = {
   code: (props: {
@@ -113,7 +90,16 @@ function SegmentView({
   }
 }
 
-function Message({ message, index }: { message: ChatMessage; index: number }) {
+const Message = memo(function Message({
+  message,
+  index,
+  segments,
+}: {
+  message: ChatMessage;
+  index: number;
+  /** Pre-parsed assistant segments, memoized by the list (see parse cache). */
+  segments: ChatSegment[];
+}) {
   const { role, content, streaming } = message;
   const [copied, setCopied] = useState(false);
 
@@ -171,11 +157,6 @@ function Message({ message, index }: { message: ChatMessage; index: number }) {
     );
   };
 
-  let segments: ChatSegment[] = [];
-  if (role === "assistant") {
-    segments = parseChatSegments(content || "");
-  }
-
   const roleLabel =
     role === "user"
       ? "You"
@@ -184,6 +165,8 @@ function Message({ message, index }: { message: ChatMessage; index: number }) {
           ? message.model.name
           : message.model.name
         : "Assistant";
+
+  const lastRealIndex = segments.reduce((acc, s, i) => (s.kind !== "gate" ? i : acc), -1);
 
   return (
     <article className={`msg-turn msg-turn--${role}${streaming ? " is-streaming" : ""}`}>
@@ -233,18 +216,14 @@ function Message({ message, index }: { message: ChatMessage; index: number }) {
             </ReactMarkdown>
           ) : role === "assistant" ? (
             <>
-              {segments.map((seg, i) => {
-                const lastReal = segments.map((s) => s.kind !== "gate").lastIndexOf(true);
-                const isLast = i === lastReal;
-                return (
-                  <SegmentView
-                    key={i}
-                    segment={seg}
-                    isLast={isLast}
-                    streaming={Boolean(streaming)}
-                  />
-                );
-              })}
+              {segments.map((seg, i) => (
+                <SegmentView
+                  key={`${seg.kind}-${i}`}
+                  segment={seg}
+                  isLast={i === lastRealIndex}
+                  streaming={Boolean(streaming)}
+                />
+              ))}
               {streaming && <span className="msg-caret" aria-hidden />}
             </>
           ) : (
@@ -257,6 +236,25 @@ function Message({ message, index }: { message: ChatMessage; index: number }) {
       </div>
     </article>
   );
+});
+
+/**
+ * Parse-cache keyed by message key. `parseChatSegments` walks the whole
+ * transcript with a global regex, so re-parsing every message on each streamed
+ * token is what makes long chats stutter; only the streaming tail actually
+ * changes, and its `content` guard forces a re-parse of that one entry.
+ */
+function useSegmentCache() {
+  const cacheRef = useRef(new Map<string, { content: string; segments: ChatSegment[] }>());
+  return (key: string, message: ChatMessage): ChatSegment[] => {
+    if (message.role !== "assistant") return [];
+    const content = message.content || "";
+    const hit = cacheRef.current.get(key);
+    if (hit && hit.content === content) return hit.segments;
+    const segments = parseChatSegments(content);
+    cacheRef.current.set(key, { content, segments });
+    return segments;
+  };
 }
 
 function MessageList({
@@ -266,11 +264,41 @@ function MessageList({
   messages: ChatMessage[];
   liveTools: Record<string, LiveToolState>;
 }) {
-  const liveToolList = Object.values(liveTools);
+  const segmentsFor = useSegmentCache();
+
+  // A tool the stream already emitted as a `<tool_call>` segment is rendered
+  // inside the assistant bubble; showing its live badge too would double it.
+  const lastMessage = messages[messages.length - 1];
+  const streamingToolNames = new Set(
+    lastMessage?.streaming && lastMessage.role === "assistant"
+      ? parseChatSegments(lastMessage.content || "")
+          .filter((s): s is Extract<ChatSegment, { kind: "tool" }> => s.kind === "tool")
+          .map((s) => s.name)
+      : [],
+  );
+  const liveToolList = Object.values(liveTools).filter((lt) => !streamingToolNames.has(lt.tool));
+
+  const rows = useMemo(
+    () =>
+      messages.map((message, index) => {
+        const key = messageKey(message, index);
+        return {
+          key,
+          message,
+          index,
+          segments: segmentsFor(key, message),
+        };
+      }),
+    // `segmentsFor` is a stable ref-backed callback; `messages` identity is the
+    // only thing that can change the parsed rows.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [messages],
+  );
+
   return (
     <div className="messages">
-      {messages.map((message, index) => (
-        <Message key={index} message={message} index={index} />
+      {rows.map(({ key, message, index, segments }) => (
+        <Message key={key} message={message} index={index} segments={segments} />
       ))}
       {liveToolList.length > 0 && (
         <article className="msg-turn msg-turn--assistant is-streaming">

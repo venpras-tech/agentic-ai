@@ -1,6 +1,8 @@
 import type { ImageAttachment } from "../lib/ipc";
 
 export interface ActivityLogEntry {
+  /** Monotonic id so React keys stay stable as the log is trimmed. */
+  id: number;
   text: string;
   type: "status" | "error" | "tool" | "index";
 }
@@ -10,6 +12,8 @@ export interface ChatMessage {
   content: string;
   streaming?: boolean;
   ts?: number;
+  /** Session-log turn id; the stable React key and the `session_append` dedupe key. */
+  turnId?: string;
   /** Snapshot of the model/provider that produced this turn (chat display + logs). */
   model?: { name: string; provider: string };
   done?: {
@@ -20,6 +24,49 @@ export interface ChatMessage {
     elapsedMs?: number;
     stopReason?: string;
   };
+}
+
+/** A tool call the backend reported for the run in flight. */
+export interface LiveToolState {
+  id: string;
+  tool: string;
+  status: string;
+  summary: string;
+  output?: string;
+}
+
+/** A blocking `ask_question` from the agent. */
+export interface QuestionRequest {
+  requestId: string;
+  question: string;
+  choices: string[];
+}
+
+export interface PlanStepState {
+  index: number;
+  title: string;
+  status: string;
+  error?: string;
+}
+
+export interface TodoItemState {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+export interface SubtaskState {
+  index: number;
+  total: number;
+  title: string;
+  status: string;
+}
+
+export interface BackgroundTaskState {
+  id: string;
+  label: string;
+  status: string;
+  detail?: string;
 }
 
 export type MessageUpdate = Omit<Partial<ChatMessage>, "content"> & {

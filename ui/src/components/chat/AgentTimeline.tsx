@@ -3,7 +3,7 @@ import type {
   PlanStepState,
   SubtaskState,
   TodoItemState,
-} from "../../hooks/useAgentStream";
+} from "../../context/types";
 import "./agentTimeline.css";
 
 interface AgentTimelineProps {

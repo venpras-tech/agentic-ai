@@ -42,6 +42,14 @@ describe("recordToMessage", () => {
     expect(m?.ts).toBe(1234);
     expect(m?.done).toEqual({ outputTokens: 42 });
   });
+
+  it("carries the turn id through so reloaded messages keep a stable key", () => {
+    expect(recordToMessage(rec({ turnId: "t-1", content: "x" }))?.turnId).toBe("t-1");
+  });
+
+  it("leaves turnId undefined for records written before it existed", () => {
+    expect(recordToMessage(rec({ turnId: "", content: "x" }))?.turnId).toBeUndefined();
+  });
 });
 
 describe("hydrateContextFromSession", () => {

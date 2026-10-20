@@ -806,6 +806,7 @@ pub fn run() {
             commands::agent::agent_respond_hitl,
             commands::agent::agent_audit_log,
             commands::agent::agent_policy_snapshot,
+            commands::agent::agent_policy_save,
             commands::agent::agent_set_yolo,
             commands::agent::agent_grant_path,
             commands::agent::agent_revoke_path,

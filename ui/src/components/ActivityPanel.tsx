@@ -1,9 +1,5 @@
+import type { ActivityLogEntry } from "../context/types";
 import "./ActivityPanel.css";
-
-interface ActivityLogEntry {
-  text: string;
-  type: "status" | "error" | "tool" | "index";
-}
 
 interface ActivityPanelProps {
   logs: ActivityLogEntry[];
@@ -32,8 +28,8 @@ function ActivityPanel({ logs, collapsed, onToggle }: ActivityPanelProps) {
         </button>
       </div>
       <div className="activity">
-        {logs.map((log, index) => (
-          <div key={index} className={`activity-item activity-${log.type}`}>
+        {logs.map((log) => (
+          <div key={log.id} className={`activity-item activity-${log.type}`}>
             <span className="activity-label">
               {log.type === "tool" ? "Tool" :
                log.type === "error" ? "Error" :

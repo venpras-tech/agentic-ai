@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import App from "./App";
 import { AppProvider } from "./context/AppContext";
+import { AgentStreamProvider } from "./context/AgentStreamContext";
 import { isTauriRuntime, tauriInvoke } from "./lib/ipc";
 import "./styles/index.css";
 
@@ -12,7 +13,9 @@ if (rootEl) {
     <React.StrictMode>
       <HashRouter>
         <AppProvider>
-          <App />
+          <AgentStreamProvider>
+            <App />
+          </AgentStreamProvider>
         </AppProvider>
       </HashRouter>
     </React.StrictMode>,

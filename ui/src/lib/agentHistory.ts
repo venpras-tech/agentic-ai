@@ -1,9 +1,8 @@
 import { api, type SessionRecord } from "./ipc";
+import type { ChatMessage } from "../context/types";
 
 /** Coerce a persisted record into a UI chat message, dropping empties. */
-export function recordToMessage(
-  record: SessionRecord,
-): { role: "user" | "assistant" | "error"; content: string; ts?: number; done?: Record<string, unknown> } | null {
+export function recordToMessage(record: SessionRecord): ChatMessage | null {
   const content = (record.content ?? "").toString();
   if (!content.trim()) return null;
   const rawRole = (record.role ?? "assistant").toString();
@@ -13,7 +12,10 @@ export function recordToMessage(
     role,
     content,
     ts: typeof record.ts === "number" ? record.ts : undefined,
-    done: record.done,
+    // Carried through so a reloaded transcript keeps stable React keys and
+    // `session_append` can still dedupe a re-sent turn.
+    turnId: record.turnId || undefined,
+    done: record.done as ChatMessage["done"],
   };
 }
 

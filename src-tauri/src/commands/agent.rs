@@ -15,7 +15,7 @@ use crate::agent::background::start_background_task;
 use crate::agent::core::tool_schemas;
 use crate::agent::interrupt::{AbortPayload, InterruptState};
 use crate::agent::orchestrator::{run_agent_loop_pool, AgentTaskRequest};
-use crate::agent::policy::{snapshot, PolicySnapshot};
+use crate::agent::policy::{snapshot, PolicyConfig, PolicyRule, PolicySnapshot, RED_ZONE_TOOL};
 use crate::agent::skills::{KnowledgeReport, KnowledgeState};
 use crate::agent::subagent::{builtin_modes, register_workflow_tools, Mode};
 use crate::agent::tools::{dispatch, git_checkpoint, git_checkpoints, git_revert, transcribe_file};
@@ -1005,6 +1005,64 @@ pub async fn agent_policy_snapshot(
 ) -> Result<PolicySnapshot, String> {
     let ws = state.primary_workspace().await;
     let mut snap = snapshot(ws.as_deref());
+    snap.yolo = Some(state.yolo.load(std::sync::atomic::Ordering::SeqCst));
+    snap.path_grants = state.path_grants.lock().unwrap().iter().cloned().collect();
+    Ok(snap)
+}
+
+/// Persist the workspace policy edited in the UI and return the refreshed
+/// snapshot. The red-zone rule is injected by `load_policy` rather than read
+/// from the file, so it is dropped instead of written back.
+#[tauri::command]
+pub async fn agent_policy_save(
+    state: State<'_, Arc<ToolState>>,
+    default: String,
+    rules: Vec<PolicyRule>,
+) -> Result<PolicySnapshot, String> {
+    let ws = state
+        .primary_workspace()
+        .await
+        .ok_or("Open a project folder before saving its policy.")?;
+    let decision = default.trim().to_ascii_lowercase();
+    if !matches!(decision.as_str(), "allow" | "ask" | "deny") {
+        return Err("Default decision must be allow, ask or deny.".into());
+    }
+    let mut cleaned: Vec<PolicyRule> = Vec::with_capacity(rules.len());
+    for mut rule in rules {
+        rule.tool = rule.tool.trim().to_string();
+        if rule.tool.is_empty() || rule.tool == RED_ZONE_TOOL {
+            continue;
+        }
+        rule.policy = rule.policy.trim().to_ascii_lowercase();
+        if !matches!(rule.policy.as_str(), "allow" | "ask" | "deny") {
+            return Err(format!(
+                "Rule `{}`: decision must be allow, ask or deny.",
+                rule.tool
+            ));
+        }
+        rule.command_patterns = rule
+            .command_patterns
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        cleaned.push(rule);
+    }
+    let cfg = PolicyConfig {
+        default: decision,
+        rules: cleaned,
+    };
+    let dir = ws.join(".ai");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    let text =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("Could not encode the policy: {e}"))?;
+    let path = dir.join("policy.json");
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    let mut snap = snapshot(Some(ws.as_path()));
     snap.yolo = Some(state.yolo.load(std::sync::atomic::Ordering::SeqCst));
     snap.path_grants = state.path_grants.lock().unwrap().iter().cloned().collect();
     Ok(snap)

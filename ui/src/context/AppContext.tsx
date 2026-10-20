@@ -202,6 +202,7 @@ const [isProcessing, setIsProcessing] = useState(false);
   });
 const chatAbortRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
+  const activitySeqRef = useRef(1);
   const [modelRestoreState, setModelRestoreState] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const [modelRestoreError, setModelRestoreError] = useState("");
   const [modelPromptVisible, setModelPromptVisible] = useState(false);
@@ -348,7 +349,7 @@ setModelMeta(null);
   }, []);
 
   const addActivity = useCallback((text: string, type: ActivityLogEntry["type"]) => {
-    setActivityLog((prev) => [...prev.slice(-50), { text, type }]);
+    setActivityLog((prev) => [...prev.slice(-50), { id: activitySeqRef.current++, text, type }]);
   }, []);
 
   const clearActivity = useCallback(() => setActivityLog([]), []);

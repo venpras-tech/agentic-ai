@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { PermissionDecision, PermissionRequest } from "../../lib/ipc";
-import type { QuestionRequest } from "../../hooks/useAgentStream";
+import type { QuestionRequest } from "../../context/types";
 import "./PermissionPrompt.css";
 
 interface PermissionPromptProps {

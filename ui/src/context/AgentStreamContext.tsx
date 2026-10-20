@@ -1,54 +1,32 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
-import { useApp } from "../context/AppContext";
-import {
-  api,
-  isTauriRuntime,
-  type PermissionDecision,
-  type PermissionRequest,
-} from "../lib/ipc";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
+import { useApp } from "./AppContext";
+import { api, isTauriRuntime, type ContextUsage, type PermissionDecision, type PermissionRequest } from "../lib/ipc";
 import { parseChatSegments } from "../lib/chatParse";
 import { appendTurn, assistantTurnId } from "../lib/sessionLog";
-import type { LiveToolState } from "../components/MessageList";
-
-/** A blocking `ask_question` from the agent. */
-export interface QuestionRequest {
-  requestId: string;
-  question: string;
-  choices: string[];
-}
-
-export interface PlanStepState {
-  index: number;
-  title: string;
-  status: string;
-  error?: string;
-}
-
-export interface TodoItemState {
-  id: number;
-  title: string;
-  done: boolean;
-}
-
-export interface SubtaskState {
-  index: number;
-  total: number;
-  title: string;
-  status: string;
-}
-
-export interface BackgroundTaskState {
-  id: string;
-  label: string;
-  status: string;
-  detail?: string;
-}
+import type {
+  BackgroundTaskState,
+  LiveToolState,
+  PlanStepState,
+  QuestionRequest,
+  SubtaskState,
+  TodoItemState,
+} from "./types";
 
 /**
  * Turn id of the user message currently being answered, shared across
- * components. This is a module ref rather than hook state on purpose:
- * `useAgentStream` owns the single event subscription, and the composer (a
- * sibling of the chat page) must not open a second one just to record an id.
+ * components. This is a module ref rather than context state on purpose: the
+ * composer must be able to record an id without opening a second event
+ * subscription, and the single subscriber below is the only reader.
  */
 let activeTurnId = "";
 
@@ -66,22 +44,57 @@ export function setActiveChatId(chatId: string | null): void {
   activeChatId = chatId;
 }
 
+export interface AgentStreamValue {
+  liveTools: Record<string, LiveToolState>;
+  hitlGate: { requestId: string; reason: string } | null;
+  resolveGate: (approved: boolean) => Promise<void>;
+  planSteps: PlanStepState[];
+  todos: TodoItemState[];
+  subtasks: SubtaskState[];
+  bgTasks: BackgroundTaskState[];
+  abortBackgroundTask: (taskId: string) => Promise<void>;
+  permission: PermissionRequest | null;
+  respondPermission: (decision: PermissionDecision) => Promise<void>;
+  question: QuestionRequest | null;
+  respondQuestion: (answer: string) => Promise<void>;
+  clearRunState: () => void;
+  /** Latest `context_status` reading; null until the first successful probe. */
+  contextUsage: ContextUsage | null;
+  refreshContextUsage: () => void;
+}
+
+const AgentStreamContext = createContext<AgentStreamValue | null>(null);
+
+export function useAgentStream(): AgentStreamValue {
+  const ctx = useContext(AgentStreamContext);
+  if (!ctx) throw new Error("useAgentStream must be used within AgentStreamProvider");
+  return ctx;
+}
+
 type StreamHandlers = {
   updateLastMessage: ReturnType<typeof useApp>["updateLastMessage"];
   setProcessing: ReturnType<typeof useApp>["setProcessing"];
   addActivity: ReturnType<typeof useApp>["addActivity"];
   setHitlGate: ReturnType<typeof useApp>["setHitlGate"];
   setLiveTools: Dispatch<SetStateAction<Record<string, LiveToolState>>>;
+  setPlanSteps: Dispatch<SetStateAction<PlanStepState[]>>;
+  setTodos: Dispatch<SetStateAction<TodoItemState[]>>;
+  setSubtasks: Dispatch<SetStateAction<SubtaskState[]>>;
+  setBgTasks: Dispatch<SetStateAction<BackgroundTaskState[]>>;
+  setPermission: Dispatch<SetStateAction<PermissionRequest | null>>;
+  setQuestion: Dispatch<SetStateAction<QuestionRequest | null>>;
+  setContextUsage: Dispatch<SetStateAction<ContextUsage | null>>;
   clearResolvedKey: () => void;
 };
 
 /**
- * Owns the agent-stream event subscription (tokens, tool events, HITL gates,
- * completion stats) plus live tool-badge state and HITL gate resolution.
- * Shared by ChatPage and the three-panel WorkspacePage so both stay in lock
- * step with a running agent session.
+ * Owns the one and only `subscribeEngineEvents` subscription for the agent
+ * stream (tokens, tool events, HITL gates, completion stats) plus the live
+ * tool badges, run bookkeeping and HITL resolution. It is mounted above the
+ * router, so leaving `/chat` for `/workspace` mid-run cannot drop the
+ * subscription or reset the run state.
  */
-export function useAgentStream() {
+export function AgentStreamProvider({ children }: { children: React.ReactNode }) {
   const {
     messages,
     addActivity,
@@ -99,6 +112,7 @@ export function useAgentStream() {
   const [bgTasks, setBgTasks] = useState<BackgroundTaskState[]>([]);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
   const [question, setQuestion] = useState<QuestionRequest | null>(null);
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const resolvedKeyRef = useRef<string>("");
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -112,6 +126,13 @@ export function useAgentStream() {
     addActivity,
     setHitlGate,
     setLiveTools,
+    setPlanSteps,
+    setTodos,
+    setSubtasks,
+    setBgTasks,
+    setPermission,
+    setQuestion,
+    setContextUsage,
     clearResolvedKey: () => {
       resolvedKeyRef.current = "";
     },
@@ -145,6 +166,15 @@ export function useAgentStream() {
     let unlisten: (() => void) | null = null;
     let disposed = false;
 
+    const refreshUsage = () => {
+      void api
+        .contextStatus()
+        .then((usage) => {
+          if (!disposed) setContextUsage(usage ?? null);
+        })
+        .catch(() => {});
+    };
+
     api
       .subscribeEngineEvents({
         onToken: (data) => {
@@ -161,6 +191,7 @@ export function useAgentStream() {
           h.setLiveTools({});
           h.clearResolvedKey();
           h.addActivity("Agent started", "status");
+          refreshUsage();
         },
         onDone: (data) => {
           const h = handlersRef.current;
@@ -204,6 +235,7 @@ export function useAgentStream() {
             .filter(Boolean)
             .join(" · ");
           h.addActivity(stats ? `Agent finished — ${stats}` : "Agent finished", "status");
+          refreshUsage();
         },
         onError: (data) => {
           const h = handlersRef.current;
@@ -311,7 +343,7 @@ export function useAgentStream() {
             title: st.title ?? `Subtask ${index}`,
             status: st.status ?? "running",
           };
-          setSubtasks((prev) => {
+          h.setSubtasks((prev) => {
             const next = prev.filter((x) => x.index !== index);
             next.push(entry);
             next.sort((a, b) => a.index - b.index);
@@ -334,7 +366,7 @@ export function useAgentStream() {
           };
           const index = d.itemIndex ?? 0;
           if (!index) return;
-          setPlanSteps((prev) => {
+          h.setPlanSteps((prev) => {
             const next = prev.filter((x) => x.index !== index);
             next.push({
               index,
@@ -361,7 +393,7 @@ export function useAgentStream() {
             title: it.title ?? "",
             done: Boolean(it.done),
           }));
-          setTodos(items);
+          h.setTodos(items);
           const doneCount = items.filter((it) => it.done).length;
           h.addActivity(`Todos ${doneCount}/${items.length}`, "status");
         },
@@ -379,7 +411,7 @@ export function useAgentStream() {
           // The backend emits "started" on spawn, never "running".
           const raw = d.status ?? "started";
           const status = raw === "started" ? "running" : raw;
-          setBgTasks((prev) => {
+          h.setBgTasks((prev) => {
             const next = prev.filter((x) => x.id !== id);
             // Terminal states are kept so the outcome stays visible; the
             // timeline only offers abort for the still-running ones.
@@ -401,7 +433,7 @@ export function useAgentStream() {
             review?: string;
           };
           if (!d.requestId) return;
-          setPermission({
+          h.setPermission({
             requestId: d.requestId,
             tool: d.tool ?? "tool",
             summary: d.summary ?? "",
@@ -419,7 +451,7 @@ export function useAgentStream() {
             choices?: string[];
           };
           if (!d.requestId) return;
-          setQuestion({
+          h.setQuestion({
             requestId: d.requestId,
             question: d.question ?? "",
             choices: d.choices ?? [],
@@ -433,6 +465,7 @@ export function useAgentStream() {
             `Context trimmed — dropped ${d.dropped ?? 0}, ${d.remaining ?? 0} turns kept`,
             "status",
           );
+          refreshUsage();
         },
         onSkillsChanged: () => {
           handlersRef.current?.addActivity("Skills changed — reloaded", "status");
@@ -471,22 +504,25 @@ export function useAgentStream() {
     }
   }, [messages, isProcessing, setHitlGate, hitlGate]);
 
-  const resolveGate = async (approved: boolean) => {
-    const gate = hitlGate;
-    if (!gate) return;
-    setHitlGate(null);
-    resolvedKeyRef.current = `${gate.requestId}|${gate.reason}`;
-    if (gate.requestId) {
-      await api.hitlRespond(gate.requestId, approved).catch(() => {});
-      addActivity(approved ? "Approved — resuming…" : "Denied — agent will reroute…", "status");
-      return;
-    }
-    void api.abortAgentExecution().catch(() => {});
-    const text = approved
-      ? `[HITL Approved] ${gate.reason}`
-      : `[HITL Denied] ${gate.reason} — do not perform this action. Propose an alternative or reroute.`;
-    window.dispatchEvent(new CustomEvent("vencoder-send-prompt", { detail: text }));
-  };
+  const resolveGate = useCallback(
+    async (approved: boolean) => {
+      const gate = hitlGate;
+      if (!gate) return;
+      setHitlGate(null);
+      resolvedKeyRef.current = `${gate.requestId}|${gate.reason}`;
+      if (gate.requestId) {
+        await api.hitlRespond(gate.requestId, approved).catch(() => {});
+        addActivity(approved ? "Approved — resuming…" : "Denied — agent will reroute…", "status");
+        return;
+      }
+      void api.abortAgentExecution().catch(() => {});
+      const text = approved
+        ? `[HITL Approved] ${gate.reason}`
+        : `[HITL Denied] ${gate.reason} — do not perform this action. Propose an alternative or reroute.`;
+      window.dispatchEvent(new CustomEvent("vencoder-send-prompt", { detail: text }));
+    },
+    [hitlGate, setHitlGate, addActivity],
+  );
 
   const respondPermission = useCallback(
     async (decision: PermissionDecision) => {
@@ -512,26 +548,61 @@ export function useAgentStream() {
     [question],
   );
 
-  return {
-    liveTools,
-    hitlGate,
-    resolveGate,
-    planSteps,
-    todos,
-    subtasks,
-    bgTasks,
-    permission,
-    respondPermission,
-    question,
-    respondQuestion,
-    clearRunState: () => {
-      setPlanSteps([]);
-      setTodos([]);
-      setSubtasks([]);
-    },
-    abortBackgroundTask: async (taskId: string) => {
-      await api.abortBackgroundTask(taskId).catch(() => {});
-      setBgTasks((prev) => prev.filter((x) => x.id !== taskId));
-    },
-  };
+  const clearRunState = useCallback(() => {
+    setPlanSteps([]);
+    setTodos([]);
+    setSubtasks([]);
+  }, []);
+
+  const abortBackgroundTask = useCallback(async (taskId: string) => {
+    await api.abortBackgroundTask(taskId).catch(() => {});
+    setBgTasks((prev) => prev.filter((x) => x.id !== taskId));
+  }, []);
+
+  const refreshContextUsage = useCallback(() => {
+    if (!isTauriRuntime()) return;
+    void api
+      .contextStatus()
+      .then((usage) => setContextUsage(usage ?? null))
+      .catch(() => {});
+  }, []);
+
+  const value: AgentStreamValue = useMemo(
+    () => ({
+      liveTools,
+      hitlGate,
+      resolveGate,
+      planSteps,
+      todos,
+      subtasks,
+      bgTasks,
+      abortBackgroundTask,
+      permission,
+      respondPermission,
+      question,
+      respondQuestion,
+      clearRunState,
+      contextUsage,
+      refreshContextUsage,
+    }),
+    [
+      liveTools,
+      hitlGate,
+      resolveGate,
+      planSteps,
+      todos,
+      subtasks,
+      bgTasks,
+      abortBackgroundTask,
+      permission,
+      respondPermission,
+      question,
+      respondQuestion,
+      clearRunState,
+      contextUsage,
+      refreshContextUsage,
+    ],
+  );
+
+  return <AgentStreamContext.Provider value={value}>{children}</AgentStreamContext.Provider>;
 }
