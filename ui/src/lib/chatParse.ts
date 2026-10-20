@@ -1,7 +1,18 @@
 export type ChatSegment =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
-  | { kind: "tool"; name: string; status: string; text: string }
+  | {
+      kind: "tool";
+      name: string;
+      status: string;
+      text: string;
+      /** Wall-clock tool duration in ms, when the backend reported it. */
+      durationMs?: number;
+      /** Process exit code for shell tools, when reported. */
+      exitCode?: number;
+      /** Raw arguments/detail string, when reported. */
+      args?: string;
+    }
   | { kind: "diff"; path: string; text: string }
   | { kind: "gate"; reason: string; text: string };
 
@@ -20,7 +31,22 @@ const SEGMENT_RE = new RegExp(
   "g",
 );
 
+const CACHE_MAX = 256;
+const cache = new Map<string, ChatSegment[]>();
+
 export function parseChatSegments(content: string): ChatSegment[] {
+  const hit = cache.get(content);
+  if (hit) return hit;
+  const segments = parseChatSegmentsUncached(content);
+  cache.set(content, segments);
+  if (cache.size > CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  return segments;
+}
+
+function parseChatSegmentsUncached(content: string): ChatSegment[] {
   const segments: ChatSegment[] = [];
   let cursor = 0;
   let m: RegExpExecArray | null;
@@ -35,11 +61,18 @@ export function parseChatSegments(content: string): ChatSegment[] {
     if (tag === "agent_thought") {
       segments.push({ kind: "reasoning", text: inner });
     } else if (tag === "tool_call") {
+      const dur = attrs.durationms ?? attrs.duration ?? attrs.ms;
+      const exit = attrs.exitcode ?? attrs.exit;
+      const durationMs = dur != null && dur !== "" ? Number(dur) : undefined;
+      const exitCode = exit != null && exit !== "" ? Number(exit) : undefined;
       segments.push({
         kind: "tool",
         name: attrs.name || "tool",
         status: attrs.status || (inner ? "success" : "running"),
         text: inner,
+        durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+        exitCode: Number.isFinite(exitCode) ? exitCode : undefined,
+        args: attrs.args || attrs.detail || undefined,
       });
     } else if (tag === "diff") {
       segments.push({ kind: "diff", path: attrs.path || "", text: inner });

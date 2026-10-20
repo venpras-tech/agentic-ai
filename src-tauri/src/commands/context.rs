@@ -35,6 +35,28 @@ pub async fn context_set_file_buffer(
     Ok(inner.usage())
 }
 
+/// Pin an editor code selection with its location; it stays in context like
+/// the file buffer and survives sliding-window eviction. Re-pinning with the
+/// same path replaces the previous selection slot. Returns the updated report.
+#[tauri::command]
+pub async fn context_set_selection(
+    state: State<'_, ContextState>,
+    path: String,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    content: String,
+) -> Result<UsageReport, String> {
+    let mut inner = state.inner.lock().await;
+    let range = match (start_line, end_line) {
+        (Some(s), Some(e)) if e > s => format!(":{s}-{e}"),
+        (Some(s), None) => format!(":{s}"),
+        _ => String::new(),
+    };
+    let labeled = format!("### {path}{range}\n{content}");
+    inner.upsert_pinned("selection", labeled);
+    Ok(inner.usage())
+}
+
 /// Append an evictable conversation turn; auto-triggers sliding-window
 /// truncation when usage crosses 80% of the model's context limit.
 #[tauri::command]

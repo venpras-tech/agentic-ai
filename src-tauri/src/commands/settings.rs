@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tauri::AppHandle;
 
+use crate::app_data_dir;
 use crate::engine::ModelInitParams;
 use crate::remote::RemoteModelConfig;
-use crate::app_data_dir;
 
 /// Key under which the global ("no specific model") local-load config is
 /// stored in the `localModelConfigs` map.
@@ -171,6 +171,12 @@ pub(crate) fn parse_settings(text: &str) -> AppSettings {
 }
 
 impl AppSettings {
+    /// Read a top-level catch-all key (e.g. `lspServers`) without leaking the
+    /// whole map to consumers.
+    pub(crate) fn extra_value(&self, key: &str) -> Option<&Value> {
+        self.extra.get(key)
+    }
+
     /// Model-loading params persisted by the Settings → LLM page, mapped onto
     /// [`ModelInitParams`] for `install_local_model`. Load-only fields like
     /// `nWorkers` live in the catch-all (`settings.json` top level), the rest
@@ -222,27 +228,23 @@ impl AppSettings {
 
     /// Store a config for `path` (`None`/`"default"` = global fallback) and
     /// return the updated settings.
-    pub(crate) fn persist_local_config(
-        &mut self,
-        path: Option<&str>,
-        config: &ModelInitParams,
-    ) {
-        let key = path.filter(|p| !p.is_empty()).unwrap_or(DEFAULT_LOCAL_CONFIG_KEY).to_string();
+    pub(crate) fn persist_local_config(&mut self, path: Option<&str>, config: &ModelInitParams) {
+        let key = path
+            .filter(|p| !p.is_empty())
+            .unwrap_or(DEFAULT_LOCAL_CONFIG_KEY)
+            .to_string();
         self.local_model_configs.insert(key, config.clone());
     }
 
     /// Built-in server behaviour (enabled by default, port 8080).
     pub(crate) fn local_api_server(&self) -> LocalApiServerSettings {
-        self.local_api_server
-            .clone()
-            .unwrap_or_default()
+        self.local_api_server.clone().unwrap_or_default()
     }
 }
 
 /// Load `settings.json` from disk, or a default when absent/corrupt.
 pub(crate) fn read_settings(app: &AppHandle) -> AppSettings {
-    let text =
-        std::fs::read_to_string(app_data_dir(app).join("settings.json")).ok();
+    let text = std::fs::read_to_string(app_data_dir(app).join("settings.json")).ok();
     text.as_deref().map(parse_settings).unwrap_or_default()
 }
 
@@ -282,7 +284,9 @@ pub async fn local_model_config_save(
 }
 
 #[tauri::command]
-pub async fn local_model_configs_load(app: AppHandle) -> Result<HashMap<String, ModelInitParams>, String> {
+pub async fn local_model_configs_load(
+    app: AppHandle,
+) -> Result<HashMap<String, ModelInitParams>, String> {
     Ok(read_settings(&app).local_model_configs)
 }
 
@@ -471,10 +475,15 @@ mod tests {
         let resolved = s.merge_init_params(Some("D:\\models\\m.gguf"), &explicit);
         assert_eq!(resolved.context_size, Some(8192), "per-path beats default");
         assert_eq!(resolved.n_gpu_layers, Some(24), "explicit wins");
-        assert_eq!(resolved.n_threads, Some(2), "legacy kept where nothing overrides");
+        assert_eq!(
+            resolved.n_threads,
+            Some(2),
+            "legacy kept where nothing overrides"
+        );
 
         // A model WITHOUT its own entry falls back to the default config.
-        let fallback = s.merge_init_params(Some("D:\\models\\other.gguf"), &ModelInitParams::default());
+        let fallback =
+            s.merge_init_params(Some("D:\\models\\other.gguf"), &ModelInitParams::default());
         assert_eq!(fallback.context_size, Some(4096), "default config applies");
 
         // No path at all → default config.
@@ -522,10 +531,16 @@ mod tests {
     fn persist_local_config_keys() {
         let mut s = AppSettings::default();
         s.persist_local_config(Some("D:\\models\\m.gguf"), &cfg(2048, 0));
-        assert_eq!(s.local_config(Some("D:\\models\\m.gguf")).and_then(|c| c.context_size), Some(2048));
+        assert_eq!(
+            s.local_config(Some("D:\\models\\m.gguf"))
+                .and_then(|c| c.context_size),
+            Some(2048)
+        );
         s.persist_local_config(Some(""), &cfg(1024, 0));
         assert_eq!(
-            s.local_model_configs.get(DEFAULT_LOCAL_CONFIG_KEY).and_then(|c| c.context_size),
+            s.local_model_configs
+                .get(DEFAULT_LOCAL_CONFIG_KEY)
+                .and_then(|c| c.context_size),
             Some(1024)
         );
     }

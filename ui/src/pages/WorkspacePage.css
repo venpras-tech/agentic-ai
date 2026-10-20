@@ -81,6 +81,13 @@
   font-size: 0.9rem;
 }
 
+.workspace-chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 .workspace-composer {
   flex-shrink: 0;
   border-top: 1px solid var(--border-color);

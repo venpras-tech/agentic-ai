@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useApp } from "../context/AppContext";
+import { useModel } from "../context/AppContext";
 import { useDownloadManager, formatBytes, formatSpeed, formatEta } from "../lib/downloads";
 import { api } from "../lib/ipc";
 import CancelDownloadDialog from "./CancelDownloadDialog";
@@ -8,7 +8,7 @@ import "./DownloadBar.css";
 
 function DownloadBar() {
   const navigate = useNavigate();
-  const { modelLoadParams, rememberLastModel } = useApp();
+  const { modelLoadParams, rememberLastModel } = useModel();
   const { downloads, active, completed, pause, resume, cancel, dismiss, loadModel } = useDownloadManager();
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);

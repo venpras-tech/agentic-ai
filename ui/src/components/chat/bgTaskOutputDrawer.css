@@ -1,0 +1,52 @@
+.bg-output-drawer {
+  margin: 6px 0 10px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-bg, rgba(0, 0, 0, 0.15));
+}
+
+.bg-output-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  font-size: 11px;
+}
+
+.bg-output-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.bg-output-action {
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 6px;
+  opacity: 0.75;
+}
+
+.bg-output-action:hover {
+  opacity: 1;
+}
+
+.bg-output-body {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

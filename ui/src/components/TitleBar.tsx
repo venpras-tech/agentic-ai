@@ -1,10 +1,11 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useApp } from "../context/AppContext";
+import { useShell, useModel } from "../context/AppContext";
 import { PROVIDERS } from "../lib/providers";
 import "./TitleBar.css";
 
 function TitleBar() {
-  const { theme, setTheme, modelName, modelProvider, modelLoadStage, modelLoadProgress, modelLoading, unloadModel, apiServerStatus } = useApp();
+  const { theme, setTheme } = useShell();
+  const { modelName, modelProvider, modelLoadStage, modelLoadProgress, modelLoading, unloadModel, apiServerStatus } = useModel();
   const win = getCurrentWindow();
 
   const providerLabel = PROVIDERS.find((p) => p.id === modelProvider)?.name || modelProvider || "Local";
@@ -105,6 +106,7 @@ function TitleBar() {
           className="titlebar-btn"
           onClick={handleMinimize}
           title="Minimize"
+          aria-label="Minimize"
         >
           <svg width="12" height="12" viewBox="0 0 12 12">
             <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
@@ -115,6 +117,7 @@ function TitleBar() {
           className="titlebar-btn"
           onClick={handleMaximize}
           title="Maximize"
+          aria-label="Maximize"
         >
           <svg width="12" height="12" viewBox="0 0 12 12">
             <rect x="2" y="2" width="8" height="8" rx="1" fill="none" stroke="currentColor" strokeWidth="1.2" />
@@ -125,6 +128,7 @@ function TitleBar() {
           className="titlebar-btn titlebar-btn-close"
           onClick={handleClose}
           title="Close"
+          aria-label="Close window"
         >
           <svg width="12" height="12" viewBox="0 0 12 12">
             <line x1="3" y1="3" x2="9" y2="9" stroke="currentColor" strokeWidth="1.3" />

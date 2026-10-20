@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { useApp } from "../context/AppContext";
-import { api } from "../lib/ipc";
+import { listen } from "@tauri-apps/api/event";
+import { useShell, useContextPane } from "../context/AppContext";
+import { api, isTauriRuntime, type IndexSearchHit } from "../lib/ipc";
 import "./ProjectPage.css";
 
 interface FileTreeEntry {
@@ -11,18 +12,63 @@ interface FileTreeEntry {
 }
 
 function ProjectPage() {
-  const { projectPath, setProjectPath, addContextPath } = useApp();
+  const { projectPath, setProjectPath, indexStatus, indexing, reindex } = useShell();
+  const { addContextPath } = useContextPane();
   const [files, setFiles] = useState<FileTreeEntry[]>([]);
   const [selectedFile, setSelectedFile] = useState<FileTreeEntry | null>(null);
   const [fileContent, setFileContent] = useState("");
   const [loading, setLoading] = useState(false);
-  const [showTemplateDropdown, setShowTemplateDropdown] = useState(false);
+  const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<IndexSearchHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [semantic, setSemantic] = useState(false);
+  const [indexError, setIndexError] = useState("");
 
   useEffect(() => {
     if (projectPath) {
       void loadFileTree();
     }
   }, [projectPath]);
+
+  useEffect(() => {
+    if (!projectPath || !isTauriRuntime()) return;
+    const un = listen("workspace://file-changed", () => {
+      void loadFileTree();
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
+  }, [projectPath]);
+
+  const runSearch = async () => {
+    if (!projectPath || !query.trim()) return;
+    setSearching(true);
+    setIndexError("");
+    try {
+      const hits = semantic
+        ? await api.indexSemanticSearch(projectPath, query.trim())
+        : await api.indexSearch(projectPath, query.trim());
+      setSearchResults(hits);
+    } catch (err) {
+      setIndexError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const rebuildIndex = async () => {
+    if (!projectPath) return;
+    setIndexError("");
+    reindex();
+    if (query.trim()) await runSearch();
+  };
+
+  const openHit = (hit: IndexSearchHit) => {
+    if (!projectPath) return;
+    const base = projectPath.replaceAll("\\", "/").replace(/\/?$/, "/");
+    const target = `${base}${hit.path}`;
+    window.dispatchEvent(new CustomEvent<string>("vencoder-open-editor", { detail: target }));
+  };
 
   const loadFileTree = async () => {
     if (!projectPath) return;
@@ -108,25 +154,59 @@ function ProjectPage() {
           <button type="button" className="btn-index" onClick={() => void loadFileTree()} disabled={!projectPath}>
             Refresh
           </button>
-          <div className="project-template-wrap">
-            <button
-              type="button"
-              className="btn-index"
-              onClick={() => setShowTemplateDropdown(!showTemplateDropdown)}
-              disabled={!projectPath}
-            >
-              + Project template
-            </button>
-            {showTemplateDropdown && (
-              <div className="project-template-dropdown">
-                <button type="button" className="project-template-opt">Python</button>
-                <button type="button" className="project-template-opt">React</button>
-                <button type="button" className="project-template-opt">Node.js</button>
-                <button type="button" className="project-template-opt">Rust</button>
-              </div>
+        </div>
+      </div>
+      <div className="project-index">
+        <div className="project-index-row">
+          <input
+            className="project-index-input"
+            value={query}
+            placeholder="Search workspace (regex or plain text)…"
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void runSearch();
+            }}
+            disabled={!projectPath}
+          />
+          <button type="button" className="btn-index" onClick={() => void runSearch()} disabled={!projectPath || searching}>
+            {searching ? "…" : "Search"}
+          </button>
+          <label className="project-index-semantic">
+            <input type="checkbox" checked={semantic} onChange={(e) => setSemantic(e.target.checked)} />
+            <span>Semantic</span>
+          </label>
+          <button type="button" className="btn-index" onClick={() => void rebuildIndex()} disabled={!projectPath || indexing}>
+            {indexing ? "Building…" : "Rebuild index"}
+          </button>
+        </div>
+        <div className="project-index-status">
+          {indexStatus
+            ? `${indexStatus.indexedFiles.toLocaleString()} files · ${indexStatus.totalChars.toLocaleString()} chars${indexStatus.lastBuilt ? ` · built ${new Date(indexStatus.lastBuilt).toLocaleTimeString()}` : ""}`
+            : "Index not built yet — search the workspace to build it lazily."}
+        </div>
+        {indexError && <div className="project-index-error">{indexError}</div>}
+        {searchResults && (
+          <div className="project-index-results">
+            {searchResults.length === 0 ? (
+              <div className="project-index-empty">No matches.</div>
+            ) : (
+              searchResults.map((h, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  className="project-index-hit"
+                  onClick={() => openHit(h)}
+                  title={`Open ${h.path}:${h.lineNumber}`}
+                >
+                  <span className="project-index-hit-path">
+                    {h.path}:{h.lineNumber}
+                  </span>
+                  <span className="project-index-hit-line">{h.line}</span>
+                </button>
+              ))
             )}
           </div>
-        </div>
+        )}
       </div>
       <div className="project-explorer">
         <div className="project-tree-panel">

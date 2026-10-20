@@ -62,11 +62,7 @@ impl TerminalSessions {
     /// Spawn a persistent shell in `cwd` and stream output to the frontend.
     /// `me` is an `Arc` to this registry so background tasks can clean up the
     /// entry once the process exits.
-    pub fn spawn(
-        self: &Arc<Self>,
-        app: &AppHandle,
-        cwd: Option<String>,
-    ) -> Result<String, String> {
+    pub fn spawn(self: &Arc<Self>, app: &AppHandle, cwd: Option<String>) -> Result<String, String> {
         let id = uuid();
         let cwd = cwd
             .map(PathBuf::from)
@@ -240,7 +236,10 @@ fn uuid() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("term-{nanos:x}-{:016x}", (std::process::id() as u64) | randish())
+    format!(
+        "term-{nanos:x}-{:016x}",
+        (std::process::id() as u64) | randish()
+    )
 }
 
 fn randish() -> u64 {

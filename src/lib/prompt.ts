@@ -106,6 +106,15 @@ Format Layout:
 - mark_todo_item_done: {"type":"mark_todo_item_done","item":number}
 - create_plan: {"type":"create_plan","title":"string","goal":"string","items":["string"]}
 - read_plan / update_plan / execute_plan: Plan orchestration.
+- summarize_changes: {"type":"summarize_changes"}
+- tree_sitter_query: {"type":"tree_sitter_query","path":"string","query":"string"}
+- list_mcp_servers: {"type":"list_mcp_servers"}
+- call_mcp_tool: {"type":"call_mcp_tool","serverName":"string","toolName":"string","args":"string"}
+- add_mcp_server: {"type":"add_mcp_server","name":"string","command":"string","args":["string"],"env":["string"]}
+- remove_mcp_server: {"type":"remove_mcp_server","name":"string"}
+- analyze_bug: {"type":"analyze_bug","path":"string","bugDescription":"string"}
+- review_code: {"type":"review_code","path":"string"}
+- browse_web: {"type":"browse_web","url":"string","maxChars":number}
 - task: {"type":"task","subagentType":"string","task":"string"}
 - get_scratchpad_folder: {"type":"get_scratchpad_folder"}
 

@@ -1,25 +1,39 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useApp } from "../context/AppContext";
-import { api } from "../lib/ipc";
+import { useShell, useContextPane } from "../context/AppContext";
+import { api, type OpenEditorTarget } from "../lib/ipc";
 import FileTreePanel from "../components/editor/FileTreePanel";
 import EditorPane from "../components/editor/EditorPane";
 import "./FileEditorPage.css";
 
 function FileEditorPage() {
-  const { projectPath, setProjectPath, addContextPath } = useApp();
+  const { projectPath, setProjectPath } = useShell();
+  const { addContextPath } = useContextPane();
   const [searchParams] = useSearchParams();
   const [selected, setSelected] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [focusLine, setFocusLine] = useState<number | null>(null);
 
   const pathParam = searchParams.get("path");
   useEffect(() => {
     if (pathParam) setSelected(pathParam);
   }, [pathParam]);
 
+  const lineParam = searchParams.get("line");
+  useEffect(() => {
+    setFocusLine(lineParam ? Number(lineParam) : null);
+  }, [lineParam]);
+
   useEffect(() => {
     const listener = (e: Event) => {
-      if ((e as CustomEvent<string>).detail) setSelected((e as CustomEvent<string>).detail);
+      const detail = (e as CustomEvent<OpenEditorTarget | null>).detail;
+      if (!detail) return;
+      const path = typeof detail === "string" ? detail : detail.path;
+      const line = typeof detail === "string" ? undefined : detail.line;
+      if (path) {
+        setSelected(path);
+        setFocusLine(line ?? null);
+      }
     };
     window.addEventListener("vencoder-open-editor", listener);
     return () => window.removeEventListener("vencoder-open-editor", listener);
@@ -63,11 +77,24 @@ function FileEditorPage() {
         </div>
       </div>
       <div className="editor-explorer">
-        <FileTreePanel projectPath={projectPath} selectedPath={selected} onSelect={setSelected} refreshSignal={reload} />
+        <FileTreePanel
+          projectPath={projectPath}
+          selectedPath={selected}
+          onSelect={(p) => {
+            setSelected(p);
+            setFocusLine(null);
+          }}
+          onOpenHit={(p, line) => {
+            setSelected(p);
+            setFocusLine(line);
+          }}
+          refreshSignal={reload}
+        />
         <EditorPane
           selectedPath={selected}
           projectPath={projectPath}
           onAddContext={(rel) => addContextPath(rel)}
+          focusLine={focusLine}
         />
       </div>
     </div>

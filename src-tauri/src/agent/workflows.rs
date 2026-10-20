@@ -152,7 +152,10 @@ mod tests {
         assert_eq!(wfs.len(), 2);
         assert_eq!(wfs[0].name, "alpha");
         assert_eq!(wfs[1].name, "zebra");
-        assert_eq!(prompt_for(&wfs[0], "the api"), "Prep alpha.\n\nGoal: the api");
+        assert_eq!(
+            prompt_for(&wfs[0], "the api"),
+            "Prep alpha.\n\nGoal: the api"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

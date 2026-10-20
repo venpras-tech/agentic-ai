@@ -539,7 +539,10 @@ mod tests {
         assert!(b.turns > 0, "turn tokens missing");
         assert_eq!(b.other_pinned, 0);
         // Two skill roles collapse into the single `skills` category.
-        assert!(b.skills > b.rules, "two skills should sum above one rules buffer");
+        assert!(
+            b.skills > b.rules,
+            "two skills should sum above one rules buffer"
+        );
     }
 
     #[test]
@@ -547,6 +550,38 @@ mod tests {
         assert_eq!(heuristic(""), 1);
         assert_eq!(heuristic("abcd"), 1);
         assert_eq!(heuristic("abcdefgh"), 2);
+    }
+
+    #[test]
+    fn selection_pin_survives_eviction_and_replaces_on_repin() {
+        let mut m = ContextManager::new(64);
+        m.upsert_pinned("selection", "### src/a.ts:4-9\nconst x = 1;".to_string());
+        for i in 0..50 {
+            m.push("assistant", format!("turn {i:03} ").repeat(40));
+        }
+        let roles: Vec<String> = m.messages().iter().map(|x| x.role.clone()).collect();
+        assert!(
+            roles.contains(&"selection".to_string()),
+            "selection survives eviction"
+        );
+        assert!(
+            m.usage().breakdown.other_pinned > 0,
+            "selection lands in other_pinned"
+        );
+        let before = m
+            .messages()
+            .iter()
+            .filter(|x| x.role == "selection")
+            .count();
+        assert_eq!(before, 1, "exactly one selection slot");
+        m.upsert_pinned("selection", "### src/b.ts:1\nconst y = 2;".to_string());
+        let after: Vec<String> = m
+            .messages()
+            .iter()
+            .filter(|x| x.role == "selection")
+            .map(|x| x.content.clone())
+            .collect();
+        assert_eq!(after, vec!["### src/b.ts:1\nconst y = 2;".to_string()]);
     }
 
     #[test]

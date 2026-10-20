@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   assistantTurnId,
+  chatIdForInvoke,
+  isDefaultChat,
   newChatId,
   newTurnId,
   resolveChatId,
@@ -46,5 +48,31 @@ describe("sessionLog", () => {
 
   it("routes a history-selected chat to its own log", () => {
     expect(resolveChatId("myproj::chat-abc")).toBe("chat-abc");
+  });
+
+  // Regression: the base chat lives at the flat `sessions/<key>.jsonl`, which
+  // the backend addresses with a null chat id. Forwarding the "default"
+  // sentinel verbatim addressed `sessions/<key>/default.jsonl` — a file nothing
+  // writes — so history loads came back empty and new turns went to a phantom
+  // log that surfaced later as a duplicate entry.
+  it("collapses the default sentinel to null at the IPC boundary", () => {
+    expect(chatIdForInvoke("default")).toBeNull();
+    expect(chatIdForInvoke(null)).toBeNull();
+    expect(chatIdForInvoke(undefined)).toBeNull();
+    expect(chatIdForInvoke("")).toBeNull();
+    // A named chat must survive untouched.
+    expect(chatIdForInvoke("chat-abc")).toBe("chat-abc");
+  });
+
+  it("never resolves a default conversation to a named chat id", () => {
+    expect(resolveChatId("myproj::default")).toBeNull();
+    expect(resolveChatId("myproj")).toBeNull();
+  });
+
+  it("identifies the base chat regardless of how the id was formed", () => {
+    expect(isDefaultChat("myproj::default")).toBe(true);
+    expect(isDefaultChat("myproj")).toBe(true);
+    expect(isDefaultChat("myproj::")).toBe(true);
+    expect(isDefaultChat("myproj::chat-abc")).toBe(false);
   });
 });

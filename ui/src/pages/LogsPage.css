@@ -83,7 +83,9 @@ html.theme-dark .logs-tab.active {
 }
 
 .btn-refresh-logs,
-.btn-copy-logs {
+.btn-open-logs,
+.btn-download-logs,
+.btn-clear-logs {
   padding: 8px 14px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -96,7 +98,9 @@ html.theme-dark .logs-tab.active {
 }
 
 .btn-refresh-logs:hover,
-.btn-copy-logs:hover {
+.btn-open-logs:hover,
+.btn-download-logs:hover,
+.btn-clear-logs:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
   border-color: var(--border-hover);
@@ -168,4 +172,42 @@ html.theme-dark .logs-content-wrap {
 .log-line.log-empty {
   color: var(--text-muted);
   font-style: italic;
+}
+.logs-tab-count {
+  margin-left: 6px;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+.logs-file {
+  max-width: 260px;
+  padding: 8px 10px;
+  font-size: 0.8125rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-sidebar);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.btn-clear-logs:hover {
+  color: var(--error, #f87171);
+  border-color: var(--error, #f87171);
+}
+
+.logs-path {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  word-break: break-all;
+  user-select: text;
+}
+
+.logs-path-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.logs-notice {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
 }

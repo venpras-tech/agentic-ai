@@ -23,16 +23,17 @@ use crossbeam_channel::Sender;
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_sys_2::llama_flash_attn_type as LlamaFlashAttnType;
-use llama_cpp_sys_2::{
-    LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED,
-};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_sys_2::llama_flash_attn_type as LlamaFlashAttnType;
+use llama_cpp_sys_2::{
+    LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 #[allow(unused_imports)]
@@ -118,7 +119,11 @@ fn take_load_diag() -> Vec<String> {
 /// alone.
 fn strip_module_tag(line: &str) -> &str {
     match line.find(": ") {
-        Some(i) if line[..i].chars().all(|c| c.is_ascii_lowercase() || c == '_') => {
+        Some(i)
+            if line[..i]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_') =>
+        {
             line[i + 2..].trim()
         }
         _ => line.trim(),
@@ -185,10 +190,7 @@ fn load_hint(diag: &str) -> Option<&'static str> {
 }
 
 /// Turn a load failure into a message a user can act on.
-fn format_load_error(
-    e: llama_cpp_2::LlamaModelLoadError,
-    diag: &[String],
-) -> String {
+fn format_load_error(e: llama_cpp_2::LlamaModelLoadError, diag: &[String]) -> String {
     let causes = load_diag_causes(diag);
     if causes.is_empty() {
         // No native diagnostics: fall back to whatever the wrapper reported.
@@ -458,7 +460,10 @@ impl ModelInitParams {
                 return Err(format!("Max concurrent must be between 1 and 32 (got {v})"));
             }
         }
-        for (label, v) in [("Evaluation batch size", self.n_batch), ("Physical batch size", self.n_ubatch)] {
+        for (label, v) in [
+            ("Evaluation batch size", self.n_batch),
+            ("Physical batch size", self.n_ubatch),
+        ] {
             if let Some(v) = v {
                 if v < 1 || v > 1_048_576 {
                     return Err(format!("{label} out of range: {v} (1..1048576)"));
@@ -474,15 +479,22 @@ impl ModelInitParams {
         }
         if let Some(v) = self.rope_freq_base {
             if !(0.1..=1_000_000.0).contains(&v) {
-                return Err(format!("RoPE frequency base out of range: {v} (0.1..1000000)"));
+                return Err(format!(
+                    "RoPE frequency base out of range: {v} (0.1..1000000)"
+                ));
             }
         }
         if let Some(v) = self.rope_freq_scale {
             if !(0.01..=1_000.0).contains(&v) {
-                return Err(format!("RoPE frequency scale out of range: {v} (0.01..1000)"));
+                return Err(format!(
+                    "RoPE frequency scale out of range: {v} (0.01..1000)"
+                ));
             }
         }
-        for (label, v) in [("K-cache quantization", self.cache_type_k.as_deref()), ("V-cache quantization", self.cache_type_v.as_deref())] {
+        for (label, v) in [
+            ("K-cache quantization", self.cache_type_k.as_deref()),
+            ("V-cache quantization", self.cache_type_v.as_deref()),
+        ] {
             if let Some(v) = v {
                 if parse_cache_type(v).is_none() {
                     return Err(format!(
@@ -517,7 +529,9 @@ impl ModelInitParams {
 }
 
 /// Cache quantization types accepted by the KV-cache override controls.
-pub const CACHE_TYPES: &[&str] = &["F16", "F32", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "IQ4_NL"];
+pub const CACHE_TYPES: &[&str] = &[
+    "F16", "F32", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "IQ4_NL",
+];
 
 /// Map a cache-quantization type name onto the crate's [`KvCacheType`].
 pub fn parse_cache_type(name: &str) -> Option<KvCacheType> {
@@ -556,12 +570,13 @@ pub fn parse_cache_type(name: &str) -> Option<KvCacheType> {
 /// clear error instead of being silently dropped.
 fn apply_llama_args(params: &mut ModelInitParams, args: &str) -> Result<(), String> {
     let mut tokens = args.split_whitespace();
-    let need_next = |flag: &str, tokens: &mut std::str::SplitWhitespace| -> Result<String, String> {
-        tokens
-            .next()
-            .ok_or_else(|| format!("`{flag}` requires a value"))
-            .map(|v| v.to_string())
-    };
+    let need_next =
+        |flag: &str, tokens: &mut std::str::SplitWhitespace| -> Result<String, String> {
+            tokens
+                .next()
+                .ok_or_else(|| format!("`{flag}` requires a value"))
+                .map(|v| v.to_string())
+        };
     while let Some(tok) = tokens.next() {
         let (flag, inline_val) = match tok.split_once('=') {
             Some((f, v)) => (f, Some(v.to_string())),
@@ -611,9 +626,9 @@ fn apply_llama_args(params: &mut ModelInitParams, args: &str) -> Result<(), Stri
                 params.n_workers = Some(v);
             }
             "-s" | "--seed" => {
-                let v = take(&mut tokens)?
-                    .parse::<u32>()
-                    .map_err(|_| "`--seed` must be a number between 0 and 4294967294".to_string())?;
+                let v = take(&mut tokens)?.parse::<u32>().map_err(|_| {
+                    "`--seed` must be a number between 0 and 4294967294".to_string()
+                })?;
                 params.seed = Some(v);
             }
             "--rope-freq-base" | "--rope-frequency-base" => {
@@ -706,6 +721,16 @@ pub struct InferenceRequest {
     /// prompt re-evaluation cost on multi-step agent loops.
     #[serde(default)]
     pub cached_prefix_tokens: Option<usize>,
+    /// Native tool definitions in OpenAI `tools` shape
+    /// (`{"type":"function","function":{"name","description","parameters"}}`).
+    ///
+    /// Only consumed by remote generators: the local llama.cpp path has no
+    /// tool channel and keeps parsing `<execute_tool>` markdown out of the
+    /// generated text. A remote provider that returns structured `tool_calls`
+    /// has them re-rendered as `<execute_tool>` blocks in `GenerationOutcome`,
+    /// so the orchestrator's parser handles both paths identically.
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
 }
 
 /// Snapshot of model metadata surfaced to the frontend (camelCase).
@@ -807,6 +832,18 @@ pub struct GenerationOutcome {
 /// Every variant carries the `session_id` so multi-session rendering (plain
 /// chat *and* multi-step agent tasks) always keys events to the right stream.
 pub enum WorkerEvent {
+    /// Generation was accepted and prompt evaluation is about to begin.
+    ///
+    /// Emitted before the first decode so a listener can timestamp the *real*
+    /// start of the turn. Without it the time-to-first-token below included
+    /// prompt evaluation but was measured from the first delta, reporting a
+    /// misleading `0 ms` for what is usually the slowest phase.
+    Started {
+        session_id: u64,
+        /// Prompt length in tokens, or 0 when the backend does not tokenize
+        /// locally (remote providers count tokens server-side).
+        prompt_tokens: usize,
+    },
     /// A decoded slice of the generated text.
     Token { session_id: u64, delta: String },
     /// A completed orchestrator step (agentic tasks only).
@@ -848,6 +885,15 @@ pub trait TextGenerator: Send {
     /// template or the configured override.
     fn render_chat(&mut self, _request: &InferenceRequest) -> Option<String> {
         None
+    }
+    /// Does this backend have a native tool channel (OpenAI `tools`)?
+    ///
+    /// Defaults to `false`, which is right for the local llama.cpp path: it has
+    /// no tool-call API and reads `<execute_tool>` markdown from the generated
+    /// text instead. The orchestrator skips building a `tools` catalog for
+    /// backends that answer `false`, so no local prompt changes shape.
+    fn supports_native_tools(&self) -> bool {
+        false
     }
 }
 
@@ -930,17 +976,29 @@ pub enum EngineMsg {
 pub struct PoolGenerator {
     tx: crossbeam_channel::Sender<EngineMsg>,
     info: ModelInfo,
+    /// Whether the pool's backend has a native tool channel. Captured from the
+    /// inner generator at spawn time; the handle cannot reach the worker's
+    /// generator, so the flag must travel with the handle.
+    native_tools: bool,
 }
 
 impl PoolGenerator {
-    fn new(tx: crossbeam_channel::Sender<EngineMsg>, info: ModelInfo) -> Self {
-        Self { tx, info }
+    fn new(tx: crossbeam_channel::Sender<EngineMsg>, info: ModelInfo, native_tools: bool) -> Self {
+        Self {
+            tx,
+            info,
+            native_tools,
+        }
     }
 }
 
 impl TextGenerator for PoolGenerator {
     fn info(&self) -> ModelInfo {
         self.info.clone()
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.native_tools
     }
 
     fn generate(
@@ -1021,6 +1079,7 @@ impl PoolGenerator {
 struct EngineWorker {
     tx: crossbeam_channel::Sender<EngineMsg>,
     info: ModelInfo,
+    native_tools: bool,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -1145,6 +1204,7 @@ impl EnginePool {
         for _ in 0..count.max(1) {
             let inner = factory()?;
             let info = inner.info();
+            let native_tools = inner.supports_native_tools();
             let (tx, rx) = crossbeam_channel::unbounded::<EngineMsg>();
             let event_tx = event_tx.clone();
             let handle = std::thread::spawn(move || {
@@ -1168,8 +1228,7 @@ impl EnginePool {
                             events,
                             reply,
                         } => {
-                            let result =
-                                inner.generate(&request, session_id, &interrupt, &events);
+                            let result = inner.generate(&request, session_id, &interrupt, &events);
                             let _ = reply.send(result);
                         }
                         EngineMsg::RenderChat { request, reply } => {
@@ -1183,6 +1242,7 @@ impl EnginePool {
             workers.push(EngineWorker {
                 tx,
                 info,
+                native_tools,
                 _handle: handle,
             });
         }
@@ -1213,7 +1273,7 @@ impl EnginePool {
     /// Round-robin handle to worker `idx % len`.
     pub fn handle(&self, idx: usize) -> PoolGenerator {
         let w = &self.workers[idx % self.workers.len()];
-        PoolGenerator::new(w.tx.clone(), w.info.clone())
+        PoolGenerator::new(w.tx.clone(), w.info.clone(), w.native_tools)
     }
 }
 
@@ -1483,18 +1543,55 @@ pub fn run_generation(
         ));
     }
 
-    // KV-cache prefix reuse is DISABLED across agent-loop calls. The naive
-    // reuse (resume at `cached_prefix_tokens` / the LCP of the previous prompt)
-    // leaves the llama.cpp KV cache with positions that are not strictly
-    // consecutive with what the model expects, so the very next decode returns
-    // `-1` (surfaced by the crate as "Decode Error -1: n_tokens == 0" — a
-    // generic failure, not actually an empty batch) and multi-step agentic
-    // replies break on step 2. Re-evaluating the full prompt every step is
-    // correct (consecutive positions 0..n) at the cost of some speed.
-    let _ = request.cached_prefix_tokens;
-    engine.context.clear_kv_cache();
-    engine.cached_tokens.clear();
-    let prefix_len = 0usize;
+    // Announce the turn before any decode so listeners measure time-to-first
+    // token against prompt evaluation, not against the first delta (which would
+    // always read 0 ms).
+    let _ = tx.send(WorkerEvent::Started {
+        session_id,
+        prompt_tokens: prompt_tokens.len(),
+    });
+
+    // KV-cache prefix reuse across agent-loop calls. The cache is only valid for
+    // the exact token sequence that produced it, so reuse is gated on a
+    // *verified* longest-common-prefix against the ledger of what is actually
+    // in the cache (`cached_tokens` = the previous prompt plus its output).
+    //
+    // Positions stay strictly consecutive (0..=prefix_len-1 reused, then
+    // prefix_len..=n decoded), which is what llama.cpp requires. The earlier
+    // "Decode Error -1" failures came from resuming at a caller-supplied offset
+    // that did not correspond to a real prefix boundary; deriving the offset
+    // from the ledger instead makes that mismatch impossible.
+    //
+    // At least one prompt token must be decoded to obtain fresh logits, so the
+    // reused prefix is capped at `prompt_len - 1`.
+    let prefix_len = common_prefix_len(&engine.cached_tokens, &prompt_tokens)
+        .min(request.cached_prefix_tokens.unwrap_or(usize::MAX))
+        .min((prompt_tokens.len() as i32 - 1).max(0) as usize);
+
+    // Only attempt the partial removal when there is something to reuse;
+    // `kv_cache_seq_rm` on an empty boundary is a needless failure mode.
+    let truncate_ok = prefix_len == 0
+        || engine
+            .context
+            .kv_cache_seq_rm(0, Some(prefix_len as u32), None)
+            .is_ok();
+    let plan = plan_kv_reuse(prefix_len, truncate_ok);
+    let prefix_len = match plan {
+        // Drop everything at or after the reuse boundary. Without this the
+        // stale tail from the previous turn would still occupy cells and the
+        // next decode would find no room for the new tokens.
+        KvReusePlan::Truncate(n) => {
+            engine.cached_tokens.truncate(n);
+            n
+        }
+        // Either nothing was reusable, or the partial removal was rejected. Both
+        // end in the same place: drop the whole cache and decode from scratch.
+        KvReusePlan::Clear => {
+            engine.context.clear_kv_cache();
+            engine.cached_tokens.clear();
+            0
+        }
+    };
     engine.context.reset_timings();
 
     let mut sampler = build_sampler(engine.default_seed);
@@ -1542,8 +1639,9 @@ pub fn run_generation(
     }
 
     // The whole prompt is now in the KV cache. Rebuild the ledger so the
-    // in-cache token sequence stays authoritative for any future (opt-in)
-    // prefix reuse; with reuse currently disabled this is just the prompt.
+    // in-cache token sequence stays authoritative for the next step's prefix
+    // reuse; the generation loop below appends its output tokens to it, so the
+    // ledger ends up as exactly the sequence the cache holds.
     engine.cached_tokens = prompt_tokens.clone();
 
     let started = Instant::now();
@@ -1678,10 +1776,91 @@ fn has_stop_suffix(text: &str, stop_words: &[String]) -> bool {
         .any(|w| !w.is_empty() && text.len() >= w.len() && text.ends_with(w.as_str()))
 }
 
+/// Length of the longest common prefix of two token sequences — i.e. how many
+/// leading tokens of `next` are already resident in the KV cache that produced
+/// `cached`.
+///
+/// This is the only trustworthy reuse boundary. A caller-supplied offset (or
+/// the previous prompt's length) can overstate what is really cached, which is
+/// what made the earlier reuse attempt decode from the wrong KV position and
+/// fail with `n_tokens == 0`.
+fn common_prefix_len(
+    cached: &[llama_cpp_2::token::LlamaToken],
+    next: &[llama_cpp_2::token::LlamaToken],
+) -> usize {
+    cached
+        .iter()
+        .zip(next.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// What to do with the KV cache before decoding a new prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvReusePlan {
+    /// Nothing reusable: clear the cache and decode from position 0.
+    Clear,
+    /// Keep `prefix_len` tokens resident and truncate the stale tail.
+    Truncate(usize),
+}
+
+/// Decide how to prepare the KV cache for a new prompt.
+///
+/// `truncate_ok` reports whether `kv_cache_seq_rm` succeeded. It returns `false`
+/// with "Couldn't remove partial sequence" in the normal state after a
+/// decode+generate cycle, because llama.cpp spreads a sequence across cells as
+/// it recycles the pool. That is a cache-placement detail rather than a
+/// correctness problem — the ledger already proves the first `prefix_len` tokens
+/// are genuinely cached — so the caller degrades to a full clear and a
+/// re-decode rather than failing the request. Aborting instead killed every
+/// agent step after the first.
+fn plan_kv_reuse(prefix_len: usize, truncate_ok: bool) -> KvReusePlan {
+    match (prefix_len, truncate_ok) {
+        (0, _) => KvReusePlan::Clear,
+        (_, false) => KvReusePlan::Clear,
+        (n, true) => KvReusePlan::Truncate(n),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+
+    #[test]
+    fn kv_reuse_falls_back_to_a_clear_when_removal_is_rejected() {
+        // The regression that killed every agent step after the first: llama.cpp
+        // rejects a partial `kv_cache_seq_rm` once the sequence's cells are no
+        // longer contiguous from its head, which is the normal state after a
+        // decode+generate cycle. That must degrade to a full re-decode, never an
+        // error.
+        assert_eq!(plan_kv_reuse(512, false), KvReusePlan::Clear);
+        // Removal succeeded: keep the prefix and truncate the stale tail.
+        assert_eq!(plan_kv_reuse(512, true), KvReusePlan::Truncate(512));
+        // Nothing reusable either way.
+        assert_eq!(plan_kv_reuse(0, true), KvReusePlan::Clear);
+        assert_eq!(plan_kv_reuse(0, false), KvReusePlan::Clear);
+    }
+
+    #[test]
+    fn common_prefix_len_stops_at_the_first_divergent_token() {
+        let t = |ids: &[i32]| -> Vec<llama_cpp_2::token::LlamaToken> {
+            ids.iter()
+                .map(|i| llama_cpp_2::token::LlamaToken(*i))
+                .collect()
+        };
+        // Identical sequences reuse everything.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[1, 2, 3])), 3);
+        // A single mismatch caps reuse at that point.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[1, 9, 3])), 1);
+        // A shorter cache caps reuse at its length.
+        assert_eq!(common_prefix_len(&t(&[1, 2]), &t(&[1, 2, 3])), 2);
+        // A shorter prompt never reuses beyond itself.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[1, 2])), 2);
+        // Empty cache or empty prompt means no reuse.
+        assert_eq!(common_prefix_len(&t(&[]), &t(&[1, 2])), 0);
+        assert_eq!(common_prefix_len(&t(&[1, 2]), &t(&[])), 0);
+    }
 
     #[test]
     fn load_diag_causes_take_the_earliest_concrete_lines() {
@@ -1817,13 +1996,15 @@ mod tests {
         if !path.is_file() {
             panic!("sample not present: {}", path.display());
         }
-        let err =
-            match load_model_with_progress(path, &ModelInitParams::default(), |_| true) {
-                Ok(_) => panic!("a non-first shard must not load"),
-                Err(e) => e,
-            };
+        let err = match load_model_with_progress(path, &ModelInitParams::default(), |_| true) {
+            Ok(_) => panic!("a non-first shard must not load"),
+            Err(e) => e,
+        };
         println!("USER-FACING ERROR: {err}");
-        assert!(!err.contains("null result from llama cpp"), "generic message leaked");
+        assert!(
+            !err.contains("null result from llama cpp"),
+            "generic message leaked"
+        );
         assert!(err.contains("first shard"), "missing shard guidance: {err}");
     }
 
@@ -1840,13 +2021,15 @@ mod tests {
         if !path.is_file() {
             panic!("sample not present: {}", path.display());
         }
-        let err = match load_model_with_progress(path, &ModelInitParams::default(), |_| true)
-        {
+        let err = match load_model_with_progress(path, &ModelInitParams::default(), |_| true) {
             Ok(_) => panic!("this GGUF must not load"),
             Err(e) => e,
         };
         println!("USER-FACING ERROR: {err}");
-        assert!(!err.contains("null result from llama cpp"), "generic message leaked");
+        assert!(
+            !err.contains("null result from llama cpp"),
+            "generic message leaked"
+        );
         assert!(err.contains("tensor name"), "missing root cause: {err}");
     }
 
@@ -1975,18 +2158,18 @@ mod tests {
     fn runtime_router_routes_local_roles_to_the_pool() {
         let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
         let pool = EnginePool::spawn_with(
-            || {
-                Ok(Box::new(FakeGen {
-                    tag: "pool".into(),
-                }) as Box<dyn TextGenerator>)
-            },
+            || Ok(Box::new(FakeGen { tag: "pool".into() }) as Box<dyn TextGenerator>),
             ev_tx.clone(),
             1,
         )
         .expect("spawn pool");
 
         // Local-only registry: every role must fall back to the pool handle.
-        let mut router = RuntimeRouter::new(&pool, ProviderRegistry::with_defaults("qwen", None), ev_tx.clone());
+        let mut router = RuntimeRouter::new(
+            &pool,
+            ProviderRegistry::with_defaults("qwen", None),
+            ev_tx.clone(),
+        );
         for role in [
             ProviderRole::Planner,
             ProviderRole::Editor,
@@ -2010,7 +2193,11 @@ mod tests {
         reg.set_role_provider(ProviderRole::Editor, "my_local");
         let mut router2 = RuntimeRouter::new(&pool, reg, ev_tx);
         assert_eq!(
-            router2.resolve(ProviderRole::Editor).expect("editor routes").info().name,
+            router2
+                .resolve(ProviderRole::Editor)
+                .expect("editor routes")
+                .info()
+                .name,
             "pool"
         );
     }
@@ -2019,11 +2206,7 @@ mod tests {
     fn runtime_router_spawns_worker_pool_per_remote_role() {
         let (ev_tx, _ev_rx) = bounded::<WorkerEvent>(256);
         let pool = EnginePool::spawn_with(
-            || {
-                Ok(Box::new(FakeGen {
-                    tag: "pool".into(),
-                }) as Box<dyn TextGenerator>)
-            },
+            || Ok(Box::new(FakeGen { tag: "pool".into() }) as Box<dyn TextGenerator>),
             ev_tx.clone(),
             1,
         )
@@ -2164,6 +2347,107 @@ mod tests {
             big.done.total_tokens, big.done.stop_reason
         );
         assert!(!big.full_text.trim().is_empty());
+
+        // Prefix reuse: a follow-up turn that opens with the same long
+        // instruction block must reuse those KV cells instead of re-evaluating
+        // them, and must still produce a coherent answer. This is the case that
+        // used to fail with "Decode Error -1: n_tokens == 0".
+        let reuse_request = InferenceRequest {
+            prompt: format!(
+                "Here is a long instruction list for you. {}\nNow answer: what is 3+3?",
+                "A numbered fact: 42. ".repeat(130)
+            ),
+            messages: None,
+            images: None,
+            max_tokens: 24,
+            stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
+            ..Default::default()
+        };
+        let reused = run_generation(&mut engine, &reuse_request, 1, &interrupt, &tx)
+            .expect("prefix-reuse generation must not fail");
+        eprintln!(
+            "prefix reuse: input={} cache_read={} cache_write={} tokens={} stop={}",
+            reused.done.input_tokens,
+            reused.done.cache_read_tokens,
+            reused.done.cache_write_tokens,
+            reused.done.total_tokens,
+            reused.done.stop_reason
+        );
+        assert!(
+            reused.done.cache_read_tokens > 0,
+            "expected KV cache hits on a near-identical follow-up prompt, got {}",
+            reused.done.cache_read_tokens
+        );
+        assert!(!reused.full_text.trim().is_empty());
+
+        // A third turn with a *different* opening must fall back to a full
+        // re-evaluate rather than reusing a prefix that is not there.
+        let diverge = InferenceRequest {
+            prompt: "Completely unrelated question: what is the capital of France?".to_string(),
+            messages: None,
+            images: None,
+            max_tokens: 24,
+            stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
+            ..Default::default()
+        };
+        let diverged = run_generation(&mut engine, &diverge, 1, &interrupt, &tx)
+            .expect("divergent generation must not fail");
+        eprintln!(
+            "divergent: input={} cache_read={} tokens={}",
+            diverged.done.input_tokens, diverged.done.cache_read_tokens, diverged.done.total_tokens
+        );
+        assert_eq!(
+            diverged.done.cache_read_tokens, 0,
+            "no prefix should be reused for an unrelated prompt"
+        );
+        assert!(!diverged.full_text.trim().is_empty());
+    }
+
+    /// Throughput probe: decode the same prompt at several thread counts and
+    /// print tokens/sec, so a change to the build's CPU features or the pool's
+    /// thread split can be measured instead of guessed at. Skipped without the
+    /// model file; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires the real GGUF model file on disk"]
+    fn bench_decode_tokens_per_sec_by_thread_count() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+        if !path.is_file() {
+            eprintln!("SKIP: model not found at {}", path.display());
+            return;
+        }
+        let params = ModelInitParams {
+            context_size: Some(2048),
+            n_gpu_layers: Some(0),
+            ..Default::default()
+        };
+        let model = load_model_with_progress(&path, &params, |_| true).expect("load model");
+        let (tx, _rx) = bounded::<WorkerEvent>(4096);
+        let interrupt = CancellationToken::new();
+        let request = InferenceRequest {
+            prompt: "Explain what a hash map is in detail.".to_string(),
+            messages: None,
+            images: None,
+            max_tokens: 96,
+            stop_words: Some(vec![]),
+            cached_prefix_tokens: None,
+            ..Default::default()
+        };
+        for threads in [4u32, 8] {
+            let mut engine = model
+                .new_engine_with_threads(threads as i32)
+                .expect("build engine");
+            // Warm up so the first (cold) run does not skew the number.
+            let _ = run_generation(&mut engine, &request, 1, &interrupt, &tx);
+            let out = run_generation(&mut engine, &request, 1, &interrupt, &tx)
+                .expect("generation must not fail");
+            eprintln!(
+                "BENCH threads={threads} tokens={} tok/s={:.1} elapsed_ms={}",
+                out.done.total_tokens, out.done.tokens_per_sec, out.done.elapsed_ms
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2205,13 +2489,16 @@ mod tests {
         assert_eq!(back.n_gpu_layers, Some(29));
         assert_eq!(back.context_size, Some(8192));
         assert_eq!(back.cache_type_k.as_deref(), Some("Q8_0"));
-        assert_eq!(back.reasoning_budget.as_deref(), Some("prefer short answers"));
+        assert_eq!(
+            back.reasoning_budget.as_deref(),
+            Some("prefer short answers")
+        );
         assert_eq!(back.llama_args.as_deref(), Some("--no-mmap"));
 
         // An old payload without the newer fields must still parse to `None`
         // (backward compatibility — old settings.json / old frontends).
-        let old: ModelInitParams = serde_json::from_str(r#"{"contextSize":4096}"#)
-            .expect("legacy subset parses");
+        let old: ModelInitParams =
+            serde_json::from_str(r#"{"contextSize":4096}"#).expect("legacy subset parses");
         assert_eq!(old.context_size, Some(4096));
         assert!(old.n_batch.is_none());
         assert!(old.reasoning_budget.is_none());
@@ -2234,7 +2521,11 @@ mod tests {
         };
         let merged = base.merge(&explicit);
         assert_eq!(merged.context_size, Some(8192), "explicit wins");
-        assert_eq!(merged.n_gpu_layers, Some(0), "base kept where explicit is None");
+        assert_eq!(
+            merged.n_gpu_layers,
+            Some(0),
+            "base kept where explicit is None"
+        );
         assert_eq!(merged.cache_type_k.as_deref(), Some("Q4_0"));
         assert_eq!(merged.n_threads, Some(2));
         assert!(merged.unified_kv.is_none());
@@ -2256,14 +2547,38 @@ mod tests {
         assert!(ok.validate().is_ok());
 
         for bad in [
-            ModelInitParams { n_threads: Some(0), ..Default::default() },
-            ModelInitParams { n_workers: Some(33), ..Default::default() },
-            ModelInitParams { n_batch: Some(0), ..Default::default() },
-            ModelInitParams { n_gpu_layers: Some(20_000), ..Default::default() },
-            ModelInitParams { rope_freq_base: Some(0.0), ..Default::default() },
-            ModelInitParams { cache_type_k: Some("BRPF".into()), ..Default::default() },
-            ModelInitParams { seed: Some(u32::MAX), ..Default::default() },
-            ModelInitParams { speculative: Some("mtp".into()), ..Default::default() },
+            ModelInitParams {
+                n_threads: Some(0),
+                ..Default::default()
+            },
+            ModelInitParams {
+                n_workers: Some(33),
+                ..Default::default()
+            },
+            ModelInitParams {
+                n_batch: Some(0),
+                ..Default::default()
+            },
+            ModelInitParams {
+                n_gpu_layers: Some(20_000),
+                ..Default::default()
+            },
+            ModelInitParams {
+                rope_freq_base: Some(0.0),
+                ..Default::default()
+            },
+            ModelInitParams {
+                cache_type_k: Some("BRPF".into()),
+                ..Default::default()
+            },
+            ModelInitParams {
+                seed: Some(u32::MAX),
+                ..Default::default()
+            },
+            ModelInitParams {
+                speculative: Some("mtp".into()),
+                ..Default::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "expected error for {bad:?}");
         }
@@ -2319,8 +2634,14 @@ mod tests {
 
     #[test]
     fn flash_policy_mapping() {
-        assert_eq!(LoadedModel::flash_policy(Some(true)), LLAMA_FLASH_ATTN_TYPE_ENABLED);
-        assert_eq!(LoadedModel::flash_policy(Some(false)), LLAMA_FLASH_ATTN_TYPE_DISABLED);
+        assert_eq!(
+            LoadedModel::flash_policy(Some(true)),
+            LLAMA_FLASH_ATTN_TYPE_ENABLED
+        );
+        assert_eq!(
+            LoadedModel::flash_policy(Some(false)),
+            LLAMA_FLASH_ATTN_TYPE_DISABLED
+        );
         assert_eq!(LoadedModel::flash_policy(None), LLAMA_FLASH_ATTN_TYPE_AUTO);
     }
 }

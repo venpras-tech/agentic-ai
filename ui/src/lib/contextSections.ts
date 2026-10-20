@@ -34,12 +34,17 @@ function clip(text: string, max: number): string {
   return `${text.slice(0, max)}\n… (truncated, ${text.length - max} more chars)`;
 }
 
-function lineRange(content: string, start?: number, end?: number): string {
+/** Extract the numbered `start..end` (1-based, inclusive) lines of `content`,
+ *  with per-line numbers so the agent can reference exact locations. Unknown
+ *  boundaries clamp to the file; a start past the end yields an empty string. */
+export function lineRange(content: string, start?: number, end?: number): string {
+  if (content === "") return "";
   const lines = content.split(/\r?\n/);
   const from = Math.max(1, start ?? 1);
   const to = Math.min(lines.length, end ?? lines.length);
   if (from > lines.length) return "";
   const selected = lines.slice(from - 1, to);
+  if (selected.length === 0) return "";
   const width = String(to).length;
   return selected
     .map((line, i) => `${String(from + i).padStart(width, " ")} | ${line}`)

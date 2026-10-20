@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { useApp } from "../context/AppContext";
+import { useShell } from "../context/AppContext";
 import { api, isTauriRuntime } from "../lib/ipc";
 import "./StatusBanners.css";
 
 function StatusBanners() {
-  const { backendConnected, setBackendConnected } = useApp();
+  const { backendConnected, setBackendConnected } = useShell();
   const [connecting, setConnecting] = useState(true);
 
   useEffect(() => {

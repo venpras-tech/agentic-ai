@@ -1,0 +1,98 @@
+.task-checklist {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--bg-hover);
+  font-size: 0.75rem;
+}
+
+.task-checklist--done {
+  border-left-color: #22c55e;
+  opacity: 0.85;
+}
+
+.task-checklist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.task-checklist-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-checklist-count {
+  flex: none;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-checklist-bar {
+  height: 3px;
+  margin-bottom: 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+  overflow: hidden;
+}
+
+.task-checklist-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.task-checklist--done .task-checklist-bar-fill {
+  background: #22c55e;
+}
+
+.task-checklist-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.task-checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+}
+
+.task-checklist-item.done {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.task-checklist-mark {
+  flex: none;
+  width: 12px;
+  text-align: center;
+}
+
+.task-checklist-item.done .task-checklist-mark {
+  color: #22c55e;
+}
+
+.task-checklist-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-checklist-more {
+  color: var(--text-muted);
+  font-style: italic;
+}

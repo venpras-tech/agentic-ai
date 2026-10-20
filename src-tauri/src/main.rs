@@ -7,6 +7,7 @@ mod commands;
 mod engine;
 mod hub;
 mod logging;
+mod lsp;
 mod remote;
 mod terminal;
 mod watcher;
@@ -20,7 +21,7 @@ use agent::skills::{KnowledgeReport, KnowledgeState};
 use agent::ToolState;
 use crossbeam_channel::{bounded, Sender};
 use engine::{
-    EnginePool, InferenceDone, LoadProgressEvent, LocalGenerator, ModelInitParams, ModelInfo,
+    EnginePool, InferenceDone, LoadProgressEvent, LocalGenerator, ModelInfo, ModelInitParams,
     TextGenerator, WorkerEvent,
 };
 use remote::ProviderRegistry;
@@ -78,11 +79,7 @@ impl InferenceState {
 
     /// Synchronous local GGUF load — blocks until the model is loaded.
     #[allow(dead_code)]
-    pub fn load_local_sync(
-        &self,
-        path: &str,
-        app: &AppHandle,
-    ) -> Result<ModelInfo, String> {
+    pub fn load_local_sync(&self, path: &str, app: &AppHandle) -> Result<ModelInfo, String> {
         let p = PathBuf::from(path);
         if !p.is_file() {
             return Err(format!("Model file not found: {path}"));
@@ -182,11 +179,39 @@ pub(crate) fn spawn_emitter(app: AppHandle) -> crossbeam_channel::Sender<WorkerE
         let mut streams: HashMap<u64, logging::StreamProgress> = HashMap::new();
         while let Ok(event) = rx.recv() {
             match event {
+                WorkerEvent::Started {
+                    session_id,
+                    prompt_tokens,
+                } => {
+                    // Reset the clock at the real start of the turn so the
+                    // "first token after N ms" line below measures prompt
+                    // evaluation instead of reporting 0 ms.
+                    let _ = streams.insert(session_id, logging::StreamProgress::new());
+                    if prompt_tokens > 0 {
+                        logging::info(
+                            Some(session_id),
+                            "llm.stream",
+                            &format!("prompt eval · {prompt_tokens} tok"),
+                        );
+                    }
+                    let _ = app_sink.emit(
+                        "inference-prompt-eval",
+                        PromptEvalEvent {
+                            session_id,
+                            prompt_tokens,
+                        },
+                    );
+                }
                 WorkerEvent::Token { session_id, delta } => {
                     let chars = delta.chars().count() as u64;
                     let progress = streams.entry(session_id).or_default();
                     if let Some(line) = progress.record(chars) {
                         logging::info(Some(session_id), "llm.stream", &line);
+                    }
+                    // Background tasks keep a per-session output ring buffer;
+                    // unbound sessions are ignored by the store.
+                    if let Some(ts) = app_sink.try_state::<std::sync::Arc<ToolState>>() {
+                        ts.background_output.record_token(session_id, &delta);
                     }
                     let _ = app_sink.emit("inference-token", TokenEvent { session_id, delta });
                 }
@@ -199,6 +224,15 @@ pub(crate) fn spawn_emitter(app: AppHandle) -> crossbeam_channel::Sender<WorkerE
                             step.step, step.group, step.tokens, step.elapsed_ms, step.tool_calls
                         ),
                     );
+                    if let Some(ts) = app_sink.try_state::<std::sync::Arc<ToolState>>() {
+                        ts.background_output.record(
+                            session_id,
+                            &format!(
+                                "step {} · {} tool call(s) · {} ms",
+                                step.step, step.tool_calls, step.elapsed_ms
+                            ),
+                        );
+                    }
                     let _ = app_sink.emit("agent-step", StepEvent { session_id, step });
                 }
                 WorkerEvent::Subtask {
@@ -271,6 +305,18 @@ struct TokenEvent {
     delta: String,
 }
 
+/// Prompt evaluation began. Lets the UI show how large the prompt is and start
+/// an elapsed timer *before* the first token, which on a CPU-only model is
+/// usually the longest part of a turn.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PromptEvalEvent {
+    session_id: u64,
+    /// 0 when the backend cannot report it (remote providers tokenize
+    /// server-side).
+    prompt_tokens: usize,
+}
+
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StepEvent {
@@ -303,17 +349,47 @@ struct ErrorEvent {
 // Model lifecycle
 // ---------------------------------------------------------------------------
 
+/// Thread count to use when the user has not pinned one.
+///
+/// Counts **physical** cores, not logical ones. llama.cpp decode is
+/// memory-bandwidth bound rather than compute bound, so SMT siblings add no
+/// throughput and actively hurt: measured on an i5-11300H (4C/8T) running
+/// qwen2.5-0.5b-q4, decode went 37.1 tok/s at 4 threads but *down* to 25.0
+/// tok/s at 8. The logical count is only used when the physical count cannot
+/// be determined.
+fn default_compute_threads() -> u32 {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_cpu();
+    sys.physical_core_count()
+        .filter(|n| *n > 0)
+        .map(|n| n as u32)
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|n| n.get() as u32)
+        })
+        .unwrap_or(4)
+}
+
 /// Local pool: load the GGUF once, then spawn `n_workers` contexts (each on
 /// its own worker thread). Compute threads are split across workers so the
 /// machine isn't oversubscribed. Returns the pool, whose `info()` is the model
 /// metadata.
+///
+/// Defaults to a **single** worker. A generation is memory-bandwidth bound, so
+/// a lone stream scaling across every physical core is strictly faster than
+/// two half-width streams; extra workers only pay off when subtasks actually run
+/// concurrently. Splitting by default halved the thread count and cost roughly
+/// 1.7x decode throughput. Raise `nWorkers` only if you routinely fan out to
+/// parallel subagents.
 pub(crate) fn build_local_pool(
     path: &std::path::Path,
     params: &ModelInitParams,
     event_tx: Sender<WorkerEvent>,
     app: &AppHandle,
 ) -> Result<EnginePool, String> {
-    let workers = params.n_workers.unwrap_or(2).clamp(1, 32) as usize;
+    let workers = params.n_workers.unwrap_or(1).clamp(1, 32) as usize;
     let app_progress = app.clone();
     let mut last_progress = 0.0f32;
     let model = engine::load_model_with_progress(path, params, move |progress: f32| {
@@ -330,11 +406,7 @@ pub(crate) fn build_local_pool(
         }
         true
     })?;
-    let total_threads = params.n_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(4)
-    }) as i32;
+    let total_threads = params.n_threads.unwrap_or_else(default_compute_threads) as i32;
     let per_threads = (total_threads as usize / workers).max(1) as i32;
 
     let factory = || {
@@ -447,7 +519,7 @@ pub(crate) async fn install_local_model(
         api.engine.set(shared_pool);
         let local_api = crate::commands::settings::read_settings(&app).local_api_server();
         if local_api.enabled && api.server.lock().await.is_none() {
-            match crate::api_server::start(api.engine.clone(), local_api.port) {
+            match crate::api_server::start(api.engine.clone(), local_api.port, app.clone()) {
                 Ok(handle) => {
                     let port = handle.port;
                     *api.server.lock().await = Some(handle);
@@ -588,7 +660,11 @@ pub(crate) fn sync_modes(workspace: &std::path::Path) -> Vec<crate::agent::subag
         logging::info(
             None,
             "agent.modes",
-            &format!("{} custom mode(s) registered from {}", modes.len(), workspace.display()),
+            &format!(
+                "{} custom mode(s) registered from {}",
+                modes.len(),
+                workspace.display()
+            ),
         );
     }
     modes
@@ -677,6 +753,7 @@ pub fn run() {
         ),
         _ => builder,
     };
+    let lsp_manager = std::sync::Arc::new(lsp::LspManager::default());
     builder
         .manage(InferenceState::default())
         .manage(HubState::default())
@@ -684,13 +761,16 @@ pub fn run() {
         .manage(ApiServerState::default())
         .manage(std::sync::Arc::new(ToolState {
             knowledge: knowledge.clone(),
+            lsp: std::sync::Arc::clone(&lsp_manager),
             ..ToolState::default()
         }))
         .manage(InterruptState::default())
         .manage(ContextState::default())
+        .manage(Arc::new(commands::index::SearchIndex::default()))
         .manage(watcher::WatcherState::new())
         .manage(knowledge)
         .manage(std::sync::Arc::new(terminal::TerminalSessions::new()))
+        .manage(lsp_manager)
         .setup(|app| {
             // Route every [BE]/[LLM] log line into (a) the rolling file
             // appender under the app-data `logs/` dir and (b) the in-app
@@ -729,6 +809,11 @@ pub fn run() {
             commands::model::load_model_from_path,
             commands::model::auto_load_model,
             commands::misc::console_history,
+            commands::misc::log_dir,
+            commands::misc::log_files,
+            commands::misc::log_read,
+            commands::misc::log_open_dir,
+            commands::misc::log_clear,
             commands::model::loaded_model_path,
             commands::model::hf_search,
             commands::model::hf_download_model,
@@ -756,6 +841,7 @@ pub fn run() {
             commands::model::providers_clear_role,
             commands::model::providers_route,
             commands::model::providers_list,
+            commands::model::remote_config_load,
             commands::model::unload_model,
             commands::model::model_status,
             commands::agent::stream_inference,
@@ -771,6 +857,7 @@ pub fn run() {
             commands::agent::agent_run_background,
             commands::agent::list_background_tasks,
             commands::agent::abort_background_task,
+            commands::agent::background_task_output,
             commands::editor::pick_workspace_folder,
             commands::editor::pick_text_file,
             commands::editor::list_directory,
@@ -791,6 +878,7 @@ pub fn run() {
             commands::agent::agent_reset_mcp,
             commands::misc::mcp_catalog_load,
             commands::misc::mcp_catalog_save,
+            commands::misc::mcp_server_probe,
             commands::agent::knowledge_scan,
             commands::agent::knowledge_report_cmd,
             commands::agent::skill_set_active,
@@ -806,6 +894,7 @@ pub fn run() {
             commands::agent::agent_respond_hitl,
             commands::agent::agent_audit_log,
             commands::agent::agent_policy_snapshot,
+            commands::agent::agent_policy_save,
             commands::agent::agent_set_yolo,
             commands::agent::agent_grant_path,
             commands::agent::agent_revoke_path,
@@ -813,6 +902,13 @@ pub fn run() {
             commands::agent::agent_git_checkpoints_cmd,
             commands::agent::agent_git_revert_cmd,
             commands::agent::agent_checkpoint_names_cmd,
+            commands::agent::agent_list_pending_edits,
+            commands::agent::agent_apply_edits,
+            commands::agent::agent_reject_edits,
+            commands::agent::agent_resolve_edit_conflict,
+            commands::agent::agent_run_verify,
+            commands::agent::agent_checkpoint_list,
+            commands::agent::agent_checkpoint_restore,
             commands::settings::settings_load,
             commands::settings::settings_save,
             commands::settings::models_dir_info,
@@ -831,13 +927,26 @@ pub fn run() {
             commands::context::context_status,
             commands::context::context_set_system_prompt,
             commands::context::context_set_file_buffer,
+            commands::context::context_set_selection,
             commands::context::context_push_turn,
+            commands::index::index_status,
+            commands::index::index_rebuild,
+            commands::index::index_search,
+            commands::index::index_semantic_search,
+            commands::lsp::lsp_diagnostics,
             watcher::start_file_watcher,
             watcher::stop_file_watcher,
             watcher::file_watcher_active,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AI Editor");
+        .build(tauri::generate_context!())
+        .expect("error while building AI Editor")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(mgr) = app_handle.try_state::<std::sync::Arc<lsp::LspManager>>() {
+                    mgr.shutdown_all();
+                }
+            }
+        });
 }
 
 fn main() {

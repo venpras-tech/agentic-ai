@@ -62,7 +62,7 @@ Format Layout:
 - view_file_structure: {"type":"view_file_structure","path":"string","maxDepth":number} -> AST summary of declarations.
 - read_file_range: {"type":"read_file_range","path":"string","startLine":number,"endLine":number} -> Line-range reader.
 - read_file_chars: {"type":"read_file_chars","path":"string","offset":number,"limit":number} -> Character-offset reader.
-- view_repo_map: {"type":"view_repo_map","top_n":number|null,"root":"string|null"} -> Symbol-graph repo map ranked by PageRank (most-relevant files first).
+- view_repo_map: {"type":"view_repo_map","topN":number|null,"root":"string|null"} -> Symbol-graph repo map ranked by PageRank (most-relevant files first).
 
 ### Writing & Management
 - write_file: {"type":"write_file","path":"string","content":"string"} -> Overwrite/create file.
@@ -108,6 +108,15 @@ Format Layout:
 - mark_todo_item_done: {"type":"mark_todo_item_done","item":number}
 - create_plan: {"type":"create_plan","title":"string","goal":"string","items":["string"]}
 - read_plan / update_plan / execute_plan: Plan orchestration.
+- summarize_changes: {"type":"summarize_changes"}
+- tree_sitter_query: {"type":"tree_sitter_query","path":"string","query":"string"}
+- list_mcp_servers: {"type":"list_mcp_servers"}
+- call_mcp_tool: {"type":"call_mcp_tool","serverName":"string","toolName":"string","args":"string"}
+- add_mcp_server: {"type":"add_mcp_server","name":"string","command":"string","args":["string"],"env":["string"]}
+- remove_mcp_server: {"type":"remove_mcp_server","name":"string"}
+- analyze_bug: {"type":"analyze_bug","path":"string","bugDescription":"string"}
+- review_code: {"type":"review_code","path":"string"}
+- browse_web: {"type":"browse_web","url":"string","maxChars":number}
 - task: {"type":"task","subagentType":"string","task":"string"}
 - get_scratchpad_folder: {"type":"get_scratchpad_folder"}
 

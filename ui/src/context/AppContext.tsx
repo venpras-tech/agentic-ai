@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { api, isTauriRuntime } from "../lib/ipc";
+import type { IndexStatus } from "../lib/ipc";
 import {
   activeLocalConfig,
   mergeLocalConfig,
@@ -10,7 +11,7 @@ import {
 } from "../lib/localModelConfig";
 import { buildSystemPrompt } from "../lib/agentPrepare";
 import { hydrateContextFromSession, recordToMessage } from "../lib/agentHistory";
-import { splitConversationId } from "../lib/sessionLog";
+import { chatIdForInvoke, newChatId, splitConversationId } from "../lib/sessionLog";
 import {
   defaultContextState,
   type ActiveFileBuffer,
@@ -24,7 +25,14 @@ import {
   type ModelInfo,
 } from "./types";
 
-interface AppContextValue {
+/**
+ * The app state is split into independent domain contexts (shell, model, agent
+ * settings, chat, context-pane) so a change in one domain — a keystroke in the
+ * composer, a model-load poll tick, a new activity line — only re-renders the
+ * components that actually consume that domain. `useApp()` remains as a merged
+ * convenience hook that subscribes to every domain.
+ */
+interface ShellValue {
   theme: string;
   setTheme: (t: string) => void;
   sidebarCollapsed: boolean;
@@ -32,6 +40,23 @@ interface AppContextValue {
   historyPanelOpen: boolean;
   setHistoryPanelOpen: (v: boolean) => void;
   toggleHistoryPanel: () => void;
+  projectPath: string;
+  setProjectPath: (p: string) => void;
+  /** Current workspace text-index snapshot (updated on rebuild + progress events). */
+  indexStatus: IndexStatus | null;
+  /** True while a workspace index rebuild is in flight. */
+  indexing: boolean;
+  /** Manually rebuild the workspace index. */
+  reindex: () => void;
+  /** Recently opened workspace roots (most-recent-first, capped). */
+  recentProjects: string[];
+  backendConnected: boolean;
+  setBackendConnected: (v: boolean) => void;
+  hitlGate: { requestId: string; reason: string } | null;
+  setHitlGate: React.Dispatch<React.SetStateAction<{ requestId: string; reason: string } | null>>;
+}
+
+interface ModelValue {
   modelName: string;
   modelProvider: string;
   setModelInfo: (name: string, provider: string) => void;
@@ -39,15 +64,31 @@ interface AppContextValue {
   setModelMeta: (info: ModelInfo | null) => void;
   modelLoading: boolean;
   modelLoadProgress: number | null;
-modelLoadStage: string;
+  modelLoadStage: string;
   apiServerStatus: { running: boolean; port: number | null };
   unloadModel: (() => Promise<void>) | (() => void);
-  projectPath: string;
-  setProjectPath: (p: string) => void;
-  backendConnected: boolean;
-  setBackendConnected: (v: boolean) => void;
-isProcessing: boolean;
-  setProcessing: (v: boolean) => void;
+  llmSettings: LlmSettings;
+  loadLlmSettings: () => Promise<void>;
+  saveLlmSettings: (patch: Partial<LlmSettings>) => void | Promise<void>;
+  modelLoadParams: () => Record<string, unknown>;
+  localModelConfigs: Record<string, Partial<LocalModelConfig>>;
+  loadLocalModelConfigs: () => Promise<void>;
+  saveLocalModelConfig: (
+    path: string | null,
+    patch: Partial<LocalModelConfig>,
+  ) => void | Promise<void>;
+  activeLocalModelPath: string | null;
+  activeModelConfig: Partial<LocalModelConfig> | undefined;
+  rememberLastModel: (sel: LastModelSelection) => void;
+  lastModel: LastModelSelection | null;
+  modelRestoreState: "idle" | "loading" | "ready" | "failed";
+  modelRestoreError: string;
+  modelPromptVisible: boolean;
+  dismissModelPrompt: () => void;
+  promptModelSelection: () => void;
+}
+
+interface AgentSettingsValue {
   verify: boolean;
   setVerify: (v: boolean) => void;
   /** YOLO sub-mode: auto-approve ROUTINE shell commands (red-zone stays blocked). */
@@ -56,20 +97,51 @@ isProcessing: boolean;
   /** Max agent execution steps per task (1-20). */
   maxSteps: number;
   setMaxSteps: (v: number) => void;
-  hitlGate: { requestId: string; reason: string } | null;
-  setHitlGate: React.Dispatch<React.SetStateAction<{ requestId: string; reason: string } | null>>;
-messages: ChatMessage[];
+  /** Total-token cap per agent run (0 = no cap). */
+  tokenBudget: number;
+  setTokenBudget: (v: number) => void;
+  /** Run the goal-search phase before the focused execution. */
+  decompose: boolean;
+  setDecompose: (v: boolean) => void;
+  /** Ask mode: single chat-completion turn (zero tool loop) instead of the
+   *  agent orchestrator. Faster; no tools run. */
+  preferChatComplete: boolean;
+  setPreferChatComplete: (v: boolean) => void;
+  settings: Record<string, unknown>;
+  setSettings: (s: Record<string, unknown>) => void;
+}
+
+interface ChatValue {
+  messages: ChatMessage[];
   addMessage: (msg: ChatMessage) => void;
   updateLastMessage: (update: MessageUpdate | ((prev: string) => string)) => void;
   clearMessages: () => void;
   truncateMessages: (fromIndex: number) => void;
-  activityLog: ActivityLogEntry[];
-  addActivity: (text: string, type: ActivityLogEntry["type"]) => void;
-  clearActivity: () => void;
+  isProcessing: boolean;
+  setProcessing: (v: boolean) => void;
   composerDraft: string;
   setComposerDraft: (v: React.SetStateAction<string>) => void;
   currentMode: string;
   setMode: (m: string) => void;
+  activityLog: ActivityLogEntry[];
+  addActivity: (text: string, type: ActivityLogEntry["type"]) => void;
+  clearActivity: () => void;
+  conversations: ConversationSummary[];
+  setConversations: (c: ConversationSummary[]) => void;
+  /** Increments whenever a turn is persisted, so the history list can refetch
+   *  without the panel having to be closed and reopened. */
+  historyVersion: number;
+  bumpHistory: () => void;
+  currentConversationId: string | null;
+  setCurrentConversation: (id: string | null) => void;
+  newChatSession: () => void;
+  /** Load a stored chat: hydrate the message list and replay it into the
+   *  backend ContextManager so the agent remembers the conversation. */
+  loadConversation: (conversationId: string) => Promise<void>;
+  loadingConversation: boolean;
+}
+
+interface ContextPaneValue {
   contextPaths: string[];
   addContextPath: (p: string) => void;
   removeContextPath: (p: string) => void;
@@ -79,42 +151,6 @@ messages: ChatMessage[];
   /** Active editor text, mirrored from EditorPane and pinned into agent context. */
   activeFile: ActiveFileBuffer | null;
   setActiveFile: (f: ActiveFileBuffer | null) => void;
-  conversations: ConversationSummary[];
-  setConversations: (c: ConversationSummary[]) => void;
-  currentConversationId: string | null;
-  setCurrentConversation: (id: string | null) => void;
-  newChatSession: () => void;
-  /** Load a stored chat: hydrate the message list and replay it into the
-   *  backend ContextManager so the agent remembers the conversation. */
-  loadConversation: (conversationId: string) => Promise<void>;
-  loadingConversation: boolean;
-  chatAbortRef: React.MutableRefObject<AbortController | null>;
-  settings: Record<string, unknown>;
-  setSettings: (s: Record<string, unknown>) => void;
-llmSettings: LlmSettings;
-  loadLlmSettings: () => Promise<void>;
-  saveLlmSettings: (patch: Partial<LlmSettings>) => void | Promise<void>;
-  modelLoadParams: () => Record<string, unknown>;
-  /** Per-model Local Model configs keyed by GGUF path (`"default"` = global). */
-  localModelConfigs: Record<string, Partial<LocalModelConfig>>;
-  loadLocalModelConfigs: () => Promise<void>;
-  saveLocalModelConfig: (
-    path: string | null,
-    patch: Partial<LocalModelConfig>,
-  ) => void | Promise<void>;
-  /** Path of the currently loaded local model (null = none/remote). */
-  activeLocalModelPath: string | null;
-  /** Merged config currently in effect for the active local model. */
-  activeModelConfig: Partial<LocalModelConfig> | undefined;
-rememberLastModel: (sel: LastModelSelection) => void;
-  lastModel: LastModelSelection | null;
-  /** Startup restore of the last model: probe availability/connectivity before showing it as loaded. */
-  modelRestoreState: "idle" | "loading" | "ready" | "failed";
-  modelRestoreError: string;
-  modelPromptVisible: boolean;
-  dismissModelPrompt: () => void;
-  /** Open the "pick a model" prompt (used on send when no model is loaded). */
-  promptModelSelection: () => void;
 }
 
 export type {
@@ -131,15 +167,111 @@ export type {
 
 export const LAST_MODEL_KEY = "ai-editor.lastModel";
 
-const AppContext = createContext<AppContextValue | null>(null);
+/// Older builds wrote the provider API key into `LAST_MODEL_KEY` as plaintext.
+/// Read it once so an upgrade can hand it to the backend (which persists it in
+/// `active-remote.json`), then the caller scrubs it from localStorage.
+function legacyApiKeyFromStorage(): string {
+  try {
+    const raw = localStorage.getItem(LAST_MODEL_KEY);
+    if (!raw) return "";
+    const parsed = JSON.parse(raw) as { apiKey?: unknown };
+    return typeof parsed?.apiKey === "string" ? parsed.apiKey : "";
+  } catch {
+    return "";
+  }
+}
 
+function scrubLegacyApiKey(): void {
+  try {
+    const raw = localStorage.getItem(LAST_MODEL_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as Record<string, unknown> | null;
+    if (parsed && typeof parsed === "object" && "apiKey" in parsed) {
+      delete parsed.apiKey;
+      localStorage.setItem(LAST_MODEL_KEY, JSON.stringify(parsed));
+    }
+  } catch {
+    // storage unavailable — nothing to scrub
+  }
+}
+
+const ShellContext = createContext<ShellValue | null>(null);
+const ModelContext = createContext<ModelValue | null>(null);
+const AgentSettingsContext = createContext<AgentSettingsValue | null>(null);
+const ChatContext = createContext<ChatValue | null>(null);
+const ContextPaneContext = createContext<ContextPaneValue | null>(null);
+
+function useDomain<T>(ctx: React.Context<T | null>, name: string): T {
+  const value = useContext(ctx);
+  if (!value) throw new Error(`${name} must be used within AppProvider`);
+  return value;
+}
+
+/** Shell/chrome state: theme, sidebar, panels, workspace path, backend link. */
+export function useShell() {
+  return useDomain(ShellContext, "useShell");
+}
+
+/** Model + LLM state: loaded model, load progress, settings, local configs. */
+export function useModel() {
+  return useDomain(ModelContext, "useModel");
+}
+
+/** Agent tunables: verify, YOLO, step/token budgets, decompose, raw settings. */
+export function useAgentSettings() {
+  return useDomain(AgentSettingsContext, "useAgentSettings");
+}
+
+/** Conversation state: messages, streaming flag, drafts, history, activity log. */
+export function useChat() {
+  return useDomain(ChatContext, "useChat");
+}
+
+/** Pinned context: context paths, context-window state, active editor buffer. */
+export function useContextPane() {
+  return useDomain(ContextPaneContext, "useContextPane");
+}
+
+/**
+ * Merged view of every domain. Prefer the focused hooks above so a component
+ * only re-renders for the state it actually reads; this hook re-renders on any
+ * domain change and exists for components that genuinely span all of them.
+ */
 export function useApp() {
-  const ctx = useContext(AppContext);
-  if (!ctx) throw new Error("useApp must be used within AppProvider");
-  return ctx;
+  return {
+    ...useShell(),
+    ...useModel(),
+    ...useAgentSettings(),
+    ...useChat(),
+    ...useContextPane(),
+  };
 }
 
 const DARK_THEMES = new Set(["dark", "midnight", "ocean", "forest"]);
+
+const RECENT_PROJECTS_KEY = "ai-editor.recentProjects";
+
+function readRecentProjects(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_PROJECTS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordRecentProject(path: string, prev: string[]): string[] {
+  if (!path) return prev;
+  const next = [path, ...prev.filter((p) => p !== path)].slice(0, 8);
+  try {
+    localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next));
+  } catch {
+    void 0;
+  }
+  return next;
+}
+
 
 function applyTheme(theme: string) {
   const root = document.documentElement;
@@ -171,6 +303,9 @@ const [modelLoading, setModelLoading] = useState(false);
     port: null,
   });
   const [projectPath, setProjectPathState] = useState(() => localStorage.getItem("projectPath") || "");
+  const [recentProjects, setRecentProjects] = useState<string[]>(readRecentProjects);
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
+  const [indexing, setIndexing] = useState(false);
   const [backendConnected, setBackendConnected] = useState(false);
 const [isProcessing, setIsProcessing] = useState(false);
   const [verify, setVerifyState] = useState(true);
@@ -179,6 +314,14 @@ const [isProcessing, setIsProcessing] = useState(false);
     const raw = Number(localStorage.getItem("ai-editor.maxSteps"));
     return Number.isFinite(raw) && raw >= 1 && raw <= 20 ? raw : 12;
   });
+  const [tokenBudget, setTokenBudgetState] = useState(() => {
+    const raw = Number(localStorage.getItem("ai-editor.tokenBudget"));
+    return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+  });
+  const [decompose, setDecomposeState] = useState(false);
+  const [preferChatComplete, setPreferChatCompleteState] = useState(
+    () => localStorage.getItem("ai-editor.preferChatComplete") === "true",
+  );
   const [hitlGate, setHitlGateState] = useState<{ requestId: string; reason: string } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [activityLog, setActivityLog] = useState<ActivityLogEntry[]>([]);
@@ -188,6 +331,8 @@ const [isProcessing, setIsProcessing] = useState(false);
   const [contextState, setContextStateRaw] = useState<ContextState>(defaultContextState);
   const [activeFile, setActiveFile] = useState<ActiveFileBuffer | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const bumpHistory = useCallback(() => setHistoryVersion((v) => v + 1), []);
   const [currentConversationId, setCurrentConversation] = useState<string | null>(null);
   const [settings, setSettings] = useState<Record<string, unknown>>({});
   const [llmSettings, setLlmSettings] = useState<LlmSettings>({});
@@ -200,7 +345,6 @@ const [isProcessing, setIsProcessing] = useState(false);
       return null;
     }
   });
-const chatAbortRef = useRef<AbortController | null>(null);
   const restoreStartedRef = useRef(false);
   const [modelRestoreState, setModelRestoreState] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const [modelRestoreError, setModelRestoreError] = useState("");
@@ -266,9 +410,18 @@ useEffect(() => { applyTheme(theme); localStorage.setItem("theme", theme); }, [t
           setModelLoading(false);
           setModelLoadProgress(null);
           setModelLoadStage("");
-          refresh();
+          refreshServerStatus();
           if (data && typeof data === "object" && "nCtxTrain" in data) {
             setModelMeta(data as unknown as ModelInfo);
+          }
+        },
+        onIndexProgress: (data) => {
+          const d = data as { phase?: string; status?: IndexStatus };
+          if (d.phase === "start") {
+            setIndexing(true);
+          } else if (d.phase === "done") {
+            setIndexing(false);
+            if (d.status) setIndexStatus(d.status);
           }
         },
       })
@@ -316,7 +469,18 @@ setModelMeta(null);
   const setProjectPath = useCallback((p: string) => {
     setProjectPathState(p);
     localStorage.setItem("projectPath", p);
+    setRecentProjects((prev) => recordRecentProject(p, prev));
   }, []);
+
+  const reindex = useCallback(() => {
+    if (!projectPath) return;
+    setIndexing(true);
+    api
+      .indexRebuild(projectPath)
+      .then((st) => setIndexStatus(st))
+      .catch(() => {})
+      .finally(() => setIndexing(false));
+  }, [projectPath]);
 
   const addMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, { ...msg, ts: msg.ts || Date.now() }]);
@@ -325,19 +489,38 @@ setModelMeta(null);
   const updateLastMessage = useCallback((update: MessageUpdate | ((prev: string) => string)) => {
     setMessages((prev) => {
       if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
+      let idx = -1;
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].role === "assistant" && prev[i].streaming) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].role === "assistant") {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx < 0) idx = prev.length - 1;
+      const last = prev[idx];
       let updated: ChatMessage;
       if (typeof update === "function") {
-        updated = { ...last, content: update(last.content) };
+        updated = { ...last, content: update(last.content ?? "") };
       } else {
         const content =
           typeof update.content === "function"
-            ? update.content(last.content)
+            ? update.content(last.content ?? "")
             : update.content ?? last.content;
         const { content: _drop, ...rest } = update;
         updated = { ...last, ...rest, content };
       }
-      return [...prev.slice(0, -1), updated];
+      if (updated === last) return prev;
+      const next = [...prev];
+      next[idx] = updated;
+      return next;
     });
   }, []);
 
@@ -376,6 +559,27 @@ setModelMeta(null);
     }
   }, []);
 
+  const setTokenBudget = useCallback((v: number) => {
+    const clamped = Math.max(0, Math.round(v));
+    setTokenBudgetState(clamped);
+    try {
+      localStorage.setItem("ai-editor.tokenBudget", String(clamped));
+    } catch {
+      // storage unavailable — skip persistence
+    }
+  }, []);
+
+  const setDecompose = useCallback((v: boolean) => setDecomposeState(v), []);
+
+  const setPreferChatComplete = useCallback((v: boolean) => {
+    setPreferChatCompleteState(v);
+    try {
+      localStorage.setItem("ai-editor.preferChatComplete", String(v));
+    } catch {
+      // storage unavailable — skip persistence
+    }
+  }, []);
+
   const setHitlGate = useCallback(
     (gate: React.SetStateAction<{ requestId: string; reason: string } | null>) => {
       setHitlGateState(gate);
@@ -401,13 +605,20 @@ setModelMeta(null);
   }, []);
 
   const newChatSession = useCallback(() => {
+    // A new chat is its own conversation. Stop any in-flight run first so a
+    // live stream can't keep writing into the transcript we're about to clear,
+    // then mint a fresh chat id so the next turn opens its own named log
+    // (`sessions/<key>/<chat>.jsonl`) instead of appending to the shared
+    // default chat (`sessions/<key>.jsonl`).
+    void api.abortAgentExecution().catch(() => {});
+    setIsProcessing(false);
     setMessages([]);
     setActivityLog([]);
-    setCurrentConversation(null);
+    setCurrentConversation(`${projectPath}::${newChatId()}`);
     setComposerDraft("");
     setActiveFile(null);
     clearContext();
-  }, [clearContext]);
+  }, [clearContext, projectPath]);
 
   const [loadingConversation, setLoadingConversation] = useState(false);
 
@@ -416,7 +627,9 @@ setModelMeta(null);
       const { project, chatId } = splitConversationId(conversationId);
       setLoadingConversation(true);
       try {
-        const records = await api.sessionLoad(project, chatId);
+        // `default` is a UI-only sentinel; the backend addresses the flat
+        // log with a null chat id.
+        const records = await api.sessionLoad(project, chatIdForInvoke(chatId));
         const messages = records
           .map((r) => recordToMessage(r))
           .filter((m): m is NonNullable<typeof m> => m !== null)
@@ -539,9 +752,20 @@ const saveLlmSettings = useCallback((patch: Partial<LlmSettings>) => {
   }, [yolo]);
 
   useEffect(() => {
-    if (!isTauriRuntime() || !projectPath) return;
+    if (!isTauriRuntime()) return;
+    if (!projectPath) {
+      api.stopFileWatcher().catch(() => {});
+      return;
+    }
     api.agentSetWorkspace(projectPath).catch(() => {});
     api.contextSetSystemPrompt(buildSystemPrompt(currentMode, modelMeta?.nParams)).catch(() => {});
+    api.startFileWatcher(projectPath).catch(() => {});
+    setIndexing(true);
+    api
+      .indexRebuild(projectPath)
+      .then((st) => setIndexStatus(st))
+      .catch(() => {})
+      .finally(() => setIndexing(false));
   }, [projectPath, currentMode, modelMeta?.nParams]);
 
   useEffect(() => {
@@ -602,21 +826,32 @@ useEffect(() => {
           setModelProvider("Local");
         } else {
           if (!lastModel.baseUrl) throw new Error("No provider URL was saved for the last model.");
-          if (!lastModel.apiKey) throw new Error("No API key was saved for the last model.");
+          // The API key is never written to localStorage: pull it (and the
+          // authoritative endpoint/model) from the backend's active-remote file.
+          // Fall back once to a legacy localStorage key so upgrades are seamless.
+          const saved = await api.remoteConfigLoad();
+          const apiKey = saved ? String(saved.apiKey ?? "") : legacyApiKeyFromStorage();
+          const baseUrl = saved ? String(saved.baseUrl ?? lastModel.baseUrl) : lastModel.baseUrl;
+          const provider = saved ? String(saved.provider ?? lastModel.provider) : lastModel.provider;
+          const model = saved ? String(saved.model ?? lastModel.name) : lastModel.name;
+          if (!apiKey) throw new Error("No API key was saved for the last model.");
           // Probe the provider (base URL + API key) before loading: only
           // reconnect the last remote model if the connection is actually live.
           await api.listRemoteModels({
-            provider: lastModel.provider,
-            baseUrl: lastModel.baseUrl,
-            apiKey: lastModel.apiKey,
+            provider,
+            baseUrl,
+            apiKey,
           });
           await api.configureRemoteModel({
-            provider: lastModel.provider,
-            baseUrl: lastModel.baseUrl,
-            apiKey: lastModel.apiKey,
-            model: lastModel.name,
+            provider,
+            baseUrl,
+            apiKey,
+            model,
           });
-          setModelName(lastModel.name);
+          // Key is now safely in the backend's active-remote.json — drop the
+          // legacy plaintext copy from localStorage.
+          scrubLegacyApiKey();
+          setModelName(model);
           setModelProvider(lastModel.providerLabel);
         }
         const fresh = await api.modelStatus().catch(() => null);
@@ -637,43 +872,114 @@ useEffect(() => {
     })();
   }, [lastModel, modelLoadParams, addActivity]);
 
-  const value: AppContextValue = {
-    theme, setTheme,
-    sidebarCollapsed, toggleSidebar,
-    historyPanelOpen, setHistoryPanelOpen, toggleHistoryPanel,
-    modelName, modelProvider, setModelInfo,
-    modelMeta, setModelMeta: setModelMetaSafe,
-    modelLoading, modelLoadProgress, modelLoadStage, unloadModel,
-    apiServerStatus,
-    projectPath, setProjectPath,
-    backendConnected, setBackendConnected,
-isProcessing, setProcessing: setIsProcessing,
-    verify, setVerify,
-    yolo, setYolo,
-    maxSteps, setMaxSteps,
-    hitlGate, setHitlGate,
-    messages, addMessage, updateLastMessage, clearMessages, truncateMessages,
-    activityLog, addActivity, clearActivity,
-    composerDraft, setComposerDraft,
-    currentMode, setMode,
-    contextPaths, addContextPath, removeContextPath,
-    contextState, setContextState, clearContext,
-    activeFile, setActiveFile,
-    conversations, setConversations,
-    currentConversationId, setCurrentConversation,
-    newChatSession,
-    loadConversation,
-    loadingConversation,
-    chatAbortRef,
-    settings, setSettings,
-llmSettings, loadLlmSettings, saveLlmSettings, modelLoadParams,
-    localModelConfigs, loadLocalModelConfigs, saveLocalModelConfig,
-    activeLocalModelPath, activeModelConfig,
-rememberLastModel, lastModel,
-    modelRestoreState, modelRestoreError, modelPromptVisible, dismissModelPrompt,
-    promptModelSelection,
-  };
+  const shellValue = useMemo<ShellValue>(
+    () => ({
+      theme, setTheme,
+      sidebarCollapsed, toggleSidebar,
+      historyPanelOpen, setHistoryPanelOpen, toggleHistoryPanel,
+      projectPath, setProjectPath,
+      indexStatus, indexing, reindex,
+      recentProjects,
+      backendConnected, setBackendConnected,
+      hitlGate, setHitlGate,
+    }),
+    [
+      theme, setTheme, sidebarCollapsed, toggleSidebar,
+      historyPanelOpen, setHistoryPanelOpen, toggleHistoryPanel,
+      projectPath, setProjectPath, indexStatus, indexing, reindex,
+      recentProjects,
+      backendConnected, setBackendConnected,
+      hitlGate, setHitlGate,
+    ],
+  );
 
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+  const modelValue = useMemo<ModelValue>(
+    () => ({
+      modelName, modelProvider, setModelInfo,
+      modelMeta, setModelMeta: setModelMetaSafe,
+      modelLoading, modelLoadProgress, modelLoadStage, unloadModel,
+      apiServerStatus,
+      llmSettings, loadLlmSettings, saveLlmSettings, modelLoadParams,
+      localModelConfigs, loadLocalModelConfigs, saveLocalModelConfig,
+      activeLocalModelPath, activeModelConfig,
+      rememberLastModel, lastModel,
+      modelRestoreState, modelRestoreError, modelPromptVisible, dismissModelPrompt,
+      promptModelSelection,
+    }),
+    [
+      modelName, modelProvider, setModelInfo, modelMeta, setModelMetaSafe,
+      modelLoading, modelLoadProgress, modelLoadStage, unloadModel,
+      apiServerStatus, llmSettings, loadLlmSettings, saveLlmSettings, modelLoadParams,
+      localModelConfigs, loadLocalModelConfigs, saveLocalModelConfig,
+      activeLocalModelPath, activeModelConfig, rememberLastModel, lastModel,
+      modelRestoreState, modelRestoreError, modelPromptVisible, dismissModelPrompt,
+      promptModelSelection,
+    ],
+  );
+
+  const agentSettingsValue = useMemo<AgentSettingsValue>(
+    () => ({
+      verify, setVerify,
+      yolo, setYolo,
+      maxSteps, setMaxSteps,
+      tokenBudget, setTokenBudget,
+      decompose, setDecompose,
+      preferChatComplete, setPreferChatComplete,
+      settings, setSettings,
+    }),
+    [
+      verify, setVerify, yolo, setYolo, maxSteps, setMaxSteps,
+      tokenBudget, setTokenBudget, decompose, setDecompose,
+      preferChatComplete, setPreferChatComplete, settings, setSettings,
+    ],
+  );
+
+  const chatValue = useMemo<ChatValue>(
+    () => ({
+      messages, addMessage, updateLastMessage, clearMessages, truncateMessages,
+      isProcessing, setProcessing: setIsProcessing,
+      composerDraft, setComposerDraft,
+      currentMode, setMode,
+      activityLog, addActivity, clearActivity,
+      conversations, setConversations,
+      historyVersion, bumpHistory,
+      currentConversationId, setCurrentConversation,
+      newChatSession, loadConversation, loadingConversation,
+    }),
+    [
+      messages, addMessage, updateLastMessage, clearMessages, truncateMessages,
+      isProcessing, setIsProcessing, composerDraft, setComposerDraft,
+      currentMode, setMode, activityLog, addActivity, clearActivity,
+      conversations, setConversations, historyVersion, bumpHistory,
+      currentConversationId, setCurrentConversation,
+      newChatSession, loadConversation, loadingConversation,
+    ],
+  );
+
+  const contextPaneValue = useMemo<ContextPaneValue>(
+    () => ({
+      contextPaths, addContextPath, removeContextPath,
+      contextState, setContextState, clearContext,
+      activeFile, setActiveFile,
+    }),
+    [
+      contextPaths, addContextPath, removeContextPath,
+      contextState, setContextState, clearContext, activeFile, setActiveFile,
+    ],
+  );
+
+  return (
+    <ShellContext.Provider value={shellValue}>
+      <ModelContext.Provider value={modelValue}>
+        <AgentSettingsContext.Provider value={agentSettingsValue}>
+          <ChatContext.Provider value={chatValue}>
+            <ContextPaneContext.Provider value={contextPaneValue}>
+              {children}
+            </ContextPaneContext.Provider>
+          </ChatContext.Provider>
+        </AgentSettingsContext.Provider>
+      </ModelContext.Provider>
+    </ShellContext.Provider>
+  );
 }
 

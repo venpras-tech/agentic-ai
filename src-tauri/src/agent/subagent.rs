@@ -184,6 +184,44 @@ pub fn child_never() -> Vec<&'static str> {
     super::registry::parent_only_names()
 }
 
+/// The tools a child running as `profile` may call, expressed as a name list.
+///
+/// Derived from [`tool_allowed`] — the exact predicate [`child_verdict`] applies
+/// at dispatch — so the catalog advertised to a remote child can never offer a
+/// tool its own gate would reject (and never omit one it would allow).
+pub fn child_allowed_tools(profile: &str) -> Vec<&'static str> {
+    super::registry::all_names()
+        .into_iter()
+        .filter(|name| tool_allowed(profile, name))
+        .collect()
+}
+
+/// The tools the **parent** agent loop may call under the given mode + workflow.
+///
+/// This is the same predicate the parent dispatch gate applies
+/// (`tool_allowed` for the mode, `workflow_child_tool_verdict` for the
+/// workflow), expressed as a name list so it can also build the tool catalog
+/// advertised to a remote provider. Catalog and enforcement are derived from
+/// one function so a model can never be offered a tool the gate would reject.
+pub fn parent_allowed_tools(mode: Option<&str>, workflow: Option<&str>) -> Vec<&'static str> {
+    super::registry::all_names()
+        .into_iter()
+        .filter(|name| {
+            if let Some(m) = mode.filter(|m| !m.trim().is_empty()) {
+                if !tool_allowed(m, name) {
+                    return false;
+                }
+            }
+            if let Some(wf) = workflow.filter(|w| !w.trim().is_empty()) {
+                if workflow_child_tool_verdict(wf, name).is_some() {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// Policy hook: when called from INSIDE a subagent loop (depth ≥ 1), deny
 /// tools the running profile may not use. Returns `None` when no restriction
 /// applies (parent context or allowed call) so the normal gates proceed.
@@ -369,12 +407,23 @@ pub fn builtin_modes() -> Vec<Mode> {
             name: name.to_string(),
             description: match name {
                 "ask" => "Read-only Q&A: inspect the codebase and answer, no edits.".to_string(),
-                "debug" => "Debug: reproduce, diagnose from evidence, then propose a fix.".to_string(),
-                "edit" => "Code-Edit-Only: read, edit files, run checks — no terminal or git writes.".to_string(),
+                "debug" => {
+                    "Debug: reproduce, diagnose from evidence, then propose a fix.".to_string()
+                }
+                "edit" => {
+                    "Code-Edit-Only: read, edit files, run checks — no terminal or git writes."
+                        .to_string()
+                }
                 _ => String::new(),
             },
-            system_prompt: builtin_mode_system_prompt(name).unwrap_or_default().to_string(),
-            allowed_tools: builtin_mode_tools(name).unwrap_or_default().into_iter().map(str::to_string).collect(),
+            system_prompt: builtin_mode_system_prompt(name)
+                .unwrap_or_default()
+                .to_string(),
+            allowed_tools: builtin_mode_tools(name)
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             allowed_globs: None,
             model_override: None,
         })
@@ -638,7 +687,13 @@ fn glob_match(pat: &str, text: &str) -> bool {
     psegs.iter().zip(tsegs.iter()).all(|(p, t)| seg_match(p, t))
 }
 
-fn glob_with_doublestar(psegs: &[&str], tsegs: &[&str], pi: usize, ti: usize, depth: usize) -> bool {
+fn glob_with_doublestar(
+    psegs: &[&str],
+    tsegs: &[&str],
+    pi: usize,
+    ti: usize,
+    depth: usize,
+) -> bool {
     if depth > tsegs.len() {
         return false;
     }
@@ -925,7 +980,10 @@ mod tests {
         assert!(names.contains(&"debug"));
         assert!(tool_allowed("debug", "run_tests"));
         assert!(tool_allowed("debug", "read_file_range"));
-        assert!(!tool_allowed("debug", "write_file"), "debug is not an editor");
+        assert!(
+            !tool_allowed("debug", "write_file"),
+            "debug is not an editor"
+        );
     }
 
     #[test]
@@ -978,8 +1036,9 @@ mod tests {
         let implement = tool_catalog_markdown("implement");
         assert!(implement.contains("`apply_file_diff`"));
         assert!(implement.contains("`run_tests`"));
-        // Optional params are marked with `?`.
-        assert!(implement.contains("timeout_secs?(integer)"));
+        // Optional params are marked with `?`, and use the camelCase name the
+        // `ToolCall` deserializer actually accepts.
+        assert!(implement.contains("timeoutSecs?(integer)"));
 
         let review = tool_catalog_markdown("review");
         assert!(review.contains("`git_status`"));
@@ -1025,7 +1084,10 @@ mod tests {
         assert_eq!(mode.name, "my-mode");
         assert_eq!(mode.description, "A test mode");
         assert_eq!(mode.system_prompt, "Do the thing.");
-        assert_eq!(mode.allowed_tools, vec!["read_file_chars", "glob_search_codebase"]);
+        assert_eq!(
+            mode.allowed_tools,
+            vec!["read_file_chars", "glob_search_codebase"]
+        );
         assert_eq!(mode.allowed_globs, Some(vec!["*.rs".into(), "*.ts".into()]));
         assert_eq!(mode.model_override.as_deref(), Some("my-model"));
 
@@ -1165,7 +1227,12 @@ mod tests {
         .unwrap();
         let modes = load_modes(&root);
         assert_eq!(
-            modes.iter().find(|m| m.name == "fast").unwrap().model_override.as_deref(),
+            modes
+                .iter()
+                .find(|m| m.name == "fast")
+                .unwrap()
+                .model_override
+                .as_deref(),
             Some("fast-gguf.gguf")
         );
         register_modes(&modes);
@@ -1174,8 +1241,10 @@ mod tests {
         assert!(current_mode_model_override().is_none());
 
         // In parent context (depth 0, no profile) → None.
-        let _g = enter_child(build_mode_profile(modes.iter().find(|m| m.name == "fast").unwrap()))
-            .unwrap();
+        let _g = enter_child(build_mode_profile(
+            modes.iter().find(|m| m.name == "fast").unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             current_mode_model_override().as_deref(),
             Some("fast-gguf.gguf")

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import { useApp } from "../context/AppContext";
+import { useContextPane, useShell } from "../context/AppContext";
+import { api, type IndexSearchHit } from "../lib/ipc";
 import "./ContextSelector.css";
 
 function ContextSelector() {
@@ -7,10 +8,28 @@ function ContextSelector() {
     contextPaths,
     contextState,
     removeContextPath,
+    addContextPath,
     setContextState,
-  } = useApp();
+  } = useContextPane();
+  const { projectPath, indexStatus } = useShell();
 
   const [showPanel, setShowPanel] = useState(false);
+  const [cbQuery, setCbQuery] = useState("");
+  const [cbResults, setCbResults] = useState<IndexSearchHit[]>([]);
+  const [cbBusy, setCbBusy] = useState(false);
+
+  const runCodebaseSearch = async () => {
+    if (!projectPath || !cbQuery.trim()) return;
+    setCbBusy(true);
+    try {
+      const hits = await api.indexSearch(projectPath, cbQuery.trim(), 20);
+      setCbResults(hits);
+    } catch {
+      setCbResults([]);
+    } finally {
+      setCbBusy(false);
+    }
+  };
 
   useEffect(() => {
     const open = () => setShowPanel(true);
@@ -73,13 +92,58 @@ function ContextSelector() {
         {contextState.codebase && (
           <div className="context-chip context-chip-tag" data-type="codebase">
             <span>@Codebase</span>
+            <span className="context-chip-status" title={indexStatus?.lastBuilt ? `Indexed ${new Date(indexStatus.lastBuilt).toLocaleString()}` : undefined}>
+              {indexStatus ? `${indexStatus.indexedFiles.toLocaleString()} files` : "not indexed"}
+            </span>
             <button
               type="button"
               className="context-chip-remove"
               onClick={() => setContextState({ codebase: false })}
+              title="Remove from context"
             >
               ×
             </button>
+          </div>
+        )}
+
+        {contextState.codebase && projectPath && (
+          <div className="context-codebase-search">
+            <input
+              className="context-codebase-input"
+              value={cbQuery}
+              placeholder="Search workspace index…"
+              onChange={(e) => setCbQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void runCodebaseSearch();
+              }}
+            />
+            <button
+              type="button"
+              className="context-codebase-go"
+              onClick={() => void runCodebaseSearch()}
+              disabled={cbBusy || !cbQuery.trim()}
+            >
+              {cbBusy ? "…" : "Go"}
+            </button>
+            {cbResults.length > 0 && (
+              <div className="context-codebase-results">
+                {cbResults.map((hit, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    className="context-codebase-hit"
+                    onClick={() => {
+                      addContextPath(hit.path);
+                      setCbResults([]);
+                      setCbQuery("");
+                    }}
+                    title={`Add ${hit.path}:${hit.lineNumber} to context`}
+                  >
+                    {hit.path}:{hit.lineNumber}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

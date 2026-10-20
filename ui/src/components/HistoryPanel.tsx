@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
-import { useApp } from "../context/AppContext";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { useChat, useShell } from "../context/AppContext";
 import { api } from "../lib/ipc";
-import { newChatId, splitConversationId } from "../lib/sessionLog";
+import { isDefaultChat, newChatId, splitConversationId } from "../lib/sessionLog";
 import "./HistoryPanel.css";
 
 function HistoryPanel() {
@@ -10,13 +10,32 @@ function HistoryPanel() {
     setConversations,
     currentConversationId,
     setCurrentConversation,
-    historyPanelOpen,
-    setHistoryPanelOpen,
     loadConversation,
     loadingConversation,
-  } = useApp();
+    historyVersion,
+  } = useChat();
+  const { historyPanelOpen, setHistoryPanelOpen } = useShell();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+
+  // The backend refuses to fork or delete the base chat, and addressing it as
+  // `sessions/<key>/default.jsonl` would silently hit a file that does not
+  // exist. Reflect that in the UI instead of offering an action that quietly
+  // does nothing.
+  // Compare by chat id only: a freshly minted conversation is addressed with
+  // its raw project path, while the history row carries the backend's
+  // sanitized project key, so a full-id compare would never match.
+  const activeChatId = useMemo(
+    () => (currentConversationId ? splitConversationId(currentConversationId).chatId : null),
+    [currentConversationId],
+  );
+
+  const selectedCanMutate = useMemo(
+    () =>
+      Array.from(selectedIds).length > 0 &&
+      Array.from(selectedIds).every((id) => !isDefaultChat(id)),
+    [selectedIds],
+  );
 
   const fetchHistory = useCallback(async () => {
     try {
@@ -39,9 +58,12 @@ function HistoryPanel() {
     }
   }, [setConversations]);
 
+  // Refetch when the panel opens and whenever a turn is persisted. Without the
+  // second trigger a chat saved during this session stays invisible until the
+  // panel is closed and reopened.
   useEffect(() => {
     if (historyPanelOpen) fetchHistory();
-  }, [historyPanelOpen, fetchHistory]);
+  }, [historyPanelOpen, historyVersion, fetchHistory]);
 
   const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.checked) {
@@ -70,7 +92,7 @@ function HistoryPanel() {
   /** Branch the selected chat into a new one, copying its transcript. */
   const handleFork = async () => {
     const id = Array.from(selectedIds)[0];
-    if (!id || busy) return;
+    if (!id || busy || isDefaultChat(id)) return;
     setBusy(true);
     try {
       const { project, chatId } = splitConversationId(id);
@@ -86,7 +108,11 @@ function HistoryPanel() {
   };
 
   const handleDelete = async () => {
-    const ids = Array.from(selectedIds);
+    const ids = Array.from(selectedIds).filter((id) => !isDefaultChat(id));
+    if (ids.length === 0) {
+      setSelectedIds(new Set());
+      return;
+    }
     for (const id of ids) {
       try {
         const { project, chatId } = splitConversationId(id);
@@ -148,8 +174,12 @@ function HistoryPanel() {
               type="button"
               className="btn-history-delete"
               onClick={() => void handleFork()}
-              disabled={selectedIds.size !== 1 || busy}
-              title="Branch this chat into a new one"
+              disabled={selectedIds.size !== 1 || busy || !selectedCanMutate}
+              title={
+                selectedCanMutate
+                  ? "Branch this chat into a new one"
+                  : "The base chat cannot be forked"
+              }
             >
               Fork
             </button>
@@ -157,7 +187,8 @@ function HistoryPanel() {
               type="button"
               className="btn-history-delete"
               onClick={() => void handleDelete()}
-              disabled={selectedIds.size === 0}
+              disabled={selectedIds.size === 0 || !selectedCanMutate}
+              title={selectedCanMutate ? undefined : "The base chat cannot be deleted"}
             >
               Delete
             </button>
@@ -175,7 +206,7 @@ function HistoryPanel() {
                 {groupedConversations[key].map((conv) => (
                   <label
                     key={conv.id}
-                    className={`history-item-wrap ${conv.id === currentConversationId ? "active" : ""}`}
+                    className={`history-item-wrap ${activeChatId && splitConversationId(conv.id).chatId === activeChatId ? "active" : ""}`}
                   >
                     <input
                       type="checkbox"
@@ -185,7 +216,15 @@ function HistoryPanel() {
                     />
                     <span
                       className="history-item-text"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => handleConversationClick(conv.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          handleConversationClick(conv.id);
+                        }
+                      }}
                     >
                       {conv.title || "New chat"}
                     </span>

@@ -1,103 +1,122 @@
-import { useEffect, useRef, useState } from "react";
-import { useApp } from "../context/AppContext";
-import MessageList from "../components/MessageList";
-import ActivityPanel from "../components/ActivityPanel";
-import HitlGateway from "../components/chat/HitlGateway";
-import AgentTimeline from "../components/chat/AgentTimeline";
-import { PermissionPrompt, QuestionPrompt } from "../components/chat/PermissionPrompt";
-import { useAgentStream } from "../hooks/useAgentStream";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useChat, useModel, useContextPane } from "../context/AppContext";
+import AgentChatSurface from "../components/AgentChatSurface";
+import { useAgentStreamContext } from "../context/AgentStreamContext";
+import { exportConversation, ExportError, type ExportFormat } from "../lib/exportChat";
+import { workspaceSuggestions } from "../lib/emptyState";
 import "./ChatPage.css";
 
-const welcomeSuggestions = [
-  { label: "Add a login form", prompt: "Add a login form to the app" },
-  { label: "Find auth logic", prompt: "Find where authentication is handled" },
-  { label: "Run tests & fix", prompt: "Run the test suite and fix any failures" },
-];
-
 function ChatPage() {
-  const { messages, activityLog, modelName, modelProvider, modelLoading, modelLoadProgress,
-    modelLoadStage } = useApp();
-  const {
-    liveTools,
-    hitlGate,
-    resolveGate,
-    planSteps,
-    todos,
-    subtasks,
-    bgTasks,
-    abortBackgroundTask,
-    permission,
-    respondPermission,
-    question,
-    respondQuestion,
-  } = useAgentStream();
-  const [activityCollapsed, setActivityCollapsed] = useState(false);
-  const [stickBottom, setStickBottom] = useState(true);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const { messages } = useChat();
+  const { modelName, modelProvider, modelLoading, modelLoadProgress, modelLoadStage } = useModel();
+  const { liveTools } = useAgentStreamContext();
+  const { activeFile } = useContextPane();
+  const welcomeSuggestions = useMemo(() => workspaceSuggestions(activeFile), [activeFile]);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("pdf");
+  const [exportToast, setExportToast] = useState<{ text: string; error?: boolean } | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    const el = containerRef.current;
-    if (el && stickBottom) {
-      el.scrollTop = el.scrollHeight;
+  const notify = useCallback((text: string, error?: boolean) => {
+    setExportToast({ text, error });
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setExportToast(null), 3200);
+  }, []);
+
+  const exportChat = useCallback(async () => {
+    if (messages.length === 0) return;
+    const firstUser = messages.find((m) => m.role === "user");
+    const title = firstUser ? firstUser.content.slice(0, 60).replace(/\n/g, " ") : "Chat Export";
+    try {
+      const filename = await exportConversation({ messages, title, format: exportFormat });
+      notify(`Exported ${filename}`);
+    } catch (err) {
+      notify(err instanceof ExportError ? err.message : `Export failed: ${String(err)}`, true);
     }
-  }, [messages, stickBottom]);
-
-  const handleContainerScroll = () => {
-    const el = containerRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    setStickBottom(nearBottom);
-  };
+  }, [messages, exportFormat, notify]);
 
   const applySuggestion = (prompt: string) => {
     window.dispatchEvent(new CustomEvent("vencoder-prefill-composer", { detail: prompt }));
   };
 
-  return (
-    <div className="chat-content">
-      {hitlGate && (
-        <HitlGateway
-          reason={hitlGate.reason}
-          onApprove={() => void resolveGate(true)}
-          onDeny={() => void resolveGate(false)}
-        />
-      )}
-      {permission && <PermissionPrompt request={permission} onDecide={(d) => void respondPermission(d)} />}
-      {question && <QuestionPrompt request={question} onAnswer={(a) => void respondQuestion(a)} />}
-      {(modelLoading || modelName) && (
-        <div className={`chat-model-banner${modelLoading ? " loading" : ""}`}>
-          {modelLoading ? (
-            <>
-              <span className="chat-model-spinner" />
-              <span className="chat-model-banner-text">
-                {modelLoadProgress != null ? `Loading model… ${Math.round(modelLoadProgress * 100)}%` : `Loading model (${modelLoadStage || "init"})…`}
-              </span>
-              {modelLoadProgress != null && (
-                <span className="chat-model-track"><span className="chat-model-fill" style={{ width: `${Math.min(100, Math.max(0, Math.round(modelLoadProgress * 100)))}%` }} /></span>
-              )}
-            </>
-          ) : (
-            <>
-              <span className="chat-model-dot" />
-              <span className="chat-model-banner-text">{modelName || "Model"}<span className="chat-model-provider">{modelProvider ? ` · ${modelProvider}` : ""}</span></span>
-            </>
+  const hasModel = modelLoading || Boolean(modelName);
+  const showBar = hasModel || messages.length > 0;
+
+  const modelBanner = showBar && (
+    <div className={`chat-model-banner${modelLoading ? " loading" : ""}`}>
+      {modelLoading ? (
+        <>
+          <span className="chat-model-spinner" />
+          <span className="chat-model-banner-text">
+            {modelLoadProgress != null
+              ? `Loading model… ${Math.round(modelLoadProgress * 100)}%`
+              : `Loading model (${modelLoadStage || "init"})…`}
+          </span>
+          {modelLoadProgress != null && (
+            <span className="chat-model-track">
+              <span
+                className="chat-model-fill"
+                style={{
+                  width: `${Math.min(100, Math.max(0, Math.round(modelLoadProgress * 100)))}%`,
+                }}
+              />
+            </span>
           )}
+        </>
+      ) : modelName ? (
+        <>
+          <span className="chat-model-dot" />
+          <span className="chat-model-banner-text">
+            {modelName}
+            <span className="chat-model-provider">
+              {modelProvider ? ` · ${modelProvider}` : ""}
+            </span>
+          </span>
+        </>
+      ) : (
+        <span className="chat-model-banner-text" />
+      )}
+      {messages.length > 0 && (
+        <div className="chat-export-controls">
+          {exportToast && (
+            <span
+              className={`chat-export-toast${exportToast.error ? " error" : ""}`}
+              role="status"
+            >
+              {exportToast.text}
+            </span>
+          )}
+          <select
+            value={exportFormat}
+            onChange={(e) => setExportFormat(e.target.value as ExportFormat)}
+            className="chat-export-select"
+            aria-label="Export format"
+            title="Export format"
+          >
+            <option value="pdf">PDF</option>
+            <option value="docx">DOCX</option>
+            <option value="csv">CSV</option>
+          </select>
+          <button
+            type="button"
+            className="chat-export-btn"
+            onClick={() => void exportChat()}
+            title={`Export chat as ${exportFormat.toUpperCase()}`}
+            aria-label={`Export chat as ${exportFormat.toUpperCase()}`}
+          >
+            <span aria-hidden="true">⤓</span> export
+          </button>
         </div>
       )}
-      <ActivityPanel
-        logs={activityLog}
-        collapsed={activityCollapsed}
-        onToggle={() => setActivityCollapsed(!activityCollapsed)}
-      />
-      <AgentTimeline
-        planSteps={planSteps}
-        subtasks={subtasks}
-        todos={todos}
-        bgTasks={bgTasks}
-        onAbortBackground={(id) => void abortBackgroundTask(id)}
-      />
-      <div className="messages-container" ref={containerRef} onScroll={handleContainerScroll}>
-        {messages.length === 0 ? (
+    </div>
+  );
+
+  return (
+    <div className="chat-content">
+      <AgentChatSurface
+        messages={messages}
+        liveTools={liveTools}
+        scrollClassName="messages-container"
+        emptyState={
           <div className="chat-welcome">
             <h2 className="chat-welcome-title">What can I build?</h2>
             <p className="chat-welcome-text">
@@ -123,26 +142,10 @@ function ChatPage() {
               <kbd className="chat-kbd">/</kbd> commands
             </div>
           </div>
-        ) : (
-          <MessageList messages={messages} liveTools={liveTools} />
-        )}
-        {!stickBottom && messages.length > 0 && (
-          <button
-            type="button"
-            className="chat-scroll-down"
-            onClick={() => {
-              const el = containerRef.current;
-              if (el) {
-                el.scrollTop = el.scrollHeight;
-                setStickBottom(true);
-              }
-            }}
-            title="Jump to latest"
-          >
-            ↓ latest
-          </button>
-        )}
-      </div>
+        }
+      >
+        {modelBanner}
+      </AgentChatSurface>
     </div>
   );
 }

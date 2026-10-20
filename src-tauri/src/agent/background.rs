@@ -5,8 +5,8 @@
 //! events flow through the same channels as foreground tasks (the frontend
 //! filters by `sessionId` to keep background turns separate from the chat).
 
-use crossbeam_channel::Sender;
 use super::ToolContext;
+use crossbeam_channel::Sender;
 
 use super::context::ContextMessage;
 use super::interrupt::InterruptState;
@@ -38,6 +38,10 @@ pub fn start_background_task(
     let (task_id, cancel) = tool_state
         .background_tasks
         .register(session_id, label.clone());
+    tool_state.background_output.bind(&task_id, session_id);
+    tool_state
+        .background_output
+        .record(session_id, &format!("started: {}", label));
 
     logging::info(
         Some(session_id),
@@ -91,6 +95,9 @@ pub fn start_background_task(
                     done: outcome.done,
                 });
                 tool_state_arc
+                    .background_output
+                    .record(session_id, "completed");
+                tool_state_arc
                     .background_tasks
                     .finish(&bg_task_id, "completed", None);
                 let _ = app_clone.emit(
@@ -109,6 +116,9 @@ pub fn start_background_task(
                     session_id,
                     message: message.clone(),
                 });
+                tool_state_arc
+                    .background_output
+                    .record(session_id, &format!("error: {message}"));
                 tool_state_arc
                     .background_tasks
                     .finish(&bg_task_id, "error", Some(message.clone()));

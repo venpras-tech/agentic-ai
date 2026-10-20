@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useApp } from "../context/AppContext";
+import { useModel } from "../context/AppContext";
 import { api } from "../lib/ipc";
 import { PROVIDERS, kindByProvider, providerKeyHint, providerUrl } from "../lib/providers";
 import DeleteModelDialog, { type DeleteModelTarget } from "../components/DeleteModelDialog";
@@ -94,7 +94,7 @@ interface LocalModel {
 }
 
 function ModelsPage() {
-  const { modelName, modelProvider, setModelInfo, modelLoadParams, rememberLastModel } = useApp();
+  const { modelName, modelProvider, setModelInfo, modelLoadParams, rememberLastModel } = useModel();
   const [selectedProvider, setSelectedProvider] = useState("local");
   const [models, setModels] = useState<LocalModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -251,7 +251,6 @@ function ModelsPage() {
           provider: kindByProvider[selectedProvider],
           providerLabel: providers.find((p) => p.id === selectedProvider)?.name || selectedProvider,
           baseUrl: baseUrlInput,
-          apiKey,
         });
       }
       setStatus("Model configured.");

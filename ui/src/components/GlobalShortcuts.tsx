@@ -1,21 +1,31 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { useApp } from "../context/AppContext";
+import { useChat, useShell } from "../context/AppContext";
 import { api } from "../lib/ipc";
 
 function GlobalShortcuts() {
   const navigate = useNavigate();
-  const {
-    isProcessing,
-    toggleHistoryPanel,
-    historyPanelOpen,
-    setHistoryPanelOpen,
-    newChatSession,
-    chatAbortRef,
-  } = useApp();
+  const { isProcessing, newChatSession, currentMode, setMode } = useChat();
+  const { toggleHistoryPanel, historyPanelOpen, setHistoryPanelOpen } = useShell();
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Shift+Tab cycles permission modes globally, except while typing in a
+      // field (the composer handles its own Shift+Tab there).
+      if (e.key === "Tab" && e.shiftKey) {
+        const el = document.activeElement as HTMLElement | null;
+        const tag = el?.tagName;
+        const editable =
+          tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable;
+        if (!editable) {
+          e.preventDefault();
+          const order = ["agent", "plan", "ask"];
+          const i = order.indexOf(currentMode);
+          setMode(order[(i + 1) % order.length] ?? "agent");
+        }
+        return;
+      }
+
       if (e.key === "Escape") {
         if (isProcessing) {
           e.preventDefault();
@@ -65,12 +75,13 @@ function GlobalShortcuts() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     isProcessing,
-    chatAbortRef,
     toggleHistoryPanel,
     setHistoryPanelOpen,
     historyPanelOpen,
     newChatSession,
     navigate,
+    currentMode,
+    setMode,
   ]);
 
   return null;

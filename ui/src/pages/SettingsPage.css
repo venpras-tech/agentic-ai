@@ -716,6 +716,7 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 14px;
   padding: 12px 14px;
   border: 1px solid var(--border-color);
@@ -743,6 +744,17 @@
   font-size: 0.9rem;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.settings-mcp-item-transport {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-hover, rgba(127, 127, 127, 0.14));
 }
 
 .settings-mcp-badge {
@@ -792,6 +804,42 @@
   align-items: center;
   gap: 8px;
 }
+
+.settings-mcp-probe {
+  flex-basis: 100%;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+  font-size: 0.78rem;
+}
+
+.settings-mcp-probe-ok {
+  color: #2da44e;
+}
+
+.settings-mcp-probe-error {
+  color: #cf222e;
+}
+
+.settings-mcp-probe-pending {
+  color: var(--text-muted);
+}
+
+.settings-mcp-probe-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 6px;
+}
+
+.settings-mcp-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 
 .settings-skill-toolbar {
   display: flex;
@@ -948,6 +996,12 @@
 
 .settings-local-server-status.on {
   color: #2e7d32;
+}
+
+.settings-local-server-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .settings-local-server-controls {

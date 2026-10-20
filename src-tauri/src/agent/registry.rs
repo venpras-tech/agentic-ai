@@ -92,7 +92,11 @@ const fn parent(name: &'static str, schema: fn() -> Value) -> ToolMeta {
 }
 
 /// Mutating (build/write) tools: not default-allow, delegated per `delegation`.
-const fn mutating(name: &'static str, delegation: SubagentAccess, schema: fn() -> Value) -> ToolMeta {
+const fn mutating(
+    name: &'static str,
+    delegation: SubagentAccess,
+    schema: fn() -> Value,
+) -> ToolMeta {
     ToolMeta {
         name,
         delegation,
@@ -376,7 +380,6 @@ pub static TOOLS: &[ToolMeta] = &[
             ),
         ])
     }),
-
     // ---- mutating / build tools ------------------------------------------
     mutating("apply_file_diff", SubagentAccess::Implement, || {
         json_schema(vec![
@@ -438,25 +441,29 @@ pub static TOOLS: &[ToolMeta] = &[
             prop("path", "string", "File or folder to delete. Folders are removed recursively; the item goes to the OS Trash so it stays recoverable."),
         ])
     }),
-    mutating("execute_terminal_command", SubagentAccess::Implement, || {
-        json_schema(vec![
-            prop(
-                "command",
-                "string",
-                "Shell command to run. Avoid destructive or interactive commands.",
-            ),
-            prop_opt(
-                "timeout_secs",
-                "integer",
-                "Timeout in seconds (1..300, default 30).",
-            ),
-            prop_opt(
-                "cwd",
-                "string",
-                "Working directory for the command (defaults to workspace root).",
-            ),
-        ])
-    }),
+    mutating(
+        "execute_terminal_command",
+        SubagentAccess::Implement,
+        || {
+            json_schema(vec![
+                prop(
+                    "command",
+                    "string",
+                    "Shell command to run. Avoid destructive or interactive commands.",
+                ),
+                prop_opt(
+                    "timeout_secs",
+                    "integer",
+                    "Timeout in seconds (1..300, default 30).",
+                ),
+                prop_opt(
+                    "cwd",
+                    "string",
+                    "Working directory for the command (defaults to workspace root).",
+                ),
+            ])
+        },
+    ),
     mutating("run_python", SubagentAccess::Implement, || {
         json_schema(vec![
             prop(
@@ -519,7 +526,6 @@ pub static TOOLS: &[ToolMeta] = &[
             prop("path", "string", "Destination path INSIDE the workspace; must not exist yet (absolute, or relative to the workspace root)."),
         ])
     }),
-
     // ---- git -----------
     mutating("git_commit", SubagentAccess::ParentOnly, || {
         json_schema(vec![prop(
@@ -557,7 +563,9 @@ pub static TOOLS: &[ToolMeta] = &[
             ),
         ])
     }),
-    mutating("git_pull", SubagentAccess::Forbidden, || json_schema(vec![])),
+    mutating("git_pull", SubagentAccess::Forbidden, || {
+        json_schema(vec![])
+    }),
     mutating("git_create_branch", SubagentAccess::Forbidden, || {
         json_schema(vec![prop(
             "name",
@@ -571,7 +579,6 @@ pub static TOOLS: &[ToolMeta] = &[
             prop_opt("body", "string", "Pull-request description (Markdown)."),
         ])
     }),
-
     // ---- plans / skills (parent-owned lifecycle) --------------------------
     mutating("create_plan", SubagentAccess::Forbidden, || {
         json_schema(vec![
@@ -614,7 +621,6 @@ pub static TOOLS: &[ToolMeta] = &[
             prop("content", "string", "Markdown body of the skill: the reusable procedure, checklist, or playbook you learned."),
         ])
     }),
-
     // ---- capabilities that were MISSING from the schema -------------------
     // Analyzer/reviewer as direct `problem` tools (read-only, never delegated
     // to children because they may spur a blocking LLM pass). Schemas are
@@ -657,7 +663,6 @@ pub static TOOLS: &[ToolMeta] = &[
             ),
         ])
     }),
-
     // ---- everything else (Forbidden for children by omission) ------------
     mutating("transcribe_audio", SubagentAccess::Forbidden, || {
         json_schema(vec![
@@ -787,11 +792,112 @@ pub fn validate(dispatcher_names: &[&str]) -> Result<(), String> {
         if !schema.is_object() {
             return Err(format!("`{}` has a malformed schema", meta.name));
         }
-        if schema.get("properties").and_then(|v| v.as_object()).is_none() {
+        if schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .is_none()
+        {
             return Err(format!("`{}` schema has no `properties` object", meta.name));
         }
     }
     Ok(())
+}
+
+/// The same catalog in OpenAI native `tools` shape, for remote providers that
+/// support structured tool calling instead of `<execute_tool>` markdown.
+///
+/// Derived from the registry so this can never advertise a tool the dispatcher
+/// does not implement. The function name is the exact snake_case name
+/// [`ToolCall::name`] produces, and the tool-name `type` tag is folded into the
+/// schema as a `const` so a well-behaved model cannot emit a mismatched tag.
+pub fn openai_tool_schemas(names: &[&str]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for name in names {
+        let Some(meta) = TOOLS.iter().find(|m| m.name == *name) else {
+            continue;
+        };
+        let mut schema = (meta.schema)();
+        if let Some(object) = schema.as_object_mut() {
+            object.insert("type".to_string(), serde_json::json!("object"));
+            let properties = object
+                .entry("properties".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(props) = properties.as_object_mut() {
+                props.insert("type".to_string(), serde_json::json!({ "const": name }));
+            }
+            // The `type` discriminator is injected by the caller, never by the
+            // model, so it must not be required.
+            if let Some(required) = object.get_mut("required").and_then(|r| r.as_array_mut()) {
+                required.retain(|r| r.as_str() != Some("type"));
+            }
+        }
+        out.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": meta.name,
+                "description": describe(meta.name, &schema),
+                "parameters": schema,
+            }
+        }));
+    }
+    out
+}
+
+/// Build a tool blurb from the schema's own property descriptions. The registry
+/// stores a description per argument (that is where the detail lives), so the
+/// summary is derived from it rather than duplicated as a second hand-maintained
+/// string that could drift.
+fn describe(name: &str, schema: &Value) -> String {
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut summary = format!("Call the `{name}` tool.");
+    if let Some(props) = props {
+        for (key, value) in props {
+            if key == "type" {
+                continue;
+            }
+            let desc = value
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .trim();
+            let marker = if required.contains(&key.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            summary.push_str(&format!("\n- `{key}` ({marker}): {desc}"));
+        }
+    }
+    summary
+}
+
+/// Rust field name → the camelCase key the model must actually emit.
+///
+/// `ToolCall` is `#[serde(rename_all = "camelCase")]`, so a payload keyed
+/// `start_line` is *silently ignored* and the required `startLine` is reported
+/// missing — the call is dropped. Renaming here keeps the advertised schema
+/// identical to what the deserializer accepts. `core::tests`' drift guard
+/// re-checks this against serde itself.
+fn wire_name(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut upper = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn json_schema(props: Vec<Value>) -> Value {
@@ -807,9 +913,9 @@ fn json_schema(props: Vec<Value>) -> Value {
         p_obj.remove("optional");
         p_obj.remove("name");
         if !is_optional {
-            required.push(name.clone());
+            required.push(wire_name(&name));
         }
-        object.insert(name, Value::Object(p_obj));
+        object.insert(wire_name(&name), Value::Object(p_obj));
     }
     serde_json::json!({
         "type": "object",
@@ -825,4 +931,87 @@ fn prop(name: &str, ty: &str, desc: &str) -> Value {
 
 fn prop_opt(name: &str, ty: &str, desc: &str) -> Value {
     serde_json::json!({ "name": name, "type": ty, "description": desc, "optional": true })
+}
+
+#[cfg(test)]
+mod openai_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn wire_names_are_camel_cased() {
+        assert_eq!(wire_name("path"), "path");
+        assert_eq!(wire_name("start_line"), "startLine");
+        assert_eq!(wire_name("end_line"), "endLine");
+        assert_eq!(wire_name("respect_gitignore"), "respectGitignore");
+        assert_eq!(wire_name("timeout_secs"), "timeoutSecs");
+        assert_eq!(wire_name("subagent_type"), "subagentType");
+    }
+
+    #[test]
+    fn every_advertised_name_is_camel_case_for_multiword_fields() {
+        // The drift guard in `core::tests` catches this at a higher level; this
+        // pins the transformation itself so a regression names the culprit.
+        for tool in openai_tool_schemas(&all_names()) {
+            let props = tool["function"]["parameters"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for key in props.keys() {
+                assert!(
+                    !key.contains('_'),
+                    "`{}` advertises `{key}`, but ToolCall is rename_all=camelCase",
+                    tool["function"]["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_covers_exactly_the_requested_tools() {
+        let tools = openai_tool_schemas(&["read_file_range"]);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "read_file_range");
+        assert!(tools[0]["function"]["parameters"]["properties"]["path"].is_object());
+    }
+
+    #[test]
+    fn unknown_names_are_skipped_not_advertised() {
+        // A name with no dispatcher must never reach the model, or it would be
+        // offered a tool that cannot run.
+        assert!(openai_tool_schemas(&["no_such_tool"]).is_empty());
+    }
+
+    #[test]
+    fn type_tag_is_a_const_matching_the_function_and_never_required() {
+        let tools = openai_tool_schemas(&["read_file_range"]);
+        let params = &tools[0]["function"]["parameters"];
+        assert_eq!(params["properties"]["type"]["const"], "read_file_range");
+        let required = params["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|r| r == "type"),
+            "the injected discriminator must not be model-supplied"
+        );
+    }
+
+    #[test]
+    fn catalog_names_match_the_tool_call_names_the_dispatcher_expects() {
+        // Every advertised name must be a real registry entry, since
+        // `ToolCall::name()` is derived from the same snake_case tag.
+        for tool in openai_tool_schemas(&all_names()) {
+            let name = tool["function"]["name"].as_str().unwrap();
+            assert!(
+                TOOLS.iter().any(|m| m.name == name),
+                "`{name}` is advertised but not in the registry"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptions_derive_from_the_schema_argument_docs() {
+        let tools = openai_tool_schemas(&["read_file_range"]);
+        let description = tools[0]["function"]["description"].as_str().unwrap();
+        assert!(description.contains("read_file_range"));
+        assert!(description.contains("`path`"));
+    }
 }

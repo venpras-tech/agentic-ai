@@ -1,4 +1,4 @@
-import type { ImageAttachment } from "../lib/ipc";
+import type { ImageAttachment, RunTrace } from "../lib/ipc";
 
 export interface ActivityLogEntry {
   text: string;
@@ -9,6 +9,7 @@ export interface ChatMessage {
   role: "user" | "assistant" | "error";
   content: string;
   streaming?: boolean;
+  turnId?: string;
   ts?: number;
   /** Snapshot of the model/provider that produced this turn (chat display + logs). */
   model?: { name: string; provider: string };
@@ -20,6 +21,8 @@ export interface ChatMessage {
     elapsedMs?: number;
     stopReason?: string;
   };
+  /** Per-generation-step traces from `agent://run-trace` for this turn. */
+  trace?: RunTrace[];
 }
 
 export type MessageUpdate = Omit<Partial<ChatMessage>, "content"> & {
@@ -77,7 +80,6 @@ export type LastModelSelection =
       provider: string;
       providerLabel: string;
       baseUrl: string;
-      apiKey: string;
     };
 
 /** The active editor's text, mirrored from EditorPane for agent context. */

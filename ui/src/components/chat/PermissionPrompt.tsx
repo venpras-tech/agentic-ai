@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { PermissionDecision, PermissionRequest } from "../../lib/ipc";
 import type { QuestionRequest } from "../../hooks/useAgentStream";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import "./PermissionPrompt.css";
 
 interface PermissionPromptProps {
@@ -18,8 +19,10 @@ interface QuestionPromptProps {
  * accepted decisions, including "always" which persists an allow rule.
  */
 export function PermissionPrompt({ request, onDecide }: PermissionPromptProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(ref);
   return (
-    <div className="perm-prompt" role="alertdialog" aria-label="Approval required">
+    <div ref={ref} className="perm-prompt" role="alertdialog" aria-modal="true" aria-label="Approval required">
       <div className="perm-head">
         <span className="perm-tool">{request.tool}</span>
         <span className="perm-title">needs your approval</span>
@@ -37,8 +40,13 @@ export function PermissionPrompt({ request, onDecide }: PermissionPromptProps) {
         >
           Allow this session
         </button>
-        <button type="button" className="perm-btn" onClick={() => onDecide("always_allow")}>
-          Always allow
+        <button
+          type="button"
+          className="perm-btn"
+          onClick={() => onDecide("always_allow")}
+          title="Persist an allow rule so this (exact) request is never asked again"
+        >
+          Don&apos;t ask again
         </button>
         <button type="button" className="perm-btn perm-deny" onClick={() => onDecide("deny")}>
           Deny
@@ -51,6 +59,8 @@ export function PermissionPrompt({ request, onDecide }: PermissionPromptProps) {
 /** Blocking `ask_question` from the agent: preset choices plus free text. */
 export function QuestionPrompt({ request, onAnswer }: QuestionPromptProps) {
   const [text, setText] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(ref);
 
   const submit = () => {
     const answer = text.trim();
@@ -58,7 +68,7 @@ export function QuestionPrompt({ request, onAnswer }: QuestionPromptProps) {
   };
 
   return (
-    <div className="perm-prompt" role="alertdialog" aria-label="The agent has a question">
+    <div ref={ref} className="perm-prompt" role="alertdialog" aria-modal="true" aria-label="The agent has a question">
       <div className="perm-head">
         <span className="perm-title">The agent is asking</span>
       </div>

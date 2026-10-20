@@ -1,0 +1,25 @@
+ VITE v6.4.3  ready in 495 ms
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+       Error Found version mismatched Tauri packages. Make sure the NPM package and Rust crate versions are on the same major/minor releases:
+tauri (v2.11.5) : @tauri-apps/api (v2.12.0)
+tauri-plugin-dialog (v2.7.2) : @tauri-apps/plugin-dialog (v2.8.0)
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching D:\ai\src-tauri for changes...
+    Blocking waiting for file lock on build directory
+   Compiling ai-editor v0.1.0 (D:\ai\src-tauri)
+warning: ai-editor@0.1.0: GPU: no CUDA toolkit detected - compiling CPU-only (llama.cpp CPU backend).
+warning: field `source_path` is never read
+  --> src\commands\index.rs:34:5
+   |
+33 | struct IndexedFile {
+   |        ----------- field in this struct
+34 |     source_path: PathBuf,
+   |     ^^^^^^^^^^^
+   |
+   = note: `IndexedFile` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+        Info File src-tauri\src\lsp\mod.rs changed. Rebuilding application...
+     Running DevCommand (`cargo  run --no-default-features --color always --`)

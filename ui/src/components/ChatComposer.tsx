@@ -1,31 +1,24 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { listen } from "@tauri-apps/api/event";
-import { useApp } from "../context/AppContext";
+import { useChat, useAgentSettings, useShell, useContextPane, useModel } from "../context/AppContext";
 import ContextSelector from "./ContextSelector";
-import { api, type AgentTaskRequest } from "../lib/ipc";
-import { isAgentCapableLocalModel, prepareAgentTurn } from "../lib/agentPrepare";
-import { buildAgentRequest, buildPlanExecutionRequest } from "../lib/agentRequest";
-import { appendTurn, newTurnId, resolveChatId } from "../lib/sessionLog";
-import { setActiveChatId, setActiveTurnId } from "../hooks/useAgentStream";
+import AttachmentsPanel from "./AttachmentsPanel";
+import { api, type ContextUsage } from "../lib/ipc";
+import { isAgentCapableLocalModel } from "../lib/agentPrepare";
+import {
+  activeMention,
+  filterMentionFiles,
+  listWorkspaceFiles,
+  MENTION_COMMANDS,
+} from "../lib/mention";
+import { useComposerSend } from "../hooks/useComposerSend";
+import { usePlanExecution } from "../hooks/usePlanExecution";
+import { useMessageQueue } from "../hooks/useMessageQueue";
+import { useAgentStreamContext } from "../context/AgentStreamContext";
 import "./BottomBar.css";
 
 interface ChatComposerProps {
   variant?: "bottom" | "home";
-}
-
-/** A plan run that finished and is waiting for the user to approve execution. */
-interface PendingPlan {
-  request: AgentTaskRequest;
-  turnId: string;
-  workspace: string;
-  chatId: string | null;
-}
-
-/** A message typed while the agent was busy, held until the run ends. */
-interface QueuedMessage {
-  id: string;
-  text: string;
 }
 
 function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
@@ -35,49 +28,102 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     currentMode,
     setMode,
     isProcessing,
-    setProcessing,
-    verify,
-    setVerify,
-    yolo,
-    setYolo,
-    maxSteps,
-    hitlGate,
-    addMessage,
-    updateLastMessage,
     addActivity,
-    clearActivity,
-    contextPaths,
-    projectPath,
-    setProjectPath,
-    contextState,
-    activeFile,
-    chatAbortRef,
-    messages,
-    clearContext,
-    newChatSession,
-    modelName,
-    modelProvider,
-    setModelInfo,
-    modelLoading,
-    modelRestoreState,
-    modelMeta,
-    promptModelSelection,
-    rememberLastModel,
+    addMessage,
     truncateMessages,
-    settings,
-    currentConversationId,
-  } = useApp();
+    messages,
+    newChatSession,
+  } = useChat();
+  const { verify, setVerify, yolo, setYolo, maxSteps, tokenBudget, decompose, settings } =
+    useAgentSettings();
+  const { hitlGate, projectPath } = useShell();
+  const { clearContext, addContextPath } = useContextPane();
+  const { modelMeta } = useModel();
 
   const navigate = useNavigate();
   const location = useLocation();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputHistIdxRef = useRef<number | null>(null);
-  const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
   const [runInBackground, setRunInBackground] = useState(false);
   const [customMode, setCustomMode] = useState<string>("");
   const [activeWorkflow, setActiveWorkflow] = useState<string>("");
   const [modes, setModes] = useState<Array<{ name: string; description: string }>>([]);
   const [workflows, setWorkflows] = useState<Array<{ name: string; description: string }>>([]);
+
+  // Live context-window usage shown next to the input, refreshed after every
+  // prepared turn so the meter reflects the pinned buffers plus history.
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+
+  // `@` typeahead state: the active token under the caret and its candidates.
+  const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
+  const [mentionFiles, setMentionFiles] = useState<string[]>([]);
+  const [mentionActive, setMentionActive] = useState(0);
+
+  const refreshContextUsage = useCallback(() => {
+    void api
+      .contextStatus()
+      .then(setContextUsage)
+      .catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    refreshContextUsage();
+  }, [refreshContextUsage]);
+
+  // Load a flat workspace file index once per project for the `@` typeahead.
+  useEffect(() => {
+    if (!projectPath) {
+      setMentionFiles([]);
+      return;
+    }
+    let cancelled = false;
+    void listWorkspaceFiles(projectPath).then((files) => {
+      if (!cancelled) setMentionFiles(files);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPath]);
+
+  // Candidates for the current mention token: static commands first, then files.
+  const mentionCandidates = useMemo(() => {
+    if (!mention) return [] as Array<{ kind: "cmd" | "file"; value: string; hint?: string }>;
+    const q = mention.query.replace(/^@/, "");
+    const cmds = MENTION_COMMANDS.filter((c) => c.token.slice(1).startsWith(q)).map((c) => ({
+      kind: "cmd" as const,
+      value: c.token,
+      hint: c.hint,
+    }));
+    const files = filterMentionFiles(mentionFiles, q).map((f) => ({
+      kind: "file" as const,
+      value: `@${f}`,
+      hint: undefined,
+    }));
+    return [...cmds, ...files].slice(0, 12);
+  }, [mention, mentionFiles]);
+
+  useEffect(() => {
+    setMentionActive(0);
+  }, [mention?.query]);
+
+  // Per-category token split for the segmented context bar. Order runs from the
+  // least- to the most-evictable, so the bar reads like the eviction pipeline.
+  const contextBreakdown = useMemo(() => {
+    const b = contextUsage?.breakdown;
+    const limit = contextUsage?.limit ?? 0;
+    if (!b || limit <= 0) return [];
+    const order: Array<[string, string, string]> = [
+      ["system", "System prompt", "var(--accent, #0ea5e9)"],
+      ["rules", "Project rules", "#8b5cf6"],
+      ["memory", "Memory", "#f59e0b"],
+      ["skills", "Skills", "#10b981"],
+      ["file", "Files", "#06b6d4"],
+      ["otherPinned", "Other pinned", "#64748b"],
+      ["turns", "History", "#ec4899"],
+    ];
+    return order
+      .map(([key, label, color]) => ({ key, label, color, tokens: Number(b[key] ?? 0) }))
+      .filter((s) => s.tokens > 0);
+  }, [contextUsage]);
 
   // Load the user-defined modes/workflows so the composer can offer them and
   // pass the selection through to the backend (it gates the allowed tools).
@@ -100,47 +146,54 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     };
   }, []);
 
-  // A pending plan stays mounted while its run streams: the approval row is
-  // already gated on `!isProcessing`, so clearing it here would discard the
-  // plan the moment it was created. A fresh submission clears it instead.
-  const discardPlan = useCallback(() => setPendingPlan(null), []);
+  const resetInputHistory = useCallback(() => {
+    inputHistIdxRef.current = null;
+  }, []);
 
-  const executePlan = useCallback(async () => {
-    const plan = pendingPlan;
-    if (!plan) return;
-    setPendingPlan(null);
-    setProcessing(true);
-    // The execution run is a turn of its own: distinct ids keep the reply out
-    // of the plan's dedupe window, and the new id is what `useAgentStream`
-    // will pair the assistant message with.
-    const execTurnId = newTurnId();
-    setActiveTurnId(execTurnId);
-    setActiveChatId(plan.chatId);
-    addMessage({ role: "assistant", content: "", streaming: true });
-    try {
-      const request = buildPlanExecutionRequest(plan.request);
-      request.prompt = "Execute the plan above now. Follow it step by step and verify as you go.";
-      // `ContextManager` is the source of truth for the transcript and the
-      // plan is already in it, so the approval instruction must be pushed too
-      // or the second run would never see why it should act.
-      await api.contextPushTurn("user", request.prompt).catch(() => {});
-      await api.agentRunTask(request);
-      void appendTurn(
-        plan.workspace,
-        { role: "user", content: request.prompt, ts: Date.now(), turnId: execTurnId },
-        plan.chatId,
-      );
-      addActivity("Plan approved — executing", "status");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addActivity(msg, "error");
-      updateLastMessage({ content: (c) => (c || "") + `\n[Error: ${msg}]`, streaming: false });
-      setProcessing(false);
-    }
-  }, [pendingPlan, setProcessing, addMessage, addActivity, updateLastMessage]);
+  const { pendingPlan, setPendingPlan, discardPlan, executePlan } = usePlanExecution({
+    refreshContextUsage,
+  });
+
+  const { sendPrompt } = useComposerSend({
+    navigate,
+    location,
+    setComposerDraft,
+    resetInputHistory,
+    setPendingPlan,
+    discardPlan,
+    refreshContextUsage,
+    settings,
+    maxSteps,
+    verify,
+    tokenBudget,
+    decompose,
+    runInBackground,
+    customMode,
+    activeWorkflow,
+  });
+
+  const { queue, steeringId, enqueueMessage, steerQueued, dequeueMessage, moveQueued, editQueued } =
+    useMessageQueue({
+    isProcessing,
+    sendPrompt,
+    onEnqueue: () => {
+      setComposerDraft("");
+      inputHistIdxRef.current = null;
+    },
+    onQueueUserTurn: (text, turnId) => {
+      addMessage({ role: "user", content: text, turnId });
+    },
+    addActivity,
+  });
+
+  const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
+  const [queueDraft, setQueueDraft] = useState("");
+
+  const { trimToast, dismissTrimToast, verifyToast, dismissVerifyToast } = useAgentStreamContext();
 
   const userInputHistory = useMemo(
-    () => messages.filter((m) => m.role === "user" && (m.content || "").trim()).map((m) => m.content),
+    () =>
+      messages.filter((m) => m.role === "user" && (m.content || "").trim()).map((m) => m.content),
     [messages],
   );
 
@@ -176,6 +229,24 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     return () => window.removeEventListener("vencoder-prefill-composer", onPrefill);
   }, [setComposerDraft]);
 
+  // Append text sent from elsewhere (e.g. a terminal selection via @mention)
+  // without clobbering an in-progress draft.
+  useEffect(() => {
+    const onInsert = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const text = typeof detail === "string" ? detail : "";
+      if (!text) return;
+      const joined = composerDraft ? `${composerDraft.replace(/\s+$/, "")}\n${text}` : text;
+      setComposerDraft(joined);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(joined.length, joined.length);
+      });
+    };
+    window.addEventListener("vencoder-insert-composer", onInsert);
+    return () => window.removeEventListener("vencoder-insert-composer", onInsert);
+  }, [composerDraft, setComposerDraft]);
+
   useEffect(() => {
     if (location.pathname !== "/chat") return;
     const p = sessionStorage.getItem("homePrompt");
@@ -202,203 +273,6 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     window.addEventListener("vencoder-focus-composer", onFocusComposer);
     return () => window.removeEventListener("vencoder-focus-composer", onFocusComposer);
   }, []);
-
-  const sendPrompt = useCallback(
-    async (text: string) => {
-      const t = text.trim();
-      if (!t) return;
-
-      // On Enter, make sure a model is actually loaded and ready before
-      // running: "No model loaded" would otherwise surface as an error mid-run.
-      if (modelLoading) {
-        addActivity("Model is still loading — wait for the banner before sending.", "status");
-        return;
-      }
-      let effectiveModel = { name: modelName, provider: modelProvider };
-      if (!modelName || modelRestoreState === "failed") {
-        const routed = (await api.providersRoute("editor").catch(() => null)) as
-          | Record<string, unknown>
-          | null;
-        const kind = routed ? String(routed.kind ?? "") : "";
-        const display = routed ? String(routed.name ?? "") : "";
-        const model = routed ? String(routed.model ?? "") : "";
-        const baseUrl = routed ? String(routed.baseUrl ?? "") : "";
-        const apiKey = routed ? String(routed.apiKey ?? "") : "";
-        if (routed && kind && kind !== "local" && model) {
-          // External provider registered in Settings → Providers: activate it
-          // now so the request actually goes out to that provider.
-          try {
-            await api.configureRemoteModel({ provider: kind, baseUrl, apiKey, model });
-            const label = display || kind;
-            setModelInfo(model, label);
-            rememberLastModel({
-              kind: "remote",
-              name: model,
-              provider: kind,
-              providerLabel: label,
-              baseUrl,
-              apiKey,
-            });
-            effectiveModel = { name: model, provider: label };
-          } catch (err2) {
-            addActivity(
-              `Could not reach the registered provider: ${String(err2 instanceof Error ? err2.message : err2)}`,
-              "error",
-            );
-            promptModelSelection();
-            return;
-          }
-        } else {
-          promptModelSelection();
-          addActivity("No model loaded — pick a model in the Models page first.", "error");
-          return;
-        }
-      }
-
-      const fromHome = location.pathname === "/";
-      if (fromHome) {
-        navigate("/chat");
-      }
-
-      setComposerDraft("");
-      inputHistIdxRef.current = null;
-      // A new prompt supersedes any plan awaiting approval.
-      discardPlan();
-      const turnId = newTurnId();
-      setActiveTurnId(turnId);
-      // Persist into the chat the user is looking at; a brand-new chat has
-      // none yet, so the backend's shared `default` log is the target.
-      const chatId = resolveChatId(currentConversationId);
-      setActiveChatId(chatId);
-      addMessage({ role: "user", content: t });
-      setProcessing(true);
-      clearActivity();
-
-      addMessage({ role: "assistant", content: "", streaming: true, model: effectiveModel });
-
-      try {
-        const nParams = modelMeta?.nParams;
-        const smallModel = Boolean(nParams && !isAgentCapableLocalModel(nParams));
-        if (currentMode === "agent" && smallModel) {
-          addActivity(
-            "This model is very small for Agent mode — use a 3B+ instruct model or a remote provider for reliable edits.",
-            "status",
-          );
-        }
-        const prepared = await prepareAgentTurn({
-          uiMode: currentMode,
-          userText: t,
-          projectPath,
-          contextPaths,
-          contextState,
-          activeFile,
-          nParams,
-          pickWorkspace: () => api.pickWorkspaceFolder(),
-        });
-        const workspace = prepared.workspace;
-        if (workspace && workspace !== projectPath) {
-          setProjectPath(workspace);
-        }
-        const request = buildAgentRequest({
-          prompt: t,
-          uiMode: currentMode,
-          settings,
-          maxSteps,
-          verify,
-          smallModel,
-          selectedMode: customMode,
-          selectedWorkflow: activeWorkflow,
-          images: prepared.images,
-        });
-        // Plan → Act separation: the backend deliberately refuses to edit
-        // while planMode is set, so the plan is shown first and the user
-        // explicitly approves before the execute run.
-        if (request.planMode) {
-          setPendingPlan({ request, turnId, workspace, chatId });
-        }
-        if (runInBackground) {
-          // Detached run: nothing streams back into this bubble, so the
-          // placeholder is turned into a pointer to the run timeline.
-          request.planMode = false;
-          const sessionId = await api.agentRunBackground(request);
-          updateLastMessage({
-            streaming: false,
-            content: `Running in the background (session ${sessionId}). Follow it, and abort it, from the run timeline.`,
-          });
-          setProcessing(false);
-          addActivity(`Started background session ${sessionId}`, "status");
-          void appendTurn(
-            workspace,
-            { role: "user", content: t, ts: Date.now(), turnId },
-            chatId,
-          );
-          return;
-        }
-        await api.agentRunTask(request);
-        void appendTurn(
-          workspace,
-          { role: "user", content: t, ts: Date.now(), turnId },
-          chatId,
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        addActivity(msg, "error");
-        updateLastMessage({ content: (c) => (c || "") + `\n[Error: ${msg}]` });
-        setProcessing(false);
-        updateLastMessage({ streaming: false });
-      }
-    },
-    [
-      location,
-      navigate,
-      setComposerDraft,
-      addMessage,
-      setProcessing,
-      clearActivity,
-      currentMode,
-      verify,
-      maxSteps,
-      projectPath,
-      setProjectPath,
-      contextPaths,
-      modelName,
-      modelProvider,
-      setModelInfo,
-      modelLoading,
-      modelRestoreState,
-      modelMeta,
-      promptModelSelection,
-      rememberLastModel,
-      addActivity,
-      updateLastMessage,
-      currentConversationId,
-      discardPlan,
-      runInBackground,
-    ],
-  );
-
-  // ---- steer queue: messages typed while the agent is busy ----------------
-  const [queue, setQueue] = useState<QueuedMessage[]>([]);
-  const [steeringId, setSteeringId] = useState<string | null>(null);
-  // Mirrors `queue` so the drain effect and steer handler can read the current
-  // list without re-subscribing on every render.
-  const queueRef = useRef<QueuedMessage[]>([]);
-  queueRef.current = queue;
-
-  /** Park a message and clear the composer so the user can keep typing. */
-  const enqueueMessage = useCallback(
-    (text: string) => {
-      const item = {
-        id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        text,
-      };
-      setQueue((q) => [...q, item]);
-      setComposerDraft("");
-      inputHistIdxRef.current = null;
-      addActivity("Queued — the agent is still working on the previous message.", "status");
-    },
-    [setComposerDraft, addActivity],
-  );
 
   useEffect(() => {
     const onSendPrompt = (e: Event) => {
@@ -447,60 +321,17 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     await sendPrompt(text);
   };
 
-  /** Hold a message for later, or push it into the live run when the user
-   *  presses Steer. Backend rejects a steer with no run in progress, which is
-   *  the authority on "is anything actually running". */
-  const steerQueued = useCallback(
-    async (id: string) => {
-      const item = queueRef.current.find((q) => q.id === id);
-      if (!item || steeringId) return;
-      setSteeringId(id);
-      try {
-        await api.agentSteer(item.text);
-        setQueue((q) => q.filter((m) => m.id !== id));
-        addActivity("Steering the running agent…", "status");
-      } catch (err) {
-        // Nothing running (or it just finished): fall back to a normal send so
-        // the message is not silently lost.
-        addActivity(
-          `Could not steer (${err instanceof Error ? err.message : String(err)}) — sending as a new message.`,
-          "status",
-        );
-        setQueue((q) => q.filter((m) => m.id !== id));
-        await sendPrompt(item.text);
-      }
-      setSteeringId(null);
-    },
-    [steeringId, addActivity, sendPrompt],
-  );
-
-  const dequeueMessage = useCallback((id: string) => {
-    setQueue((q) => q.filter((m) => m.id !== id));
-  }, []);
-
-  /** Drain the queue once the run ends, oldest first. */
-  useEffect(() => {
-    if (isProcessing) return;
-    const pending = queueRef.current;
-    if (pending.length === 0) return;
-    const [next, ...rest] = pending;
-    setQueue(rest);
-    void sendPrompt(next.text);
-  }, [isProcessing, sendPrompt]);
-
-  // A steer the backend applied lands here; drop the queue row so it is not
-  // offered twice.
-  useEffect(() => {
-    const unlisten = listen<{ id: string }>("agent://steer-applied", (e) => {
-      setQueue((q) => q.filter((m) => m.id !== e.payload.id));
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-  }, []);
-
   const handleCancel = () => {
     void api.abortAgentExecution().catch(() => {});
+  };
+
+  const steerCurrentRun = () => {
+    const text = composerDraft.trim();
+    if (!text) return;
+    // Direct steer into the live run (not queued): folded in at the next step
+    // boundary by the backend.
+    void api.agentSteer(text).catch(() => {});
+    setComposerDraft("");
   };
 
   const handleSlashCommand = (cmd: string) => {
@@ -520,6 +351,10 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     }
     if (c === "/clear") {
       clearContext();
+      return;
+    }
+    if (c === "/undo" || c === "/rewind") {
+      window.dispatchEvent(new CustomEvent("vencoder-undo-turn"));
       return;
     }
     const modeMatch = cmd.match(/^\/mode\s+(agent|ask|plan)$/i);
@@ -549,52 +384,139 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const cancelRecordingRef = useRef(false);
+  // Push-to-talk: set while the mic button is held so a release that races the
+  // async `getUserMedia` handshake still ends the clip instead of hanging.
+  const pttHeldRef = useRef(false);
 
-  const toggleDictation = async () => {
-    if (recording) {
-      recorderRef.current?.stop();
+  const startDictation = async () => {
+    if (recording || transcribing) return;
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      addActivity(
+        `Microphone unavailable — ${err instanceof Error ? err.message : "check permissions"}`,
+        "error",
+      );
       return;
     }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const chunks: Blob[] = [];
-      const recorder = new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop());
-        setRecording(false);
-        setTranscribing(true);
-        const blob = new Blob(chunks, { type: recorder.mimeType });
-        blob
-          .arrayBuffer()
-          .then((buf) =>
-            api.voiceTranscribeData(
-              Array.from(new Uint8Array(buf)),
-              "webm",
-            ),
-          )
-          .then((text) => {
-            const t = text.trim();
-            if (!t) return;
-            setComposerDraft((cur) => (cur ? `${cur} ${t}` : t));
-          })
-          .catch(() => {})
-          .finally(() => setTranscribing(false));
-      };
-      recorder.start();
-      setRecording(true);
-    } catch {
-      // mic permission denied / unsupported — stay silent
-    }
+    const chunks: Blob[] = [];
+    const recorder = new MediaRecorder(stream);
+    recorderRef.current = recorder;
+    cancelRecordingRef.current = false;
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+    recorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      recorderRef.current = null;
+      setRecording(false);
+      if (cancelRecordingRef.current) {
+        addActivity("Dictation cancelled", "status");
+        return;
+      }
+      setTranscribing(true);
+      const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      blob
+        .arrayBuffer()
+        .then((buf) => api.voiceTranscribeData(Array.from(new Uint8Array(buf)), "webm"))
+        .then((text) => {
+          const t = text.trim();
+          if (!t) return;
+          setComposerDraft((cur) => (cur ? `${cur} ${t}` : t));
+        })
+        .catch((err) =>
+          addActivity(
+            `Transcription failed — ${err instanceof Error ? err.message : String(err)}`,
+            "error",
+          ),
+        )
+        .finally(() => setTranscribing(false));
+    };
+    recorder.start();
+    setRecording(true);
+    // The pointer was released while we waited for the mic — close the clip now.
+    if (!pttHeldRef.current) stopDictation();
+  };
+
+  const stopDictation = () => {
+    recorderRef.current?.stop();
+  };
+
+  const cancelDictation = () => {
+    cancelRecordingRef.current = true;
+    recorderRef.current?.stop();
+  };
+
+  // Escape cancels an in-flight recording without transcribing it.
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelRecordingRef.current = true;
+        recorderRef.current?.stop();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [recording]);
+
+  const acceptMention = (cand: { kind: "cmd" | "file"; value: string } | undefined) => {
+    if (!cand || !mention) return;
+    const before = composerDraft.slice(0, mention.start);
+    const after = composerDraft.slice(mention.start + 1 + mention.query.length);
+    // A file mention pins the path and leaves a trailing space; a static
+    // command sends its token through as plain text for the model.
+    const insert = cand.kind === "file" ? `${cand.value} ` : `${cand.value} `;
+    const next = `${before}${insert}${after}`;
+    if (cand.kind === "file") addContextPath(cand.value.slice(1));
+    setComposerDraft(next);
+    setMention(null);
+    requestAnimationFrame(() => {
+      const caret = before.length + insert.length;
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(caret, caret);
+    });
+  };
+
+  const handleDraftChange = (value: string, caret: number) => {
+    inputHistIdxRef.current = null;
+    setComposerDraft(value);
+    setMention(activeMention(value, caret));
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // `@` typeahead navigation takes priority while the menu is open.
+    if (mention && mentionCandidates.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionActive((i) => (i + 1) % mentionCandidates.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionActive((i) => (i - 1 + mentionCandidates.length) % mentionCandidates.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        acceptMention(mentionCandidates[mentionActive]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMention(null);
+        return;
+      }
+    }
     if (e.key === "Tab" && e.shiftKey) {
+      // Cycle permission modes, Claude Code style: Agent → Plan → Ask → Agent.
       e.preventDefault();
-      setMode("plan");
+      const order = ["agent", "plan", "ask"];
+      const i = order.indexOf(currentMode);
+      setMode(order[(i + 1) % order.length] ?? "agent");
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -620,19 +542,51 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
         setComposerDraft(uh[idx]);
       } else {
         setComposerDraft("");
-        inputHistIdxRef.current = uh.length;
       }
-      return;
-    }
-    if (e.key === "@" || (e.key === "2" && e.shiftKey)) {
-      openContextSelector();
     }
   };
 
   const showStatusRow = variant === "bottom" || isProcessing;
 
+  const smallModelAgent =
+    currentMode === "agent" &&
+    modelMeta?.nParams != null &&
+    modelMeta.nParams !== 0 &&
+    !isAgentCapableLocalModel(modelMeta.nParams);
+
   const body = (
     <>
+      {trimToast && (
+        <div className="trim-toast" role="status">
+          <span className="trim-toast-text">
+            Context trimmed — dropped {trimToast.dropped}, kept {trimToast.remaining} turns
+          </span>
+          <button
+            type="button"
+            className="trim-toast-dismiss"
+            onClick={dismissTrimToast}
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {verifyToast && (
+        <div className={`verify-toast ${verifyToast.ok ? "ok" : "error"}`} role="status">
+          <span className="verify-toast-text">
+            {verifyToast.ok ? "✓ Verify passed" : "⚠ Verify found issues"}
+            {verifyToast.command ? ` · ${verifyToast.command}` : ""}
+          </span>
+          <button
+            type="button"
+            className="trim-toast-dismiss"
+            onClick={dismissVerifyToast}
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {showStatusRow ? (
         <div className="status-bar status-bar-top" role="status" aria-live="polite" aria-atomic="true">
           {isProcessing ? <span className="backend-status">Processing…</span> : <span className="backend-status" aria-hidden="true" />}
@@ -642,12 +596,32 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
         <form className="input-wrap" onSubmit={(e) => void handleSubmit(e)} aria-busy={isProcessing}>
           <div className={`chat-input-box ${isProcessing ? "processing" : ""}`}>
             <div className="chat-input-main">
+              {mention && mentionCandidates.length > 0 && (
+                <ul className="mention-menu" role="listbox" aria-label="Context suggestions">
+                  {mentionCandidates.map((c, i) => (
+                    <li key={`${c.kind}-${c.value}`} role="option" aria-selected={i === mentionActive}>
+                      <button
+                        type="button"
+                        className={`mention-item${i === mentionActive ? " active" : ""}`}
+                        onMouseEnter={() => setMentionActive(i)}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          acceptMention(c);
+                        }}
+                      >
+                        <span className="mention-kind">{c.kind === "cmd" ? "⌘" : "📄"}</span>
+                        <span className="mention-value">{c.value}</span>
+                        {c.hint && <span className="mention-hint">{c.hint}</span>}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
               <textarea
                 ref={textareaRef}
                 value={composerDraft}
                 onChange={(e) => {
-                  inputHistIdxRef.current = null;
-                  setComposerDraft(e.target.value);
+                  handleDraftChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
                 }}
                 onKeyDown={handleKeyDown}
                 rows={1}
@@ -655,7 +629,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                   hitlGate
                     ? "Input paused — awaiting approval in the modal above"
                     : isProcessing
-                      ? "Agent is working — Enter queues a follow-up, or steer the current run"
+                      ? "Agent is working — Enter queues a follow-up, or use Steer to redirect it now"
                       : placeholders[currentMode as keyof typeof placeholders] || placeholders.agent
                 }
                 aria-label="Chat message"
@@ -668,37 +642,121 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                   Queued ({queue.length}) — steers the run in progress
                 </div>
                 <ul className="steer-queue-list">
-                  {queue.map((m) => (
+                  {queue.map((m, qi) => (
                     <li key={m.id} className="steer-queue-item">
-                      <span className="steer-queue-text" title={m.text}>
-                        {m.text}
-                      </span>
-                      <span className="steer-queue-actions">
-                        <button
-                          type="button"
-                          className="steer-queue-btn steer-queue-steer"
-                          onClick={() => void steerQueued(m.id)}
-                          disabled={steeringId === m.id}
-                          title="Inject this message into the agent's current run"
-                        >
-                          {steeringId === m.id ? "Steering…" : "Steer"}
-                        </button>
-                        <button
-                          type="button"
-                          className="steer-queue-btn"
-                          onClick={() => dequeueMessage(m.id)}
-                          title="Remove from the queue"
-                          aria-label={`Remove queued message: ${m.text.slice(0, 40)}`}
-                        >
-                          ✕
-                        </button>
-                      </span>
+                      {editingQueueId === m.id ? (
+                        <>
+                          <input
+                            className="steer-queue-edit"
+                            value={queueDraft}
+                            autoFocus
+                            onChange={(e) => setQueueDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                editQueued(m.id, queueDraft);
+                                setEditingQueueId(null);
+                              } else if (e.key === "Escape") {
+                                e.preventDefault();
+                                setEditingQueueId(null);
+                              }
+                            }}
+                          />
+                          <span className="steer-queue-actions">
+                            <button
+                              type="button"
+                              className="steer-queue-btn steer-queue-steer"
+                              onClick={() => {
+                                editQueued(m.id, queueDraft);
+                                setEditingQueueId(null);
+                              }}
+                              title="Save changes"
+                            >
+                              Save
+                            </button>
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="steer-queue-text" title={m.text}>
+                            {m.text}
+                          </span>
+                          <span className="steer-queue-actions">
+                            <button
+                              type="button"
+                              className="steer-queue-btn"
+                              onClick={() => moveQueued(m.id, -1)}
+                              disabled={qi === 0}
+                              title="Move earlier"
+                              aria-label="Move queued message earlier"
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              className="steer-queue-btn"
+                              onClick={() => moveQueued(m.id, 1)}
+                              disabled={qi === queue.length - 1}
+                              title="Move later"
+                              aria-label="Move queued message later"
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              className="steer-queue-btn"
+                              onClick={() => {
+                                setEditingQueueId(m.id);
+                                setQueueDraft(m.text);
+                              }}
+                              title="Edit this queued message"
+                              aria-label="Edit queued message"
+                            >
+                              ✎
+                            </button>
+                            <button
+                              type="button"
+                              className="steer-queue-btn steer-queue-steer"
+                              onClick={() => void steerQueued(m.id)}
+                              disabled={steeringId === m.id}
+                              title="Inject this message into the agent's current run"
+                            >
+                              {steeringId === m.id ? "Steering…" : "Steer"}
+                            </button>
+                            <button
+                              type="button"
+                              className="steer-queue-btn"
+                              onClick={() => dequeueMessage(m.id)}
+                              title="Remove from the queue"
+                              aria-label={`Remove queued message: ${m.text.slice(0, 40)}`}
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        </>
+                      )}
                     </li>
                   ))}
                 </ul>
               </div>
             )}
             <ContextSelector />
+            <AttachmentsPanel />
+            {smallModelAgent && (
+              <div className="chat-small-warn" role="status">
+                <span className="chat-small-warn-text">
+                  Model is ~{(modelMeta!.nParams / 1e9).toFixed(1)}B params — Agent mode
+                  sending is disabled for it. Ask/Plan mode or a 3B+ instruct model is safer.
+                </span>
+                <button
+                  type="button"
+                  className="chat-small-warn-btn"
+                  onClick={() => setMode("ask")}
+                >
+                  Switch to Ask
+                </button>
+              </div>
+            )}
             {pendingPlan && !isProcessing && (
               <div className="plan-approval" role="group" aria-label="Plan approval">
                 <span className="plan-approval-text">Plan ready — review it, then execute?</span>
@@ -722,6 +780,41 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
               </div>
             )}
             <div className="chat-input-footer">
+              {contextUsage && (
+                <div
+                  className={`chat-input-context-meter${contextUsage.overflow ? " overflow" : ""}`}
+                  title={[
+                    `Context window ${Math.round(contextUsage.usedPercent)}% — ${contextUsage.totalTokens.toLocaleString()} of ${contextUsage.limit.toLocaleString()} tokens (${contextUsage.messageCount} messages)`,
+                    ...contextBreakdown.map((s) => `${s.label}: ${s.tokens.toLocaleString()}`),
+                  ].join("\n")}
+                  role="img"
+                  aria-label={`Context window ${Math.round(contextUsage.usedPercent)}% used`}
+                >
+                  <span className="chat-input-context-label">ctx</span>
+                  <div className="chat-input-context-track">
+                    {contextBreakdown.length > 0 ? (
+                      contextBreakdown.map((s) => (
+                        <div
+                          key={s.key}
+                          className="chat-input-context-seg"
+                          style={{
+                            width: `${Math.min(100, (s.tokens / contextUsage.limit) * 100)}%`,
+                            background: s.color,
+                          }}
+                        />
+                      ))
+                    ) : (
+                      <div
+                        className="chat-input-context-fill"
+                        style={{ width: `${Math.min(100, contextUsage.usedPercent)}%` }}
+                      />
+                    )}
+                  </div>
+                  <span className="chat-input-context-nums">
+                    {contextUsage.totalTokens.toLocaleString()}/{contextUsage.limit.toLocaleString()}
+                  </span>
+                </div>
+              )}
               <div className="chat-input-icons">
                 <button
                   type="button"
@@ -735,25 +828,42 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                 <button
                   type="button"
                   className={`chat-icon-btn chat-icon-voice${recording ? " recording" : ""}`}
-                  onClick={() => void toggleDictation()}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    pttHeldRef.current = true;
+                    void startDictation();
+                  }}
+                  onPointerUp={() => {
+                    pttHeldRef.current = false;
+                    if (recorderRef.current) stopDictation();
+                  }}
+                  onPointerLeave={() => {
+                    pttHeldRef.current = false;
+                    if (recorderRef.current) stopDictation();
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    if (recorderRef.current) cancelDictation();
+                  }}
                   disabled={transcribing}
                   title={
                     transcribing
                       ? "Transcribing…"
                       : recording
-                        ? "Stop recording and transcribe"
-                        : "Dictate (requires local whisper + ffmpeg)"
+                        ? "Release to transcribe · Esc or right-click to cancel"
+                        : "Hold to talk (requires local whisper + ffmpeg)"
                   }
                 >
                   <span className="chat-icon-btn-label" aria-hidden="true">
                     {recording ? "■" : transcribing ? "…" : "🎤"}
                   </span>
                   <span className="chat-icon-btn-text">
-                    {recording ? "Stop" : transcribing ? "…" : "Voice"}
+                    {recording ? "Rec" : transcribing ? "…" : "Voice"}
                   </span>
                 </button>
                 <select
-                  className="mode-select mode-select-inline"
+                  className={`mode-select mode-select-inline${smallModelAgent ? " mode-select-warn" : ""}`}
                   value={currentMode}
                   onChange={(e) => setMode(e.target.value)}
                   title="Agent: implement changes. Ask: explore only. Plan: create Markdown plan"
@@ -846,19 +956,31 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                 </button>
               </div>
               <div className="chat-input-actions">
+                {isProcessing && (
+                  <button
+                    type="button"
+                    className="btn-steer"
+                    onClick={steerCurrentRun}
+                    disabled={!composerDraft.trim()}
+                    title="Send this text into the run that is already in progress"
+                  >
+                    Steer
+                  </button>
+                )}
                 {isProcessing ? (
                   <button
                     type="button"
                     className="chat-icon-btn btn-cancel"
                     onClick={handleCancel}
                     title="Cancel request"
+                    aria-label="Cancel request"
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="6" y="6" width="12" height="12" />
                     </svg>
                   </button>
                 ) : (
-                  <button type="submit" className="chat-icon-btn btn-send" title="Send">
+                  <button type="submit" className="chat-icon-btn btn-send" title="Send" aria-label="Send">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M22 2L11 13" />
                       <path d="M22 2L15 22L11 13L2 9L22 2Z" />

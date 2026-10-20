@@ -3,11 +3,12 @@
 //! `main.rs` during the command-layer split.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
-use crate::agent::mcp::McpServerConfig;
+use crate::agent::mcp::{self, McpServerConfig};
 use crate::agent::ToolState;
 use crate::{app_config_dir, smoke_enabled};
 
@@ -42,11 +43,20 @@ fn parse_gb_nvidia(lines: &str) -> Option<GpuInfo> {
         let name = parts.next().unwrap_or_default().trim().to_string();
         let vram = parts
             .next()
-            .map(|s| s.trim().split_whitespace().next().unwrap_or("0").replace(',', ""))
+            .map(|s| {
+                s.trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .replace(',', "")
+            })
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
         if !name.is_empty() {
-            return Some(GpuInfo { name, vram_gb: vram });
+            return Some(GpuInfo {
+                name,
+                vram_gb: vram,
+            });
         }
     }
     None
@@ -74,6 +84,15 @@ fn query_nvidia_gpu() -> Option<GpuInfo> {
 /// "will this model fit?" estimator.
 #[tauri::command]
 pub async fn system_info(app: AppHandle) -> Result<SystemInfo, String> {
+    // `System::new_all`, `Disks::new_with_refreshed_list` and `nvidia-smi` are
+    // all blocking syscalls/process spawns; running them on the async worker
+    // stalled unrelated commands, so hand the whole probe to a blocking thread.
+    tokio::task::spawn_blocking(move || collect_system_info(&app))
+        .await
+        .map_err(|e| format!("system_info task panicked: {e}"))?
+}
+
+fn collect_system_info(app: &AppHandle) -> Result<SystemInfo, String> {
     use sysinfo::{Disks, System};
 
     let mut sys = System::new_all();
@@ -86,10 +105,12 @@ pub async fn system_info(app: AppHandle) -> Result<SystemInfo, String> {
         .map(|c| c.brand().trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown CPU".into());
-    let cores = sys.physical_core_count().unwrap_or_else(|| sys.cpus().len());
+    let cores = sys
+        .physical_core_count()
+        .unwrap_or_else(|| sys.cpus().len());
 
     let disk = {
-        let dir = crate::app_data_dir(&app);
+        let dir = crate::app_data_dir(app);
         let disks = Disks::new_with_refreshed_list();
         let by_prefix = disks
             .list()
@@ -97,7 +118,12 @@ pub async fn system_info(app: AppHandle) -> Result<SystemInfo, String> {
             .find(|d| dir.starts_with(d.mount_point()))
             .map(|d| (d.available_space(), d.total_space()));
         by_prefix
-            .or_else(|| disks.list().first().map(|d| (d.available_space(), d.total_space())))
+            .or_else(|| {
+                disks
+                    .list()
+                    .first()
+                    .map(|d| (d.available_space(), d.total_space()))
+            })
             .unwrap_or((0, 0))
     };
 
@@ -123,6 +149,42 @@ pub async fn system_info(app: AppHandle) -> Result<SystemInfo, String> {
 #[tauri::command]
 pub async fn console_history() -> Result<Vec<String>, String> {
     Ok(crate::logging::recent_lines())
+}
+
+/// Absolute path of the rolling log directory, so the Logs view can show it.
+#[tauri::command]
+pub async fn log_dir() -> Option<String> {
+    crate::logging::log_dir().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Every log file on disk, newest first (the in-memory ring only keeps the
+/// last few hundred lines, so full history has to come from these).
+#[tauri::command]
+pub async fn log_files() -> Vec<crate::logging::LogFileInfo> {
+    crate::logging::log_files()
+}
+
+/// Tail of one log file — the full `[LLM]`/`[BE]` history, not just the ring.
+#[tauri::command]
+pub async fn log_read(name: String, max_lines: Option<usize>) -> Result<Vec<String>, String> {
+    crate::logging::log_tail(&name, max_lines.unwrap_or(5000))
+}
+
+/// Reveal the log directory in the OS file manager.
+#[tauri::command]
+pub async fn log_open_dir(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = crate::logging::log_dir().ok_or_else(|| "file logging is not enabled".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create logs dir: {e}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|e| format!("could not open logs folder: {e}"))
+}
+
+/// Empty every log file.
+#[tauri::command]
+pub async fn log_clear() -> Result<usize, String> {
+    crate::logging::clear_logs()
 }
 
 // ---- auto-update (opt-in via AI_EDITOR_UPDATER_PUBKEY) ----
@@ -184,7 +246,8 @@ pub async fn mcp_catalog_save(
     state: State<'_, Arc<ToolState>>,
     servers: Vec<McpServerConfig>,
 ) -> Result<(), String> {
-    // Validate before writing: unique non-empty names, non-empty commands.
+    // Validate before writing: unique non-empty names, and a usable target per
+    // transport (stdio needs a command, http needs a URL).
     let mut seen = std::collections::HashSet::new();
     for s in &servers {
         if s.name.trim().is_empty() {
@@ -193,20 +256,14 @@ pub async fn mcp_catalog_save(
         if !seen.insert(s.name.clone()) {
             return Err(format!("Duplicate server name `{}`", s.name));
         }
-        if s.bin.trim().is_empty() {
-            return Err(format!("Server `{}` needs a command", s.name));
-        }
+        s.validate()?;
     }
     // Evict cached connections that no longer match a live config entry.
     let stale: Vec<String> = {
         let cache = state.mcp_servers.lock().await;
         cache
             .keys()
-            .filter(|key| {
-                !servers
-                    .iter()
-                    .any(|s| s.enabled && **key == format!("{} {}", s.bin, s.args.join(" ")))
-            })
+            .filter(|key| !servers.iter().any(|s| s.enabled && **key == s.cache_key()))
             .cloned()
             .collect()
     };
@@ -217,6 +274,95 @@ pub async fn mcp_catalog_save(
         }
     }
     crate::agent::mcp::save_catalog(&app_config_dir(&app), &servers)
+}
+
+/// Result of a `mcp_server_probe(name)` call.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProbeResult {
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub tools: Vec<String>,
+    /// True when a live, already-cached connection answered (no spawn).
+    pub cached: bool,
+}
+
+/// Spawn (or reuse the cached connection for) a configured MCP server and ask
+/// it for the tools it exposes. Used by the settings UI's "test connection"
+/// button; failures that came from a fresh spawn evict the bad entry so a later
+/// probe retries cleanly instead of hitting a poisoned cache.
+#[tauri::command]
+pub async fn mcp_server_probe(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    name: String,
+) -> Result<McpProbeResult, String> {
+    let servers = mcp::load_catalog(&app_config_dir(&app))?;
+    let cfg = servers
+        .iter()
+        .find(|c| c.name == name)
+        .cloned()
+        .ok_or_else(|| format!("MCP server `{name}` not configured"))?;
+    if !cfg.enabled {
+        return Ok(McpProbeResult {
+            name: name.clone(),
+            ok: false,
+            error: Some("Server is disabled in the catalog".into()),
+            tools: Vec::new(),
+            cached: false,
+        });
+    }
+    let key = cfg.cache_key();
+    let (handle, fresh) = {
+        let mut cache = state.mcp_servers.lock().await;
+        if let Some(h) = cache.get(&key) {
+            (h.clone(), false)
+        } else {
+            let h = mcp::McpClient::connect(&cfg)
+                .await
+                .map_err(|e| format!("Failed to start MCP server `{name}`: {e}"))?;
+            let arc = Arc::new(tokio::sync::Mutex::new(h));
+            cache.insert(key.clone(), arc.clone());
+            (arc, true)
+        }
+    };
+    let mut guard = handle.lock().await;
+    let probe = tokio::time::timeout(Duration::from_secs(10), guard.list_tools()).await;
+    let cached = !fresh;
+    match probe {
+        Ok(Ok(tools)) => Ok(McpProbeResult {
+            name,
+            ok: true,
+            error: None,
+            tools,
+            cached,
+        }),
+        Ok(Err(e)) => {
+            if fresh {
+                state.mcp_servers.lock().await.remove(&key);
+            }
+            Ok(McpProbeResult {
+                name,
+                ok: false,
+                error: Some(e),
+                tools: Vec::new(),
+                cached: false,
+            })
+        }
+        Err(_) => {
+            if fresh {
+                state.mcp_servers.lock().await.remove(&key);
+            }
+            Ok(McpProbeResult {
+                name,
+                ok: false,
+                error: Some("Probe timed out after 10s".into()),
+                tools: Vec::new(),
+                cached: false,
+            })
+        }
+    }
 }
 
 /// Probe used by the frontend to decide whether to report boot success.

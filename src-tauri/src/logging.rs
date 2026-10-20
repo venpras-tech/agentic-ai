@@ -38,6 +38,7 @@ type LineSink = Box<dyn Fn(&str) + Send + Sync>;
 
 static FILE_SINK: OnceLock<Mutex<Option<FileSink>>> = OnceLock::new();
 static WEBVIEW_SINK: OnceLock<Option<LineSink>> = OnceLock::new();
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Ring of recent formatted lines so a freshly-mounted webview Console can
 /// replay what was logged before its listeners attached (startup banners,
@@ -50,10 +51,109 @@ pub fn recent_lines() -> Vec<String> {
     HISTORY.lock().map(|h| h.clone()).unwrap_or_default()
 }
 
+/// Directory the rolling appender writes to, for display in the UI.
+pub fn log_dir() -> Option<PathBuf> {
+    LOG_DIR.get().cloned()
+}
+
+/// One on-disk log file, newest first, for the Logs view.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogFileInfo {
+    pub name: String,
+    pub bytes: u64,
+    pub modified_ms: u64,
+}
+
+/// Every `*.log` file in the log dir, newest first. Empty when file logging
+/// was never initialised or the directory is unreadable.
+pub fn log_files() -> Vec<LogFileInfo> {
+    let Some(dir) = log_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<LogFileInfo> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("log") {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            let modified_ms = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(LogFileInfo {
+                name: path.file_name()?.to_string_lossy().into_owned(),
+                bytes: meta.len(),
+                modified_ms,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then(b.name.cmp(&a.name)));
+    out
+}
+
+/// Truncate every log file in place and return how many were cleared.
+///
+/// Files are truncated rather than deleted: on Windows the active part file is
+/// held open by the appender and cannot be removed, so zeroing it keeps
+/// "Clear logs" working without disturbing the rotating sink.
+pub fn clear_logs() -> Result<usize, String> {
+    let dir = log_dir().ok_or_else(|| "file logging is not enabled".to_string())?;
+    // Reset the appender's byte counter so rotation timing stays correct.
+    if let Some(cell) = FILE_SINK.get() {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(fs) = guard.as_mut() {
+                fs.written = 0;
+            }
+        }
+    }
+    let mut cleared = 0usize;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("could not read logs dir: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("log") {
+            continue;
+        }
+        if let Ok(mut f) = OpenOptions::new().write(true).open(&path) {
+            if f.set_len(0).is_ok() {
+                let _ = f.flush();
+                cleared += 1;
+            }
+        }
+    }
+    info(None, "log", &format!("cleared {cleared} log file(s)"));
+    Ok(cleared)
+}
+
+/// Tail of one log file, oldest-first. `name` must be a bare file name that
+/// already exists in the log dir — anything containing a path separator is
+/// rejected so the command cannot be used to read arbitrary files.
+pub fn log_tail(name: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    let dir = log_dir().ok_or_else(|| "file logging is not enabled".to_string())?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("invalid log file name".to_string());
+    }
+    let path = dir.join(name);
+    if path.extension().and_then(|s| s.to_str()) != Some("log") || !path.is_file() {
+        return Err(format!("no such log file: {name}"));
+    }
+    let body = std::fs::read_to_string(&path).map_err(|e| format!("could not read {name}: {e}"))?;
+    let all: Vec<&str> = body.lines().collect();
+    let start = all.len().saturating_sub(max_lines.max(1));
+    Ok(all[start..].iter().map(|s| s.to_string()).collect())
+}
+
 /// Enable file logging under `dir` and mirror every line to `sink` (used to
 /// forward `[BE]`/`[LLM]` lines into the in-app Console window). Call once
 /// from the Tauri setup hook; logging before this only goes to stderr.
 pub fn init(dir: PathBuf, sink: LineSink) {
+    let _ = LOG_DIR.set(dir.clone());
     let stamp = {
         let (ts, ms) = unix_parts();
         let days = ts.div_euclid(86_400);
@@ -199,7 +299,7 @@ pub fn log(level: Level, session: Option<u64>, phase: &str, msg: &str) {
         None => String::new(),
     };
     let line = format!(
-        "[{}] [{}] [{tag}] {}[{:>12}] {}",
+        "[{}] [{}] [{tag}] {}[{:<12}] {}",
         timestamp(),
         level.as_str(),
         sess,

@@ -47,6 +47,8 @@ tree-sitter-rust = "0.23"
 streaming-iterator = "0.1"
 similar = { version = "2.5", features = ["inline"] }
 regex = "1.11"
+# Content hashes for edit conflict detection and file checkpoints.
+sha2 = "0.10"
 # Local-time log timestamps (already in the dependency tree via tauri).
 chrono = "0.4"
 # OS Trash for `delete_file_or_folder` (Bionic §3.2): deletes are recoverable.
@@ -82,6 +84,11 @@ custom-protocol = ["tauri/custom-protocol"]
 gpu-cuda = ["llama-cpp-2/cuda"]
 # Enable llama.cpp's Apple Metal backend (macOS only).
 gpu-metal = ["llama-cpp-2/metal"]
+# Local semantic-embedding backend for `index_semantic_search`. The trait slot
+# (`SemanticSearchBackend`) compiles today with a keyword scorer; this feature
+# marks the embedder slot without pulling in model download/build cost by
+# default.
+embedder = []
 
 [profile.release]
 opt-level = 3

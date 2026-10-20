@@ -1,54 +1,30 @@
-import { useEffect, useRef, useState } from "react";
-import { useApp } from "../context/AppContext";
+import { useState, useMemo } from "react";
+import { useChat, useShell, useContextPane } from "../context/AppContext";
+import { useAgentStreamContext } from "../context/AgentStreamContext";
 import { api } from "../lib/ipc";
+import { workspaceSuggestions } from "../lib/emptyState";
 import FileTreePanel from "../components/editor/FileTreePanel";
 import EditorPane from "../components/editor/EditorPane";
-import MessageList from "../components/MessageList";
-import ActivityPanel from "../components/ActivityPanel";
-import HitlGateway from "../components/chat/HitlGateway";
-import AgentTimeline from "../components/chat/AgentTimeline";
-import { PermissionPrompt, QuestionPrompt } from "../components/chat/PermissionPrompt";
+import TerminalDrawer from "../components/editor/TerminalDrawer";
+import AgentChatSurface from "../components/AgentChatSurface";
 import ChatComposer from "../components/ChatComposer";
-import { useAgentStream } from "../hooks/useAgentStream";
 import "./WorkspacePage.css";
 
 function WorkspacePage() {
-  const { messages, activityLog, addContextPath, projectPath, setProjectPath } = useApp();
-  const {
-    liveTools,
-    hitlGate,
-    resolveGate,
-    planSteps,
-    todos,
-    subtasks,
-    bgTasks,
-    abortBackgroundTask,
-    permission,
-    respondPermission,
-    question,
-    respondQuestion,
-  } = useAgentStream();
+  const { messages } = useChat();
+  const { projectPath, setProjectPath } = useShell();
+  const { addContextPath } = useContextPane();
+  const { liveTools } = useAgentStreamContext();
   const [selected, setSelected] = useState<string | null>(null);
-  const [activityCollapsed, setActivityCollapsed] = useState(false);
-  const [stickBottom, setStickBottom] = useState(true);
+  const [focusLine, setFocusLine] = useState<number | null>(null);
   const [treeW, setTreeW] = useState(240);
   const [chatW, setChatW] = useState(400);
   const [dragging, setDragging] = useState<null | "tree" | "chat">(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && stickBottom) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [messages, liveTools, stickBottom]);
-
-  const handleScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    setStickBottom(nearBottom);
-  };
+  const [termOpen, setTermOpen] = useState(false);
+  const suggestions = useMemo(
+    () => workspaceSuggestions(selected ? { path: selected, content: "" } : null),
+    [selected],
+  );
 
   const handleBrowse = async () => {
     try {
@@ -92,7 +68,18 @@ function WorkspacePage() {
       style={{ gridTemplateColumns: `${treeW}px 6px minmax(0, 1fr) 6px ${chatW}px` }}
     >
       <div className="workspace-pane workspace-tree">
-        <FileTreePanel projectPath={projectPath} selectedPath={selected} onSelect={setSelected} />
+        <FileTreePanel
+          projectPath={projectPath}
+          selectedPath={selected}
+          onSelect={(p) => {
+            setSelected(p);
+            setFocusLine(null);
+          }}
+          onOpenHit={(p, line) => {
+            setSelected(p);
+            setFocusLine(line);
+          }}
+        />
       </div>
       <div
         className={`workspace-divider${dragging === "tree" ? " dragging" : ""}`}
@@ -104,7 +91,9 @@ function WorkspacePage() {
           selectedPath={selected}
           projectPath={projectPath}
           onAddContext={(rel) => addContextPath(rel)}
+          focusLine={focusLine}
         />
+        <TerminalDrawer projectPath={projectPath} open={termOpen} onToggle={() => setTermOpen((v) => !v)} />
       </div>
       <div
         className={`workspace-divider${dragging === "chat" ? " dragging" : ""}`}
@@ -114,54 +103,41 @@ function WorkspacePage() {
       <div className="workspace-pane workspace-chat">
         <div className="workspace-chat-header">
           <span>Chat</span>
-          <button type="button" className="btn-index" onClick={() => void handleBrowse()} title="Change project folder">
+          <button
+            type="button"
+            className="btn-index"
+            onClick={() => void handleBrowse()}
+            title="Change project folder"
+          >
             {projectPath ? projectPath.split(/[/\\]/).pop() : "Set workspace"}
           </button>
         </div>
-        {hitlGate && (
-          <HitlGateway
-            reason={hitlGate.reason}
-            onApprove={() => void resolveGate(true)}
-            onDeny={() => void resolveGate(false)}
-          />
-        )}
-        {permission && <PermissionPrompt request={permission} onDecide={(d) => void respondPermission(d)} />}
-        {question && <QuestionPrompt request={question} onAnswer={(a) => void respondQuestion(a)} />}
-        <ActivityPanel
-          logs={activityLog}
-          collapsed={activityCollapsed}
-          onToggle={() => setActivityCollapsed(!activityCollapsed)}
+        <AgentChatSurface
+          messages={messages}
+          liveTools={liveTools}
+          scrollClassName="workspace-chat-scroll"
+          emptyState={
+            <div className="workspace-chat-empty">
+              <p>Ask the agent to explore or edit code — changes appear in the editor pane.</p>
+              <div className="workspace-chat-suggestions">
+                {suggestions.slice(0, 4).map((s) => (
+                  <button
+                    key={s.prompt}
+                    type="button"
+                    className="chat-suggestion"
+                    onClick={() =>
+                      window.dispatchEvent(
+                        new CustomEvent("vencoder-prefill-composer", { detail: s.prompt }),
+                      )
+                    }
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          }
         />
-        <AgentTimeline
-          planSteps={planSteps}
-          subtasks={subtasks}
-          todos={todos}
-          bgTasks={bgTasks}
-          onAbortBackground={(id) => void abortBackgroundTask(id)}
-        />
-        <div className="workspace-chat-scroll" ref={scrollRef} onScroll={handleScroll}>
-          {messages.length === 0 ? (
-            <div className="workspace-chat-empty">Ask the agent to explore or edit code — changes appear in the editor pane.</div>
-          ) : (
-            <MessageList messages={messages} liveTools={liveTools} />
-          )}
-          {!stickBottom && messages.length > 0 && (
-            <button
-              type="button"
-              className="chat-scroll-down"
-              onClick={() => {
-                const el = scrollRef.current;
-                if (el) {
-                  el.scrollTop = el.scrollHeight;
-                  setStickBottom(true);
-                }
-              }}
-              title="Jump to latest"
-            >
-              ↓ latest
-            </button>
-          )}
-        </div>
         <div className="workspace-composer">
           <ChatComposer variant="bottom" />
         </div>

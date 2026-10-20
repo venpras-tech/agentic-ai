@@ -42,6 +42,11 @@ describe("recordToMessage", () => {
     expect(m?.ts).toBe(1234);
     expect(m?.done).toEqual({ outputTokens: 42 });
   });
+
+  it("carries the turnId through for stable list keys", () => {
+    const m = recordToMessage(rec({ turnId: "t-abc", content: "x" }));
+    expect(m?.turnId).toBe("t-abc");
+  });
 });
 
 describe("hydrateContextFromSession", () => {

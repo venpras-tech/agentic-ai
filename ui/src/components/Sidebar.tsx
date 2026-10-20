@@ -1,7 +1,8 @@
 import { useEffect, useCallback, useRef, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { useApp } from "../context/AppContext";
+import { useShell, useModel, useChat } from "../context/AppContext";
 import { api, isTauriRuntime } from "../lib/ipc";
+import WorkspaceSwitcher from "./WorkspaceSwitcher";
 import "./Sidebar.css";
 
 function HomeIcon() {
@@ -115,14 +116,13 @@ function Sidebar() {
   const {
     sidebarCollapsed,
     toggleSidebar,
-    modelName,
-    modelProvider,
     projectPath,
     backendConnected,
     setBackendConnected,
-    newChatSession,
     toggleHistoryPanel,
-  } = useApp();
+  } = useShell();
+  const { modelName, modelProvider } = useModel();
+  const { newChatSession } = useChat();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -326,6 +326,7 @@ function Sidebar() {
           <div className="side-nav-project-footer" title={projectPath || ""}>
             Project: {projectPath ? projectPath.split(/[/\\]/).pop() : "—"}
           </div>
+          <WorkspaceSwitcher />
         </div>
       </nav>
     </aside>

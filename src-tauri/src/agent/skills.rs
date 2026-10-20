@@ -103,7 +103,10 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             _ => false,
         }
     }
-    match_here(&pattern.chars().collect::<Vec<char>>(), &text.chars().collect::<Vec<char>>())
+    match_here(
+        &pattern.chars().collect::<Vec<char>>(),
+        &text.chars().collect::<Vec<char>>(),
+    )
 }
 
 impl Default for KnowledgeState {
@@ -248,10 +251,8 @@ impl KnowledgeState {
             Some(s) => {
                 s.active = active;
                 // Persist the active state to disk so it survives restarts.
-                let state: HashMap<String, bool> = skills
-                    .iter()
-                    .map(|(n, s)| (n.clone(), s.active))
-                    .collect();
+                let state: HashMap<String, bool> =
+                    skills.iter().map(|(n, s)| (n.clone(), s.active)).collect();
                 drop(skills);
                 self.save_active_state(&state);
                 Ok(())
@@ -358,7 +359,13 @@ impl KnowledgeState {
         let safe: String = name
             .trim()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         if safe.is_empty() {
             return Err("Skill name cannot be empty".to_string());
@@ -485,8 +492,13 @@ impl KnowledgeState {
                     score += 100;
                 }
             }
-            let hay = format!("{} {} {}", skill.name, skill.description, skill.tags.join(" "))
-                .to_lowercase();
+            let hay = format!(
+                "{} {} {}",
+                skill.name,
+                skill.description,
+                skill.tags.join(" ")
+            )
+            .to_lowercase();
             for k in &keywords {
                 if hay.contains(k.as_str()) {
                     score += 1;
@@ -511,9 +523,8 @@ impl KnowledgeState {
             return Ok(());
         }
         let mem_dir = workspace.join(".ai");
-        std::fs::create_dir_all(&mem_dir).map_err(|e| {
-            format!("Failed to create `{}`: {e}", mem_dir.display())
-        })?;
+        std::fs::create_dir_all(&mem_dir)
+            .map_err(|e| format!("Failed to create `{}`: {e}", mem_dir.display()))?;
         let path = mem_dir.join("memory.md");
         let mut lines: Vec<String> = if path.is_file() {
             std::fs::read_to_string(&path)
@@ -538,13 +549,17 @@ impl KnowledgeState {
     /// Return the current auto-extracted memory text (if any) for loading into
     /// the model context on demand.
     pub fn memory_content(&self, workspace: &Path) -> String {
-        std::fs::read_to_string(workspace.join(".ai").join("memory.md"))
-            .unwrap_or_default()
+        std::fs::read_to_string(workspace.join(".ai").join("memory.md")).unwrap_or_default()
     }
 
     /// The first scanned workspace root (used for `.ai` file paths).
     pub fn workspace(&self) -> PathBuf {
-        self.roots.lock().unwrap().first().cloned().unwrap_or_default()
+        self.roots
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Render all *active* skills as one pinned "skill" buffer.
@@ -712,10 +727,7 @@ fn list_md(dir: &Path) -> Vec<PathBuf> {
 
 /// Directories skipped while walking for nested `AGENTS.md` files.
 fn is_skipped_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "node_modules" | ".git" | "target" | "dist" | ".ai"
-    )
+    matches!(name, "node_modules" | ".git" | "target" | "dist" | ".ai")
 }
 
 /// Depth-first walk for nested `AGENTS.md` under `workspace`, returning the
@@ -1131,7 +1143,10 @@ mod tests {
         );
         assert!(!ranked.is_empty());
         assert_eq!(ranked[0].1.name, "rust-guidelines");
-        assert_eq!(ranked[1].1.name, "sql-tables", "keyword-only still suggested");
+        assert_eq!(
+            ranked[1].1.name, "sql-tables",
+            "keyword-only still suggested"
+        );
 
         // A SQL-ish prompt with no file: only sql-tables should match.
         let ranked2 = ks.suggest("design the users table schema", None);
@@ -1185,7 +1200,9 @@ mod tests {
         assert!(!report.rules.contains("api uses rust conv"));
         assert!(!report.rules_sources.contains(&".ai/memory.md".to_string()));
         // The memory text is still reachable via `memory_content` / `workspace`.
-        assert!(ks.memory_content(&ks.workspace()).contains("api uses rust conv"));
+        assert!(ks
+            .memory_content(&ks.workspace())
+            .contains("api uses rust conv"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

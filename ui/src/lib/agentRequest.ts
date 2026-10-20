@@ -31,6 +31,10 @@ export interface BuildAgentRequestOptions {
   settings: Record<string, unknown>;
   maxSteps: number;
   verify: boolean;
+  /** Optional cap on total tokens for the run (0 = no cap). */
+  tokenBudget?: number;
+  /** Whether the run should search for a goal first, then focus in on it. */
+  decompose?: boolean;
   /** True when the local model is too small to drive a long agent loop. */
   smallModel: boolean;
   /** User-defined mode selected in the UI (`.ai/modes/*.md`). */
@@ -69,8 +73,7 @@ export function buildAgentRequest(opts: BuildAgentRequestOptions): AgentTaskRequ
   const maxSteps = opts.smallModel ? Math.min(stepSetting, 4) : stepSetting;
 
   // Accept the budget nested under `params` or at the settings top level.
-  const tokenBudgetRaw =
-    pick(params, "tokenBudget", "token_budget") ?? pick(s, "tokenBudget", "token_budget");
+  const tokenBudgetRaw = opts.tokenBudget ?? pick(params, "tokenBudget", "token_budget") ?? pick(s, "tokenBudget", "token_budget");
   const tokenBudget =
     tokenBudgetRaw == null || tokenBudgetRaw === 0
       ? undefined
@@ -84,7 +87,7 @@ export function buildAgentRequest(opts: BuildAgentRequestOptions): AgentTaskRequ
     planMode: opts.planMode ?? opts.uiMode === "plan",
     // Verification only makes sense for a mode that is allowed to edit.
     verify: opts.uiMode === "ask" ? false : bool(opts.verify, true),
-    decompose: bool(pick(params, "decompose"), false),
+    decompose: opts.decompose ?? bool(pick(params, "decompose"), false),
     // An explicit user mode wins; otherwise fall back to the built-in ask gate.
     agentMode: opts.selectedMode?.trim() || backendAgentMode(opts.uiMode),
     workflow: opts.selectedWorkflow?.trim() || undefined,

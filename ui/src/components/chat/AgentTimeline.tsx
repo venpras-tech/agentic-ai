@@ -1,17 +1,22 @@
+import { useState } from "react";
 import type {
   BackgroundTaskState,
   PlanStepState,
+  SubagentRunState,
   SubtaskState,
   TodoItemState,
 } from "../../hooks/useAgentStream";
+import BgTaskOutputDrawer from "./BgTaskOutputDrawer";
 import "./agentTimeline.css";
 
 interface AgentTimelineProps {
   planSteps: PlanStepState[];
   subtasks: SubtaskState[];
+  subagentRuns?: SubagentRunState[];
   todos: TodoItemState[];
   bgTasks: BackgroundTaskState[];
   onAbortBackground?: (taskId: string) => void;
+  onViewLog?: (query: string) => void;
 }
 
 const STEP_ICON: Record<string, string> = {
@@ -30,25 +35,40 @@ const TODO_ICON: Record<string, string> = {
   aborted: "⊘",
 };
 
+const RUN_ICON: Record<string, string> = {
+  started: "▸",
+  running: "▸",
+  completed: "✓",
+  done: "✓",
+  error: "✕",
+  failed: "✕",
+};
+
 /**
  * Live view of the agent's own bookkeeping: plan progress, decomposition
- * subtasks, the todo list, and background task pills. Renders nothing when the
- * backend has not reported any of it, so idle chats stay uncluttered.
+ * subtasks, first-class subagent runs, the todo list, and background task
+ * pills. Renders nothing when the backend has not reported any of it, so idle
+ * chats stay uncluttered.
  */
 function AgentTimeline({
   planSteps,
   subtasks,
+  subagentRuns = [],
   todos,
   bgTasks,
   onAbortBackground,
+  onViewLog,
 }: AgentTimelineProps) {
   const hasPlan = planSteps.length > 0;
   const hasSubtasks = subtasks.length > 0;
+  const hasRuns = subagentRuns.length > 0;
   const hasTodos = todos.length > 0;
   const hasBg = bgTasks.length > 0;
-  if (!hasPlan && !hasSubtasks && !hasTodos && !hasBg) return null;
+  const [openBgTaskId, setOpenBgTaskId] = useState<string | null>(null);
+  if (!hasPlan && !hasSubtasks && !hasRuns && !hasTodos && !hasBg) return null;
 
   const doneTodos = todos.filter((t) => t.done).length;
+  const runs = [...subagentRuns].sort((a, b) => a.startedAt - b.startedAt);
 
   return (
     <div className="agent-timeline">
@@ -88,6 +108,44 @@ function AgentTimeline({
         </section>
       )}
 
+      {hasRuns && (
+        <section className="tl-section" aria-label="Subagent runs">
+          <h4 className="tl-title">Subagents</h4>
+          <ul className="tl-steps">
+            {runs.map((r) => (
+              <li
+                key={r.key}
+                className={`tl-step tl-${r.status === "completed" ? "completed" : r.status}`}
+              >
+                <span className="tl-icon" aria-hidden="true">
+                  {RUN_ICON[r.status] ?? "•"}
+                </span>
+                <span className="tl-text">
+                  <span className="tl-run-profile">{r.profile}</span>
+                  {r.summary ? ` — ${r.summary}` : ""}
+                  {typeof r.durationMs === "number" && (
+                    <span className="tl-run-meta"> · {(r.durationMs / 1000).toFixed(1)}s</span>
+                  )}
+                  {typeof r.leasedWorkers === "number" && r.leasedWorkers > 0 && (
+                    <span className="tl-run-meta"> · {r.leasedWorkers} worker(s)</span>
+                  )}
+                  {onViewLog && (
+                    <button
+                      type="button"
+                      className="tl-run-log"
+                      onClick={() => onViewLog(r.profile)}
+                      title={`Filter activity to “${r.profile}” subagent runs`}
+                    >
+                      View log
+                    </button>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {hasTodos && (
         <section className="tl-section" aria-label="Todo list">
           <h4 className="tl-title">
@@ -116,7 +174,14 @@ function AgentTimeline({
                 className={`tl-bg-pill tl-bg-${t.status}`}
                 title={t.detail || undefined}
               >
-                <span className="tl-bg-label">{t.label}</span>
+                <button
+                  type="button"
+                  className="tl-bg-label"
+                  onClick={() => setOpenBgTaskId(openBgTaskId === t.id ? null : t.id)}
+                  title="Show task output"
+                >
+                  {t.label}
+                </button>
                 {onAbortBackground && t.status === "running" && (
                   <button
                     type="button"
@@ -130,6 +195,19 @@ function AgentTimeline({
               </span>
             ))}
           </div>
+          {openBgTaskId &&
+            bgTasks
+              .filter((t) => t.id === openBgTaskId)
+              .map((t) => (
+                <BgTaskOutputDrawer
+                  key={t.id}
+                  taskId={t.id}
+                  label={t.label}
+                  running={t.status === "running"}
+                  onClose={() => setOpenBgTaskId(null)}
+                  onAbort={onAbortBackground ? () => onAbortBackground(t.id) : undefined}
+                />
+              ))}
         </section>
       )}
     </div>

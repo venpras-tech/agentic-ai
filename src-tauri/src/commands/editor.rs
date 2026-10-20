@@ -235,6 +235,13 @@ pub async fn agent_set_workspace(
     if !p.is_dir() {
         return Err(format!("Not a directory: {}", p.display()));
     }
+    let changed = {
+        let guard = state.workspace.lock().await;
+        guard.first() != Some(&p)
+    };
+    if changed {
+        state.lsp.shutdown_all();
+    }
     state.workspace.lock().await.clear();
     state.workspace.lock().await.push(p.clone());
     let config_dir = app_config_dir(&app);
@@ -251,7 +258,10 @@ pub async fn agent_get_workspaces(
     state: State<'_, Arc<crate::agent::ToolState>>,
 ) -> Result<Vec<String>, String> {
     let guard = state.workspace.lock().await;
-    Ok(guard.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    Ok(guard
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// Add a workspace root (multi-root support). Scans skills/rules from it.
@@ -271,7 +281,10 @@ pub async fn agent_add_workspace(
     if !guard.contains(&p) {
         guard.push(p.clone());
     }
-    let workspaces: Vec<String> = guard.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+    let workspaces: Vec<String> = guard
+        .iter()
+        .map(|w| w.to_string_lossy().into_owned())
+        .collect();
     drop(guard);
     sync_modes(&p);
     let config_dir = app_config_dir(&app);
@@ -294,7 +307,10 @@ pub async fn agent_remove_workspace(
     let p = PathBuf::from(&root);
     let mut guard = state.workspace.lock().await;
     guard.retain(|w| w != &p);
-    let workspaces: Vec<String> = guard.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+    let workspaces: Vec<String> = guard
+        .iter()
+        .map(|w| w.to_string_lossy().into_owned())
+        .collect();
     drop(guard);
     let config_dir = app_config_dir(&app);
     if let Some(primary) = state.workspace.lock().await.first().cloned() {

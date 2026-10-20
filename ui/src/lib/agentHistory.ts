@@ -3,7 +3,7 @@ import { api, type SessionRecord } from "./ipc";
 /** Coerce a persisted record into a UI chat message, dropping empties. */
 export function recordToMessage(
   record: SessionRecord,
-): { role: "user" | "assistant" | "error"; content: string; ts?: number; done?: Record<string, unknown> } | null {
+): { role: "user" | "assistant" | "error"; content: string; ts?: number; turnId?: string; done?: Record<string, unknown> } | null {
   const content = (record.content ?? "").toString();
   if (!content.trim()) return null;
   const rawRole = (record.role ?? "assistant").toString();
@@ -13,6 +13,7 @@ export function recordToMessage(
     role,
     content,
     ts: typeof record.ts === "number" ? record.ts : undefined,
+    turnId: record.turnId,
     done: record.done,
   };
 }

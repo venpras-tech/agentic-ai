@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useApp } from "../context/AppContext";
-import { api, isTauriRuntime, type McpServerConfig, type Skill } from "../lib/ipc";
+import { useShell, useModel, useAgentSettings } from "../context/AppContext";
+import { api, isTauriRuntime, type McpServerConfig, type McpTransport, type McpProbeResult, type Skill } from "../lib/ipc";
 import { suggestLlmParams, type SystemSnapshot } from "../lib/modelSuggest";
 import {
   mergeLocalConfig,
@@ -19,8 +19,11 @@ type LlmSettings = import("../context/AppContext").LlmSettings;
 
 type McpForm = {
   name: string;
+  transport: McpTransport;
   bin: string;
   args: string;
+  url: string;
+  headers: string;
   env: string;
   allowedTools: string;
   enabled: boolean;
@@ -28,8 +31,11 @@ type McpForm = {
 
 const emptyForm: McpForm = {
   name: "",
+  transport: "stdio",
   bin: "",
   args: "",
+  url: "",
+  headers: "",
   env: "",
   allowedTools: "",
   enabled: true,
@@ -99,6 +105,16 @@ function parseEnv(text: string): Record<string, string> {
   return out;
 }
 
+function parseHeaders(text: string): Record<string, string> {
+  return parseEnv(text);
+}
+
+function formatStringMap(map: Record<string, string> | undefined): string {
+  return Object.entries(map || {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+}
+
 function validateCatalogJson(json: unknown):
   | { ok: true; servers: McpServerConfig[] }
   | { ok: false; error: string } {
@@ -124,9 +140,14 @@ function validateCatalogJson(json: unknown):
       return { ok: false, error: `Duplicate server name \`${name}\`.` };
     }
     seen.add(name);
+    const transport: McpTransport = s.transport === "http" ? "http" : "stdio";
     const bin = typeof s.bin === "string" ? s.bin.trim() : "";
-    if (!bin) {
+    const url = typeof s.url === "string" ? s.url.trim() : "";
+    if (transport === "stdio" && !bin) {
       return { ok: false, error: `Server \`${name}\` needs a non-empty \`bin\` command.` };
+    }
+    if (transport === "http" && !url) {
+      return { ok: false, error: `Server \`${name}\` needs a non-empty \`url\` for the http transport.` };
     }
     const args = Array.isArray(s.args)
       ? s.args.filter((a): a is string => typeof a === "string")
@@ -137,13 +158,22 @@ function validateCatalogJson(json: unknown):
         env[k] = String(v);
       }
     }
+    const headers: Record<string, string> = {};
+    if (s.headers && typeof s.headers === "object" && !Array.isArray(s.headers)) {
+      for (const [k, v] of Object.entries(s.headers as Record<string, unknown>)) {
+        headers[k] = String(v);
+      }
+    }
     const allowedTools = Array.isArray(s.allowedTools)
       ? s.allowedTools.filter((a): a is string => typeof a === "string")
       : [];
     servers.push({
       name,
+      transport,
       bin,
       args,
+      url,
+      headers,
       env,
       allowedTools,
       enabled: s.enabled !== false,
@@ -166,7 +196,9 @@ function BanIcon() {
 }
 
 function SettingsPage() {
-  const { theme, setTheme, llmSettings, loadLlmSettings, saveLlmSettings, modelMeta, projectPath, verify, setVerify, yolo, setYolo, maxSteps, setMaxSteps, activeModelConfig, activeLocalModelPath, saveLocalModelConfig } = useApp();
+  const { theme, setTheme, projectPath } = useShell();
+  const { llmSettings, loadLlmSettings, saveLlmSettings, modelMeta, activeModelConfig, activeLocalModelPath, saveLocalModelConfig } = useModel();
+  const { verify, setVerify, yolo, setYolo, maxSteps, setMaxSteps, tokenBudget, setTokenBudget, decompose, setDecompose, preferChatComplete, setPreferChatComplete } = useAgentSettings();
   const [activeSection, setActiveSection] = useState("general");
   const [formOpen, setFormOpen] = useState(false);
   const [servers, setServers] = useState<McpServerConfig[]>([]);
@@ -178,6 +210,7 @@ function SettingsPage() {
   const [mcpMode, setMcpMode] = useState<"form" | "json">("form");
   const [jsonText, setJsonText] = useState("");
   const [mcpMsg, setMcpMsg] = useState<{ text: string; error?: boolean } | null>(null);
+  const [probes, setProbes] = useState<Record<string, { busy?: boolean; result?: McpProbeResult; error?: string }>>({});
   const [skills, setSkills] = useState<Skill[]>([]);
   const [rulesSources, setRulesSources] = useState<string[]>([]);
   const [skillsLoaded, setSkillsLoaded] = useState(false);
@@ -203,6 +236,8 @@ function SettingsPage() {
     port: null,
   });
   const [apiSrvBusy, setApiSrvBusy] = useState(false);
+  const [agentApiInfoOpen, setAgentApiInfoOpen] = useState(false);
+  const [apiSrvTesting, setApiSrvTesting] = useState(false);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -341,6 +376,25 @@ function SettingsPage() {
       void saveApiServer({ ...apiSrv, port: parsed });
     }
   };
+
+  const apiSrvTest = async () => {
+    if (apiSrvTesting) return;
+    setApiSrvTesting(true);
+    const port = apiSrvStatus.port ?? apiSrv.port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { data?: unknown[] };
+      const count = Array.isArray(data.data) ? data.data.length : 0;
+      notify(count > 0 ? `Server OK — ${count} model(s) available.` : "Server OK — no model loaded.", count === 0);
+    } catch (err) {
+      notify(`Could not reach the server: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      setApiSrvTesting(false);
+    }
+  };
+
+  const apiSrvPort = apiSrvStatus.port ?? apiSrv.port;
 
   useEffect(() => {
     setDraftLlm(llmSettings);
@@ -526,8 +580,11 @@ function SettingsPage() {
   const addSampleMcpServer = () => {
     const entry: McpServerConfig = {
       name: "filesystem",
+      transport: "stdio",
       bin: "npx",
       args: sampleMcpArgs(),
+      url: "",
+      headers: {},
       env: {},
       allowedTools: [],
       enabled: true,
@@ -576,7 +633,7 @@ function SettingsPage() {
       });
   }, []);
 
-  useEffect(() => {
+  const loadKnowledge = useCallback(() => {
     if (!isTauriRuntime()) {
       setSkillsLoaded(true);
       return;
@@ -594,6 +651,16 @@ function SettingsPage() {
       });
   }, []);
 
+  useEffect(() => {
+    loadKnowledge();
+  }, [loadKnowledge]);
+
+  useEffect(() => {
+    const onChanged = () => loadKnowledge();
+    window.addEventListener("vencoder-skills-changed", onChanged);
+    return () => window.removeEventListener("vencoder-skills-changed", onChanged);
+  }, [loadKnowledge]);
+
   const openAdd = () => {
     setForm(emptyForm);
     setEditIndex(null);
@@ -604,9 +671,12 @@ function SettingsPage() {
     const s = servers[idx];
     setForm({
       name: s.name,
+      transport: s.transport === "http" ? "http" : "stdio",
       bin: s.bin,
       args: s.args.join(" "),
-      env: Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+      url: s.url || "",
+      headers: formatStringMap(s.headers),
+      env: formatStringMap(s.env),
       allowedTools: (s.allowedTools || []).join(", "),
       enabled: s.enabled,
     });
@@ -622,6 +692,33 @@ function SettingsPage() {
 
   const toggleEnabled = (idx: number) => {
     setServers((prev) => prev.map((s, i) => (i === idx ? { ...s, enabled: !s.enabled } : s)));
+    setDirty(true);
+  };
+
+  const probeServer = async (name: string) => {
+    setProbes((prev) => ({ ...prev, [name]: { busy: true } }));
+    try {
+      const result = await api.mcpServerProbe(name);
+      setProbes((prev) => ({ ...prev, [name]: { result } }));
+    } catch (err) {
+      const msg = String((err as { message?: string })?.message ?? err);
+      setProbes((prev) => ({ ...prev, [name]: { error: msg } }));
+    }
+  };
+
+  const toggleServerTool = (idx: number, tool: string) => {
+    setServers((prev) =>
+      prev.map((s, i) => {
+        if (i !== idx) return s;
+        const known = probes[s.name]?.result?.tools ?? [];
+        const current = s.allowedTools.length === 0 ? [...known] : [...s.allowedTools];
+        const set = new Set(current);
+        if (set.has(tool)) set.delete(tool);
+        else set.add(tool);
+        const next = known.length > 0 && known.every((t) => set.has(t)) ? [] : Array.from(set);
+        return { ...s, allowedTools: next };
+      }),
+    );
     setDirty(true);
   };
 
@@ -741,20 +838,27 @@ function SettingsPage() {
 
   const submitForm = () => {
     const name = form.name.trim();
-    const bin = form.bin.trim();
     if (!name) {
       setMcpMsg({ text: "Server name is required.", error: true });
       return;
     }
-    if (!bin) {
-      setMcpMsg({ text: "Command (executable) is required.", error: true });
+    if (form.transport === "http") {
+      if (!form.url.trim()) {
+        setMcpMsg({ text: "URL is required for the http transport.", error: true });
+        return;
+      }
+    } else if (!form.bin.trim()) {
+      setMcpMsg({ text: "Command (executable) is required for the stdio transport.", error: true });
       return;
     }
     const entry: McpServerConfig = {
       name,
-      bin,
-      args: parseArgs(form.args),
-      env: parseEnv(form.env),
+      transport: form.transport,
+      bin: form.transport === "stdio" ? form.bin.trim() : "",
+      args: form.transport === "stdio" ? parseArgs(form.args) : [],
+      url: form.transport === "http" ? form.url.trim() : "",
+      headers: form.transport === "http" ? parseHeaders(form.headers) : {},
+      env: form.transport === "stdio" ? parseEnv(form.env) : {},
       allowedTools: form.allowedTools.split(",").map((t) => t.trim()).filter(Boolean),
       enabled: form.enabled,
     };
@@ -1143,10 +1247,21 @@ function SettingsPage() {
               <div className="settings-local-server">
                 <div className="settings-local-server-head">
                   <strong>OpenAI-compatible endpoint</strong>
-                  <span className={`settings-local-server-status${apiSrvStatus.running ? " on" : ""}`}>
-                    {apiSrvStatus.running
-                      ? `Running — http://127.0.0.1:${apiSrvStatus.port ?? apiSrv.port}/v1`
-                      : "Stopped"}
+                  <span className="settings-local-server-head-right">
+                    <span className={`settings-local-server-status${apiSrvStatus.running ? " on" : ""}`}>
+                      {apiSrvStatus.running
+                        ? `Running — http://127.0.0.1:${apiSrvStatus.port ?? apiSrv.port}/v1`
+                        : "Stopped"}
+                    </span>
+                    <button
+                      type="button"
+                      className={`settings-info-btn${agentApiInfoOpen ? " active" : ""}`}
+                      title="Agent automation API & curl examples"
+                      aria-expanded={agentApiInfoOpen}
+                      onClick={() => setAgentApiInfoOpen((o) => !o)}
+                    >
+                      <InfoIcon />
+                    </button>
                   </span>
                 </div>
                 <p className="settings-hint">
@@ -1202,6 +1317,14 @@ function SettingsPage() {
                   />
                 </div>
                 <div className="settings-server-actions">
+                  <button
+                    type="button"
+                    className="settings-btn"
+                    onClick={() => void apiSrvTest()}
+                    disabled={apiSrvTesting}
+                  >
+                    {apiSrvTesting ? "Testing…" : "Test connection"}
+                  </button>
                   {apiSrvStatus.running ? (
                     <button type="button" className="settings-btn settings-btn-danger" onClick={() => void apiSrvStop()} disabled={apiSrvBusy}>
                       {apiSrvBusy ? "Stopping…" : "Stop server"}
@@ -1212,6 +1335,30 @@ function SettingsPage() {
                     </button>
                   )}
                 </div>
+                {agentApiInfoOpen && (
+                  <div className="settings-sample-panel">
+                    <div className="settings-sample-head">
+                      <span className="settings-sample-title">Agent automation API (curl)</span>
+                    </div>
+                    <p className="settings-hint">
+                      In addition to chat completions, the server exposes agentic task execution. A task
+                      starts by number and streams progress on the <code>agent://*</code> event bus; poll the
+                      trace endpoint for a step-by-step log.
+                    </p>
+                    <pre className="settings-sample-code">{`# Start an agentic task (returns { "sessionId": <n> })
+curl -s http://127.0.0.1:${apiSrvPort}/v1/agent/tasks \\
+  -H "Content-Type: application/json" \\
+  -d '{"prompt":"add a hello() function to util.ts","maxTokens":2048}'
+
+# Fetch the recorded per-step run trace
+curl -s http://127.0.0.1:${apiSrvPort}/v1/agent/sessions/1/trace
+
+# Plain chat completion (OpenAI-compatible)
+curl -s http://127.0.0.1:${apiSrvPort}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages":[{"role":"user","content":"hi"}]}'`}</pre>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1304,11 +1451,12 @@ function SettingsPage() {
                       spellCheck={false}
                       value={jsonText}
                       onChange={(e) => setJsonText(e.target.value)}
-                      placeholder={'[\n  {\n    "name": "playwright",\n    "bin": "npx",\n    "args": ["@playwright/mcp@latest"],\n    "env": {},\n    "allowedTools": [],\n    "enabled": true\n  }\n]'}
+                      placeholder={'[\n  {\n    "name": "playwright",\n    "transport": "stdio",\n    "bin": "npx",\n    "args": ["@playwright/mcp@latest"],\n    "env": {},\n    "allowedTools": [],\n    "enabled": true\n  },\n  {\n    "name": "remote",\n    "transport": "http",\n    "url": "https://host.example.com/mcp",\n    "headers": { "Authorization": "Bearer ..." },\n    "enabled": true\n  }\n]'}
                     />
                     <p className="settings-hint">
                       Accepts a single server object or an array. Fields: <code>name</code> (required),
-                      <code> bin</code> (required), <code>args</code>, <code>env</code>, <code>allowedTools</code>, <code>enabled</code>.
+                      <code> transport</code> (<code>stdio</code>/<code>http</code>), <code>bin</code>+<code>args</code>+<code>env</code> (stdio),
+                      <code> url</code>+<code>headers</code> (http), <code>allowedTools</code>, <code>enabled</code>.
                     </p>
                   </div>
                   <div className="settings-mcp-json-actions">
@@ -1333,37 +1481,79 @@ function SettingsPage() {
                       <p className="settings-hint">Unique name the agent uses to call this server.</p>
                     </div>
                     <div className="settings-field">
-                      <label className="settings-label" htmlFor="mcp-bin">Command</label>
-                      <input
-                        id="mcp-bin"
+                      <label className="settings-label" htmlFor="mcp-transport">Transport</label>
+                      <select
+                        id="mcp-transport"
                         className="settings-input"
-                        placeholder="e.g. npx"
-                        value={form.bin}
-                        onChange={(e) => setForm({ ...form, bin: e.target.value })}
-                      />
-                      <p className="settings-hint">Executable on PATH or absolute path (stdio transport).</p>
+                        value={form.transport}
+                        onChange={(e) => setForm({ ...form, transport: e.target.value as McpTransport })}
+                      >
+                        <option value="stdio">stdio (local command)</option>
+                        <option value="http">http (remote URL)</option>
+                      </select>
+                      <p className="settings-hint">How the agent connects to this server.</p>
                     </div>
-                    <div className="settings-field settings-mcp-full">
-                      <label className="settings-label" htmlFor="mcp-args">Arguments</label>
-                      <input
-                        id="mcp-args"
-                        className="settings-input"
-                        placeholder='e.g. "@playwright/mcp@latest" --browser chromium'
-                        value={form.args}
-                        onChange={(e) => setForm({ ...form, args: e.target.value })}
-                      />
-                    </div>
-                    <div className="settings-field">
-                      <label className="settings-label" htmlFor="mcp-env">Environment variables</label>
-                      <textarea
-                        id="mcp-env"
-                        className="settings-input settings-mcp-env"
-                        placeholder="API_KEY=sk-...\nDB_URL=postgres://localhost:5432/app"
-                        value={form.env}
-                        onChange={(e) => setForm({ ...form, env: e.target.value })}
-                      />
-                      <p className="settings-hint">One KEY=VALUE per line.</p>
-                    </div>
+                    {form.transport === "stdio" ? (
+                      <>
+                        <div className="settings-field">
+                          <label className="settings-label" htmlFor="mcp-bin">Command</label>
+                          <input
+                            id="mcp-bin"
+                            className="settings-input"
+                            placeholder="e.g. npx"
+                            value={form.bin}
+                            onChange={(e) => setForm({ ...form, bin: e.target.value })}
+                          />
+                          <p className="settings-hint">Executable on PATH or absolute path.</p>
+                        </div>
+                        <div className="settings-field settings-mcp-full">
+                          <label className="settings-label" htmlFor="mcp-args">Arguments</label>
+                          <input
+                            id="mcp-args"
+                            className="settings-input"
+                            placeholder='e.g. "@playwright/mcp@latest" --browser chromium'
+                            value={form.args}
+                            onChange={(e) => setForm({ ...form, args: e.target.value })}
+                          />
+                        </div>
+                        <div className="settings-field">
+                          <label className="settings-label" htmlFor="mcp-env">Environment variables</label>
+                          <textarea
+                            id="mcp-env"
+                            className="settings-input settings-mcp-env"
+                            placeholder="API_KEY=sk-...\nDB_URL=postgres://localhost:5432/app"
+                            value={form.env}
+                            onChange={(e) => setForm({ ...form, env: e.target.value })}
+                          />
+                          <p className="settings-hint">One KEY=VALUE per line.</p>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="settings-field settings-mcp-full">
+                          <label className="settings-label" htmlFor="mcp-url">URL</label>
+                          <input
+                            id="mcp-url"
+                            className="settings-input"
+                            placeholder="e.g. https://host.example.com/mcp"
+                            value={form.url}
+                            onChange={(e) => setForm({ ...form, url: e.target.value })}
+                          />
+                          <p className="settings-hint">Streamable HTTP endpoint of the MCP server.</p>
+                        </div>
+                        <div className="settings-field settings-mcp-full">
+                          <label className="settings-label" htmlFor="mcp-headers">Headers</label>
+                          <textarea
+                            id="mcp-headers"
+                            className="settings-input settings-mcp-env"
+                            placeholder="Authorization=Bearer sk-..."
+                            value={form.headers}
+                            onChange={(e) => setForm({ ...form, headers: e.target.value })}
+                          />
+                          <p className="settings-hint">One KEY=VALUE per line (e.g. auth tokens).</p>
+                        </div>
+                      </>
+                    )}
                     <div className="settings-field">
                       <label className="settings-label" htmlFor="mcp-tools">Allowed tools</label>
                       <input
@@ -1408,10 +1598,17 @@ function SettingsPage() {
                         <div className="settings-mcp-item-title">
                           <span className={`settings-mcp-badge${s.enabled ? " on" : " off"}`}>{s.enabled ? "enabled" : "disabled"}</span>
                           <span className="settings-mcp-item-name">{s.name}</span>
+                          <span className="settings-mcp-item-transport">{s.transport === "http" ? "http" : "stdio"}</span>
                         </div>
-                        <div className="settings-mcp-item-cmd" title={`${s.bin} ${s.args.join(" ")}`}>
-                          <code>{s.bin}</code> {s.args.join(" ")}
-                        </div>
+                        {s.transport === "http" ? (
+                          <div className="settings-mcp-item-cmd" title={s.url || ""}>
+                            <code>{s.url}</code>
+                          </div>
+                        ) : (
+                          <div className="settings-mcp-item-cmd" title={`${s.bin} ${s.args.join(" ")}`}>
+                            <code>{s.bin}</code> {s.args.join(" ")}
+                          </div>
+                        )}
                         {s.allowedTools.length > 0 && (
                           <div className="settings-mcp-item-tools">Tools: {s.allowedTools.join(", ")}</div>
                         )}
@@ -1424,11 +1621,52 @@ function SettingsPage() {
                           <input type="checkbox" checked={s.enabled} onChange={() => toggleEnabled(idx)} />
                           <span>Active</span>
                         </label>
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn-small"
+                          onClick={() => void probeServer(s.name)}
+                          disabled={probes[s.name]?.busy || !s.enabled}
+                          title={s.enabled ? "Connect and list tools" : "Enable the server first"}
+                        >
+                          {probes[s.name]?.busy ? "Testing…" : "Test"}
+                        </button>
                         <button type="button" className="settings-btn settings-btn-small" onClick={() => openEdit(idx)}>Edit</button>
                         <button type="button" className="settings-btn settings-btn-small settings-btn-danger" onClick={() => removeServer(idx)} title="Remove">
                           <BanIcon />
                         </button>
                       </div>
+                      {probes[s.name] && (
+                        <div className="settings-mcp-probe">
+                          {probes[s.name].error ? (
+                            <span className="settings-mcp-probe-error">✗ {probes[s.name].error}</span>
+                          ) : probes[s.name].busy ? (
+                            <span className="settings-mcp-probe-pending">Connecting…</span>
+                          ) : probes[s.name].result && !probes[s.name].result!.ok ? (
+                            <span className="settings-mcp-probe-error">✗ {probes[s.name].result!.error || "Failed to connect"}</span>
+                          ) : probes[s.name].result ? (
+                            <>
+                              <span className="settings-mcp-probe-ok">
+                                ✓ {probes[s.name].result!.tools.length} tool{probes[s.name].result!.tools.length === 1 ? "" : "s"}
+                                {probes[s.name].result!.cached ? " (cached)" : ""}
+                              </span>
+                              {probes[s.name].result!.tools.length > 0 && (
+                                <div className="settings-mcp-probe-tools">
+                                  {probes[s.name].result!.tools.map((tool) => (
+                                    <label key={tool} className="settings-mcp-tool" title="Uncheck to hide this tool from the agent">
+                                      <input
+                                        type="checkbox"
+                                        checked={s.allowedTools.length === 0 || s.allowedTools.includes(tool)}
+                                        onChange={() => toggleServerTool(idx, tool)}
+                                      />
+                                      <span>{tool}</span>
+                                    </label>
+                                  ))}
+                                </div>
+                              )}
+                            </>
+                          ) : null}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1509,6 +1747,65 @@ function SettingsPage() {
                 <p className="settings-hint">
                   Upper bound on the number of tool calls a single task may make before the agent reports
                   back. Higher values let long-running tasks finish but cost more time and tokens.
+                </p>
+              </div>
+
+              <div className="settings-field">
+                <label className="settings-label" htmlFor="setting-token-budget">Token budget per task</label>
+                <div className="settings-slider-row">
+                  <input
+                    type="range"
+                    id="setting-token-budget"
+                    min="0"
+                    max="200000"
+                    step="5000"
+                    value={tokenBudget}
+                    onChange={(e) => setTokenBudget(Number(e.target.value))}
+                  />
+                  <span className="settings-slider-value">
+                    {tokenBudget === 0 ? "Off" : tokenBudget.toLocaleString()}
+                  </span>
+                </div>
+                <p className="settings-hint">
+                  Total input+output token cap for a single agent run. At 0 there is no cap, and the run stops
+                  once it reaches the budget instead of continuing into more steps.
+                </p>
+              </div>
+
+              <div className="settings-field">
+                <label className="settings-label" htmlFor="setting-decompose">
+                  <label className="settings-check settings-check-inline">
+                    <input
+                      type="checkbox"
+                      id="setting-decompose"
+                      checked={decompose}
+                      onChange={(e) => setDecompose(e.target.checked)}
+                    />
+                    <span>Decompose the goal first</span>
+                  </label>
+                </label>
+                <p className="settings-hint">
+                  Runs a goal-search phase that lists the ways to read the request before committing to one
+                  and executing it. Slower, but less likely to head down the wrong path on vague tasks.
+                </p>
+              </div>
+
+              <div className="settings-field">
+                <label className="settings-label" htmlFor="setting-prefer-chat-complete">
+                  <label className="settings-check settings-check-inline">
+                    <input
+                      type="checkbox"
+                      id="setting-prefer-chat-complete"
+                      checked={preferChatComplete}
+                      onChange={(e) => setPreferChatComplete(e.target.checked)}
+                    />
+                    <span>Ask uses chat completion (faster, no tools)</span>
+                  </label>
+                </label>
+                <p className="settings-hint">
+                  When enabled, Ask mode sends a single chat-completion turn instead of starting the agent
+                  loop: lower latency and no tools can run, but the model cannot search or read files.
+                  Off by default.
                 </p>
               </div>
             </div>

@@ -12,3 +12,23 @@ LIBCLANG_PATH = "C:\\Users\\durga\\AppData\\Local\\LLVM-portable\\bin"
 # VS IDE - this machine has VS Build Tools only. Point it at the bundled cmake
 # explicitly.
 CMAKE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
+
+# Build llama.cpp's ggml kernels for this exact CPU.
+#
+# llama-cpp-sys-2's build script derives the GGML_* feature defines from
+# `CARGO_ENCODED_RUSTFLAGS` / `CARGO_CFG_TARGET_FEATURE`. With neither set it
+# falls back to `GGML_NATIVE=OFF` and a generic x86-64 baseline, so the build
+# came out without F16C or FMA even though the host CPU (and the stock
+# llama.cpp Windows binaries) have them - that is a straight throughput loss on
+# every token.
+#
+# `target-cpu=native` is detected by the build script and flips on
+# `GGML_NATIVE=ON`, which lets CMake probe the host for AVX2/F16C/FMA/AVX-VNNI
+# and pick the widest kernels it can actually run.
+#
+# Trade-off: the produced binary is no longer portable to older CPUs. For a
+# locally-built desktop app loaded from a local path that is the right default;
+# if you ever need a redistributable binary, drop this section and set
+# `GGML_AVX2`/`GGML_F16C`/`GGML_FMA` explicitly instead.
+[build]
+rustflags = ["-C", "target-cpu=native"]

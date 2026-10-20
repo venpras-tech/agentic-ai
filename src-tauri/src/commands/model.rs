@@ -11,10 +11,12 @@ use tauri_plugin_dialog::DialogExt;
 use crate::agent::interrupt::InterruptState;
 use crate::commands::settings::{models_dir, parse_settings};
 use crate::engine::{EnginePool, LoadProgressEvent, ModelInfo, ModelInitParams, TextGenerator};
-use crate::remote::{ProviderConfig, ProviderKind, ProviderRole, RemoteGenerator, RemoteModelConfig};
+use crate::remote::{
+    ProviderConfig, ProviderKind, ProviderRole, RemoteGenerator, RemoteModelConfig,
+};
 use crate::{
-    app_data_dir, install_local_model, spawn_emitter, ApiServerState, ContextState, DownloadControl,
-    HubState, InferenceState, ProviderRegistryState,
+    app_data_dir, install_local_model, spawn_emitter, ApiServerState, ContextState,
+    DownloadControl, HubState, InferenceState, ProviderRegistryState,
 };
 
 /// Pick a GGUF model file, load it and return its metadata. Blocking model
@@ -236,9 +238,9 @@ pub async fn configure_remote_model(
     let effective_config = {
         let reg = providers.0.lock().await;
         match reg.route(ProviderRole::Editor) {
-            Some(p) if p.kind != ProviderKind::Local => {
-                p.to_remote_model_config().unwrap_or_else(|_| config.clone())
-            }
+            Some(p) if p.kind != ProviderKind::Local => p
+                .to_remote_model_config()
+                .unwrap_or_else(|_| config.clone()),
             _ => config.clone(),
         }
     };
@@ -261,6 +263,9 @@ pub async fn configure_remote_model(
         .lock()
         .await
         .set_limit(info.context_size as usize);
+    // Remember the backend we just activated so a restart can reconnect without
+    // re-prompting for the key (the key stays out of localStorage / settings.json).
+    persist_remote_config(&app, &effective_config).await;
 
     let _ = app.emit_to(
         "main",
@@ -331,6 +336,40 @@ pub async fn providers_list(
     Ok(state.0.lock().await.providers().to_vec())
 }
 
+/// File that holds the last activated remote backend (including its API key)
+/// so a restart can reconnect without asking the user to re-enter the key.
+/// Kept out of `settings.json` deliberately: `settings_load` round-trips the
+/// whole `AppSettings` object to the webview, which would leak the key back
+/// into renderer JS. This file is only ever read through `remote_config_load`.
+fn remote_config_path(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join("active-remote.json")
+}
+
+/// Best-effort persist of the active remote backend. A failure here must never
+/// fail the model load itself (matching the `persist_model_path` convention).
+async fn persist_remote_config(app: &AppHandle, config: &RemoteModelConfig) {
+    let path = remote_config_path(app);
+    if let Some(dir) = path.parent() {
+        if tokio::fs::create_dir_all(dir).await.is_err() {
+            return;
+        }
+    }
+    if let Ok(text) = serde_json::to_string_pretty(config) {
+        let _ = tokio::fs::write(&path, text).await;
+    }
+}
+
+/// Read the last activated remote backend (provider/baseUrl/apiKey/model) so
+/// the UI can restore it on launch without holding the key in localStorage.
+#[tauri::command]
+pub async fn remote_config_load(app: AppHandle) -> Result<Option<RemoteModelConfig>, String> {
+    let path = remote_config_path(&app);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => Ok(serde_json::from_str(&text).ok()),
+        Err(_) => Ok(None),
+    }
+}
+
 #[tauri::command]
 pub async fn unload_model(
     state: State<'_, InferenceState>,
@@ -370,7 +409,10 @@ pub async fn loaded_model_path(state: State<'_, InferenceState>) -> Result<Optio
 
 /// Search the hub for GGUF repos (public models, no auth).
 #[tauri::command]
-pub async fn hf_search(query: String, limit: Option<usize>) -> Result<Vec<crate::hub::HfModel>, String> {
+pub async fn hf_search(
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::hub::HfModel>, String> {
     crate::hub::search(&query, limit.unwrap_or(20)).await
 }
 
@@ -427,18 +469,25 @@ pub async fn hf_download_model(
                     }
                 }
             }
-            let result = crate::hub::download_file(&models_dir, &repo, &file, &control.cancel, &control.paused, |p| {
-                let _ = app_sink.emit(
-                    "hf-download-progress",
-                    json!({
-                        "repoId": repo,
-                        "file": file,
-                        "receivedBytes": p.received,
-                        "totalBytes": p.total,
-                        "done": p.done,
-                    }),
-                );
-            })
+            let result = crate::hub::download_file(
+                &models_dir,
+                &repo,
+                &file,
+                &control.cancel,
+                &control.paused,
+                |p| {
+                    let _ = app_sink.emit(
+                        "hf-download-progress",
+                        json!({
+                            "repoId": repo,
+                            "file": file,
+                            "receivedBytes": p.received,
+                            "totalBytes": p.total,
+                            "done": p.done,
+                        }),
+                    );
+                },
+            )
             .await;
             match result {
                 Ok(_) => {
@@ -513,9 +562,7 @@ pub(crate) struct ActiveDownload {
 }
 
 #[tauri::command]
-pub async fn hf_list_active(
-    hub_state: State<'_, HubState>,
-) -> Result<Vec<ActiveDownload>, String> {
+pub async fn hf_list_active(hub_state: State<'_, HubState>) -> Result<Vec<ActiveDownload>, String> {
     use std::sync::atomic::Ordering;
     let active = hub_state.active.lock().await;
     Ok(active
@@ -555,7 +602,9 @@ pub async fn hf_resume_download(
             return hf_download_model(app, hub_state, repo_id, file_name).await;
         }
     };
-    control.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+    control
+        .paused
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     control.resume.notify_waiters();
     Ok(())
 }
@@ -691,6 +740,7 @@ pub(crate) struct ApiServerStatus {
 /// Start the loopback-only OpenAI-compatible server (idempotent).
 #[tauri::command]
 pub async fn api_server_start(
+    app: AppHandle,
     state: State<'_, ApiServerState>,
     port: Option<u16>,
 ) -> Result<ApiServerStatus, String> {
@@ -701,7 +751,7 @@ pub async fn api_server_start(
             port: Some(handle.port),
         });
     }
-    let handle = crate::api_server::start(state.engine.clone(), port.unwrap_or(8080))?;
+    let handle = crate::api_server::start(state.engine.clone(), port.unwrap_or(8080), app)?;
     let port = handle.port;
     *guard = Some(handle);
     Ok(ApiServerStatus {
@@ -723,7 +773,9 @@ pub async fn api_server_stop(state: State<'_, ApiServerState>) -> Result<ApiServ
 
 /// Current server status.
 #[tauri::command]
-pub async fn api_server_status(state: State<'_, ApiServerState>) -> Result<ApiServerStatus, String> {
+pub async fn api_server_status(
+    state: State<'_, ApiServerState>,
+) -> Result<ApiServerStatus, String> {
     let guard = state.server.lock().await;
     Ok(match guard.as_ref() {
         Some(h) => ApiServerStatus {
@@ -744,7 +796,10 @@ mod delete_tests {
 
     #[test]
     fn safe_file_names_are_bare_leaves() {
-        for good in ["model.gguf", "qwen2.5-coder-7b-instruct-q8_0-00001-of-00003.gguf"] {
+        for good in [
+            "model.gguf",
+            "qwen2.5-coder-7b-instruct-q8_0-00001-of-00003.gguf",
+        ] {
             assert!(is_safe_file_name(good), "should accept {good}");
         }
     }
@@ -770,9 +825,16 @@ mod delete_tests {
     fn paths_match_tolerates_case_differences() {
         // Windows filesystems are case-insensitive, so the loaded-path guard
         // must not be bypassed by a differently-cased copy of the same path.
-        let a = PathBuf::from(r"D:\ai\models\qwen2.5-0.5b-instruct-q4_k_m.gguf");
-        let b = PathBuf::from(r"D:\AI\Models\Qwen2.5-0.5B-Instruct-Q4_K_M.gguf");
+        // Use a probe file that actually exists so canonicalize resolves both
+        // spellings to the on-disk casing.
+        let dir = std::env::temp_dir().join("ai_editor_paths_match_probe");
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        let a = dir.join("CaseProbe.gguf");
+        std::fs::write(&a, b"x").expect("write probe file");
+        let mut b = a.clone();
+        b.set_file_name("CASEPROBE.GGUF");
         assert!(paths_match(&a, &b));
+        let _ = std::fs::remove_file(&a);
     }
 
     #[test]
@@ -829,7 +891,10 @@ mod delete_tests {
 
         assert!(!path.exists(), "file should be gone");
         assert_eq!(res.freed_bytes, 2048);
-        assert!(res.removed_repo_dir, "emptied repo folder should be removed");
+        assert!(
+            res.removed_repo_dir,
+            "emptied repo folder should be removed"
+        );
         assert!(
             !s.root.join("author--Repo-GGUF").exists(),
             "the emptied repo folder should be gone"
@@ -843,11 +908,7 @@ mod delete_tests {
     #[tokio::test]
     async fn keeps_the_folder_when_a_sibling_shard_remains() {
         let s = Scratch::new("sibling");
-        s.repo(
-            "author--Repo-GGUF",
-            "model-00001-of-00002.gguf",
-            512,
-        );
+        s.repo("author--Repo-GGUF", "model-00001-of-00002.gguf", 512);
         s.repo("author--Repo-GGUF", "model-00002-of-00002.gguf", 512);
 
         let res = delete_model_file(
@@ -921,7 +982,11 @@ mod delete_tests {
     #[tokio::test]
     async fn refuses_traversal_out_of_the_models_dir() {
         let s = Scratch::new("traversal");
-        let outside = s.root.parent().expect("parent of scratch").join("ai-editor-del-outside.gguf");
+        let outside = s
+            .root
+            .parent()
+            .expect("parent of scratch")
+            .join("ai-editor-del-outside.gguf");
         std::fs::write(&outside, b"precious").expect("write decoy");
 
         for bad in [
@@ -934,7 +999,10 @@ mod delete_tests {
                 .expect_err("must reject {bad}");
             assert!(err.contains("Invalid model file name"), "got: {err}");
         }
-        assert!(outside.exists(), "decoy outside the models dir must survive");
+        assert!(
+            outside.exists(),
+            "decoy outside the models dir must survive"
+        );
         let _ = std::fs::remove_file(&outside);
     }
 

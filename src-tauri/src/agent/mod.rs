@@ -20,19 +20,21 @@
 pub mod background;
 pub mod context;
 pub mod core;
+pub mod edits;
+pub mod hooks;
 pub mod interrupt;
 pub mod mcp;
 pub mod orchestrator;
 pub mod plan;
-pub mod prompt;
 pub mod policy;
+pub mod prompt;
 pub mod rag;
 pub mod registry;
 pub mod skills;
-pub mod smalltalk;
 pub mod subagent;
 pub mod todo;
 pub mod tools;
+pub mod verify;
 pub mod workflows;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -371,7 +373,7 @@ pub enum ToolCall {
     /// Fire-and-forget message addressed to the human user (not to the model).
     #[serde(rename_all = "camelCase")]
     SendToUser { message: String },
-/// Run a tree-sitter S-expression query against a source file and return
+    /// Run a tree-sitter S-expression query against a source file and return
     /// all matches with capture names, node text, and positions.
     #[serde(rename_all = "camelCase")]
     TreeSitterQuery {
@@ -488,10 +490,10 @@ impl ToolCall {
             ToolCall::SearchAttachedFiles { .. } => "search_attached_files",
             ToolCall::DetachFile { .. } => "detach_file",
             ToolCall::TranscribeAudio { .. } => "transcribe_audio",
-ToolCall::TreeSitterQuery { .. } => "tree_sitter_query",
+            ToolCall::TreeSitterQuery { .. } => "tree_sitter_query",
             ToolCall::AnalyzeBug { .. } => "analyze_bug",
             ToolCall::ReviewCode { .. } => "review_code",
-ToolCall::ViewRepoMap { .. } => "view_repo_map",
+            ToolCall::ViewRepoMap { .. } => "view_repo_map",
             ToolCall::BrowseWeb { .. } => "browse_web",
         }
     }
@@ -757,7 +759,7 @@ ToolCall::ViewRepoMap { .. } => "view_repo_map",
             ToolCall::TranscribeAudio { path, .. } => {
                 format!("Transcribing `{}`…", display_name(path))
             }
-ToolCall::TreeSitterQuery { path, query, .. } => {
+            ToolCall::TreeSitterQuery { path, query, .. } => {
                 let short: String = query.chars().take(60).collect();
                 format!("Tree-sitter query on `{}`: `{short}`…", display_name(path))
             }
@@ -836,11 +838,32 @@ pub struct AgentToolEvent {
     pub started_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Process exit code for shell tools, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Session this call belongs to, so the UI can attach it to the right
     /// turn even when events land after `activeSessionId` changes.
     pub session_id: u64,
+}
+
+/// Real-time event emitted when a first-class subagent run starts/completes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRunEvent {
+    pub parent_session_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<u64>,
+    pub profile: String,
+    pub status: String, // "started" | "completed" | "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leased_workers: Option<usize>,
 }
 
 /// Event asking the user to approve a policy-`ask` tool call.
@@ -905,6 +928,90 @@ pub struct FileChangedEvent {
     pub before: Option<String>,
 }
 
+/// Lifecycle of one proposed file edit as seen by the UI badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditStatus {
+    Pending,
+    Applied,
+    Rejected,
+    Failed,
+    Conflict,
+}
+
+/// One proposed file change waiting on (or resolved by) the user review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEdit {
+    pub id: String,
+    /// Workspace-relative path (forward slashes) when inside the workspace,
+    /// otherwise the absolute path (already vetted by the policy layer).
+    pub path: String,
+    /// 1-based inclusive line range the edit targets, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u64>,
+    /// "patch" | "search_replace" | "full_content".
+    pub kind: String,
+    /// Unified diff of before -> after, for the review pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// Full pre-change content (review pane + undo handling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Full post-change content, computed but not yet written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Free-form reason/summary supplied by the agent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+    pub status: EditStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Bundle of edits from one tool call, keyed by group id. Carried over
+/// `agent://edit-proposed` / `agent://edit-applied` / `agent://edit-failed`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditBatchEvent {
+    pub session_id: u64,
+    pub group_id: String,
+    pub edits: Vec<FileEdit>,
+    pub timestamp_ms: u64,
+}
+
+/// Internal verdict the user (via `apply_edits` / `reject_edits`) sends back to
+/// the tool call that is blocked awaiting review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditDecision {
+    Approve,
+    Reject,
+}
+
+/// A proposed-edit batch held while the user reviews it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingEditGroup {
+    pub id: String,
+    pub session_id: u64,
+    pub tool: String,
+    pub edits: Vec<FileEdit>,
+}
+
+/// Pre-apply snapshot of one edited file (stored under `{workspace}/.ai/undo/`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCheckpoint {
+    pub id: String,
+    pub path: String,
+    pub timestamp_ms: u64,
+    pub edit_id: String,
+    /// sha256 of the snapshot content, for conflict checks.
+    pub content_hash: String,
+}
+
 /// Per-plan-item progress event (blueprint §11 `step_started`/`step_completed`).
 /// Emitted on `agent://plan-step`.
 #[derive(Debug, Clone, Serialize)]
@@ -919,6 +1026,22 @@ pub struct PlanStepEvent {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Result of the post-edit background verify pass. Emitted on
+/// `agent://verify-result` so the UI can toast + log it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyResultEvent {
+    pub session_id: u64,
+    pub ok: bool,
+    /// Program/shell command that ran (empty when only LSP diagnostics ran).
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Truncated combined output for display.
+    pub output: String,
+    pub timestamp_ms: u64,
 }
 
 /// Live todo-list snapshot emitted on `agent://todo-update` after every
@@ -937,6 +1060,119 @@ pub struct ContextTrimmedEvent {
     pub session_id: u64,
     pub dropped: usize,
     pub remaining: usize,
+}
+
+/// Per-step run trace emitted on `agent://run-trace` after each generation
+/// step, so the UI can render a tool/token/duration timeline per turn.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTraceEvent {
+    pub session_id: u64,
+    /// 1-based step number, matching `agent-step`.
+    pub step_index: usize,
+    /// "Plan" / "Execute" / "Subtask i/n · …" / "Subagent · …" / "Plan item i/n · …".
+    pub group: String,
+    /// Tool names emitted by that step (empty when it produced no tool calls).
+    pub tools: Vec<String>,
+    /// Wall-clock duration of the step (generation + tool execution).
+    pub duration_ms: u64,
+    /// Prompt tokens consumed by this step's generation.
+    pub tokens_in: u64,
+    /// Output tokens produced by this step's generation.
+    pub tokens_out: u64,
+    /// "completed" | "failed" | "cancelled".
+    pub outcome: String,
+    pub timestamp_ms: u64,
+}
+
+/// Bounded per-session run-trace store (P3.2). Keeps the most recent
+/// [`MAX_TRACE_SESSIONS`] sessions, each with at most [`MAX_TRACE_EVENTS`]
+/// steps, so the HTTP trace endpoint (`GET /v1/agent/sessions/{id}/trace`) and
+/// the UI can export a run without unbounded memory retention.
+pub const MAX_TRACE_SESSIONS: usize = 50;
+pub const MAX_TRACE_EVENTS: usize = 500;
+
+#[derive(Default)]
+pub struct TraceStore {
+    sessions: std::collections::VecDeque<(u64, Vec<RunTraceEvent>)>,
+}
+
+impl TraceStore {
+    pub fn record(&mut self, event: RunTraceEvent) {
+        let sid = event.session_id;
+        if let Some(entry) = self.sessions.iter_mut().find(|(id, _)| *id == sid) {
+            entry.1.push(event);
+            if entry.1.len() > MAX_TRACE_EVENTS {
+                let excess = entry.1.len() - MAX_TRACE_EVENTS;
+                entry.1.drain(0..excess);
+            }
+        } else {
+            self.sessions.push_back((sid, vec![event]));
+            while self.sessions.len() > MAX_TRACE_SESSIONS {
+                self.sessions.pop_front();
+            }
+        }
+    }
+
+    pub fn get(&self, session_id: u64) -> Vec<RunTraceEvent> {
+        self.sessions
+            .iter()
+            .find(|(id, _)| *id == session_id)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod trace_store_tests {
+    use super::{RunTraceEvent, TraceStore, MAX_TRACE_EVENTS, MAX_TRACE_SESSIONS};
+
+    fn ev(session: u64, step: usize) -> RunTraceEvent {
+        RunTraceEvent {
+            session_id: session,
+            step_index: step,
+            group: "Execute".into(),
+            tools: Vec::new(),
+            duration_ms: 1,
+            tokens_in: 0,
+            tokens_out: 0,
+            outcome: "completed".into(),
+            timestamp_ms: 0,
+        }
+    }
+
+    #[test]
+    fn groups_by_session() {
+        let mut store = TraceStore::default();
+        store.record(ev(1, 1));
+        store.record(ev(1, 2));
+        store.record(ev(2, 1));
+        assert_eq!(store.get(1).len(), 2);
+        assert_eq!(store.get(2).len(), 1);
+        assert!(store.get(99).is_empty());
+    }
+
+    #[test]
+    fn evicts_oldest_session_beyond_cap() {
+        let mut store = TraceStore::default();
+        for s in 0..(MAX_TRACE_SESSIONS as u64 + 5) {
+            store.record(ev(s, 1));
+        }
+        assert!(store.get(0).is_empty(), "oldest session evicted");
+        let newest = MAX_TRACE_SESSIONS as u64 + 4;
+        assert_eq!(store.get(newest).len(), 1);
+    }
+
+    #[test]
+    fn per_session_events_trim_to_cap() {
+        let mut store = TraceStore::default();
+        for i in 0..(MAX_TRACE_EVENTS + 3) {
+            store.record(ev(7, i));
+        }
+        let got = store.get(7);
+        assert_eq!(got.len(), MAX_TRACE_EVENTS);
+        assert_eq!(got.last().unwrap().step_index, MAX_TRACE_EVENTS + 2);
+    }
 }
 
 /// A user message submitted while the agent was already running, waiting to be
@@ -1105,6 +1341,143 @@ impl BackgroundRegistry {
     }
 }
 
+/// How many background tasks keep an output buffer (oldest pruned first).
+const BG_OUTPUT_MAX_TASKS: usize = 16;
+/// Max retained lines per background task buffer.
+const BG_OUTPUT_MAX_LINES: usize = 400;
+/// Max characters retained for one not-yet-complete line of streamed tokens.
+const BG_OUTPUT_MAX_PARTIAL: usize = 8_192;
+/// Max characters of any single stored line.
+const BG_OUTPUT_LINE_CAP: usize = 2_000;
+
+struct TaskOutputBuffer {
+    lines: VecDeque<String>,
+    /// Tokens accumulated since the last newline (streamed assistant text).
+    partial: String,
+}
+
+#[derive(Default)]
+struct BackgroundOutputInner {
+    /// session_id → buffer. Survives task completion so the drawer can show
+    /// post-mortem output after the registry entry is removed.
+    buffers: HashMap<u64, TaskOutputBuffer>,
+    /// task_id → session_id (resolved once at bind time).
+    tasks: HashMap<String, u64>,
+    /// Insertion order of session ids, for pruning the oldest task.
+    order: Vec<u64>,
+}
+
+/// Ring buffer of recent output per background task. Background tasks run the
+/// agent loop (not a shell), so "output" is the streamed assistant text plus
+/// tool/step/done lines captured from the shared event funnel.
+pub struct BackgroundOutputStore {
+    inner: std::sync::Mutex<BackgroundOutputInner>,
+}
+
+impl Default for BackgroundOutputStore {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(BackgroundOutputInner::default()),
+        }
+    }
+}
+
+impl BackgroundOutputStore {
+    /// Bind a task id to its session, starting (or reusing) an output buffer.
+    pub fn bind(&self, task_id: &str, session_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.tasks.contains_key(task_id) {
+            inner.tasks.insert(task_id.to_string(), session_id);
+        }
+        if !inner.buffers.contains_key(&session_id) {
+            inner.order.push(session_id);
+        }
+        inner
+            .buffers
+            .entry(session_id)
+            .or_insert_with(|| TaskOutputBuffer {
+                lines: VecDeque::new(),
+                partial: String::new(),
+            });
+        while inner.order.len() > BG_OUTPUT_MAX_TASKS {
+            let Some(old) = inner.order.first().copied() else {
+                break;
+            };
+            inner.order.remove(0);
+            inner.buffers.remove(&old);
+            inner.tasks.retain(|_, sid| *sid != old);
+        }
+    }
+
+    /// Append a complete line (tool/step/done/error), flushing any partial
+    /// assistant text first so ordering is preserved.
+    pub fn record(&self, session_id: u64, line: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(buf) = inner.buffers.get_mut(&session_id) else {
+            return;
+        };
+        Self::flush_partial(buf);
+        Self::push_line(buf, line);
+    }
+
+    /// Append a streamed token delta; complete lines are drained as they form.
+    pub fn record_token(&self, session_id: u64, delta: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(buf) = inner.buffers.get_mut(&session_id) else {
+            return;
+        };
+        buf.partial.push_str(delta);
+        while let Some(pos) = buf.partial.find('\n') {
+            let line: String = buf.partial.drain(..=pos).collect();
+            Self::push_line(buf, line.trim_end_matches('\n'));
+        }
+        if buf.partial.len() > BG_OUTPUT_MAX_PARTIAL {
+            let overflow = std::mem::take(&mut buf.partial);
+            Self::push_line(buf, &overflow);
+        }
+    }
+
+    /// Push any remaining partial text as a final line (call on done/error).
+    pub fn flush(&self, session_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(buf) = inner.buffers.get_mut(&session_id) else {
+            return;
+        };
+        Self::flush_partial(buf);
+    }
+
+    /// Last `tail_lines` (default 200) for a task id; empty when unknown.
+    pub fn tail(&self, task_id: &str, tail_lines: Option<usize>) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        let Some(sid) = inner.tasks.get(task_id) else {
+            return Vec::new();
+        };
+        let Some(buf) = inner.buffers.get(sid) else {
+            return Vec::new();
+        };
+        let n = tail_lines.unwrap_or(200).clamp(1, BG_OUTPUT_MAX_LINES);
+        buf.lines.iter().rev().take(n).rev().cloned().collect()
+    }
+
+    fn flush_partial(buf: &mut TaskOutputBuffer) {
+        if !buf.partial.is_empty() {
+            let partial = std::mem::take(&mut buf.partial);
+            Self::push_line(buf, &partial);
+        }
+    }
+
+    fn push_line(buf: &mut TaskOutputBuffer, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let clipped: String = line.chars().take(BG_OUTPUT_LINE_CAP).collect();
+        buf.lines.push_back(clipped);
+        while buf.lines.len() > BG_OUTPUT_MAX_LINES {
+            buf.lines.pop_front();
+        }
+    }
+}
+
 /// Long-lived agent state managed by Tauri.
 pub struct ToolState {
     /// Current workspace root, shared with the workspace picker.
@@ -1114,14 +1487,14 @@ pub struct ToolState {
     pub yolo: std::sync::atomic::AtomicBool,
     /// Per-session path grants for paths outside the workspace.
     pub path_grants: std::sync::Mutex<Vec<PathGrant>>,
-    /// Cached MCP server connections, keyed by `bin + args`.
-    pub mcp_servers: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<mcp::McpHandle>>>>,
+    /// Cached MCP server connections, keyed by `McpServerConfig::cache_key()`.
+    pub mcp_servers: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<mcp::McpClient>>>>,
     /// Monotonic event id counter.
     pub id: AtomicU64,
     /// Pending permission requests keyed by request id (see `policy::check`).
     pub permission_requests:
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>>,
-/// Pending `ask_question` requests keyed by request id (P1-9). The agent
+    /// Pending `ask_question` requests keyed by request id (P1-9). The agent
     /// blocks on the channel until the user answers via `agent_respond_question`.
     pub pending_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// Pending `<hitl_gate>` approval requests keyed by request id. The agent
@@ -1160,6 +1533,9 @@ pub struct ToolState {
     /// Background task registry (P2-12): tracks tasks running independently
     /// of the foreground chat, each with its own cancellation token.
     pub background_tasks: BackgroundRegistry,
+    /// Per-task output ring buffers for background tasks (P2.2): streamed
+    /// assistant text + tool/step lines, keyed by session id.
+    pub background_output: BackgroundOutputStore,
     /// Cached TF-IDF index for semantic search (P0-3). Invalidated when
     /// workspace changes or a different root/include is requested.
     pub sem_index: std::sync::Mutex<Option<tools::SemIndex>>,
@@ -1178,6 +1554,21 @@ pub struct ToolState {
     /// is already in flight. Queueing here and draining inside the loop is what
     /// makes "steer" take effect on a turn that is already running.
     pub steer_queue: std::sync::Mutex<VecDeque<SteerMessage>>,
+    /// Proposed file edits awaiting user review, keyed by group id.
+    pub pending_edits: std::sync::Mutex<HashMap<String, PendingEditGroup>>,
+    /// Decision channels for blocked edit tools, keyed by group id. The tool
+    /// awaits the oneshot until the user answers via `apply_edits` /
+    /// `reject_edits` (or a 10-minute timeout fires).
+    pub edit_decisions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>>,
+    /// Pre-apply file snapshots for `checkpoint_restore`, newest last.
+    pub file_checkpoints: std::sync::Mutex<Vec<FileCheckpoint>>,
+    /// LSP diagnostics manager, shared with the editor gutter (`lsp_diagnostics`
+    /// command). The verify pass uses it to fold real diagnostics into the
+    /// post-edit report shown to the model.
+    pub lsp: std::sync::Arc<crate::lsp::LspManager>,
+    /// Bounded per-session run traces (P3.2), feeding the HTTP trace endpoint
+    /// and the UI export.
+    pub traces: std::sync::Mutex<TraceStore>,
 }
 
 impl Default for ToolState {
@@ -1188,7 +1579,7 @@ impl Default for ToolState {
             path_grants: std::sync::Mutex::new(Vec::new()),
             mcp_servers: Mutex::new(HashMap::new()),
             id: AtomicU64::new(1),
-permission_requests: Mutex::new(HashMap::new()),
+            permission_requests: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
             pending_hitl: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
@@ -1202,10 +1593,16 @@ permission_requests: Mutex::new(HashMap::new()),
             session_id: std::sync::atomic::AtomicU64::new(0),
             leased_workers: std::sync::Mutex::new(HashSet::new()),
             background_tasks: BackgroundRegistry::default(),
+            background_output: BackgroundOutputStore::default(),
             sem_index: std::sync::Mutex::new(None),
             repo_graph: tokio::sync::Mutex::new(HashMap::new()),
             step_checkpointed: std::sync::atomic::AtomicBool::new(false),
             steer_queue: std::sync::Mutex::new(VecDeque::new()),
+            pending_edits: std::sync::Mutex::new(HashMap::new()),
+            edit_decisions: Mutex::new(HashMap::new()),
+            file_checkpoints: std::sync::Mutex::new(Vec::new()),
+            lsp: std::sync::Arc::new(crate::lsp::LspManager::default()),
+            traces: std::sync::Mutex::new(TraceStore::default()),
         }
     }
 }
@@ -1213,6 +1610,21 @@ permission_requests: Mutex::new(HashMap::new()),
 impl ToolState {
     pub fn next_event_id(&self) -> String {
         format!("tool-{}", self.id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Append a run-trace step to the bounded per-session store (P3.2).
+    pub fn record_trace(&self, event: RunTraceEvent) {
+        if let Ok(mut store) = self.traces.lock() {
+            store.record(event);
+        }
+    }
+
+    /// Snapshot the recorded run trace for a session (empty when unknown).
+    pub fn traces_for(&self, session_id: u64) -> Vec<RunTraceEvent> {
+        self.traces
+            .lock()
+            .map(|store| store.get(session_id))
+            .unwrap_or_default()
     }
 
     /// Queue a user message for injection at the top of the next agent step.
@@ -1266,7 +1678,7 @@ impl ToolState {
         format!("perm-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
     }
 
-/// Fresh id for a pending `ask_question` request.
+    /// Fresh id for a pending `ask_question` request.
     pub fn next_question_id(&self) -> String {
         format!("q-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
     }
@@ -1274,6 +1686,21 @@ impl ToolState {
     /// Fresh id for a pending `<hitl_gate>` approval request.
     pub fn next_hitl_id(&self) -> String {
         format!("hitl-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Fresh group id for a proposed-edit batch.
+    pub fn next_edit_group_id(&self) -> String {
+        format!("edit-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Fresh id for one proposed file edit within a batch.
+    pub fn next_edit_id(&self) -> String {
+        format!("ed-{}", self.id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Fresh id for a pre-apply file snapshot.
+    pub fn next_checkpoint_id(&self) -> String {
+        format!("snap-{}", self.request_id.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Remember which session is running the agent loop, so the `execute_plan`
@@ -1287,7 +1714,7 @@ impl ToolState {
         self.workspace.lock().await.first().cloned()
     }
 
-/// Return all workspace roots.
+    /// Return all workspace roots.
     #[allow(dead_code)]
     pub async fn all_workspaces(&self) -> Vec<PathBuf> {
         self.workspace.lock().await.clone()
@@ -1300,7 +1727,6 @@ impl ToolState {
 
     /// Persist the current in-memory session permissions to
     /// `{workspace}/.ai/session-permissions.json` (first workspace root).
-    #[allow(dead_code)]
     pub fn save_session_allow(&self) {
         let Some(path) = self.permissions_path() else {
             return;
@@ -1322,13 +1748,19 @@ impl ToolState {
             v
         };
         let payload = serde_json::json!({ "tools": entries });
-        if std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap_or_default())
-            .is_err()
+        if std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        )
+        .is_err()
         {
             crate::logging::warn(
                 None,
                 "policy.permissions",
-                &format!("failed to persist session permissions to {}", path.display()),
+                &format!(
+                    "failed to persist session permissions to {}",
+                    path.display()
+                ),
             );
         }
     }
@@ -1359,7 +1791,6 @@ impl ToolState {
     }
 
     /// Resolve the persistence file path from the primary workspace root.
-    #[allow(dead_code)]
     fn permissions_path(&self) -> Option<PathBuf> {
         // Primary workspace is a tokio mutex — we cannot block here on a std
         // mutex; take the first entry via try_lock and fall back to scraping
@@ -1391,7 +1822,6 @@ pub fn scratchpad_root() -> PathBuf {
 pub fn session_scratchpad(session_id: u64) -> PathBuf {
     scratchpad_root().join(format!("session-{session_id}"))
 }
-
 
 #[cfg(test)]
 mod steer_tests {
@@ -1457,5 +1887,88 @@ mod steer_tests {
         let a = s.enqueue_steer(1, "x".into());
         let b = s.enqueue_steer(1, "y".into());
         assert_ne!(a, b, "ids must be distinct so the UI can match them up");
+    }
+}
+
+#[cfg(test)]
+mod background_output_tests {
+    use super::*;
+
+    #[test]
+    fn unbound_sessions_are_ignored() {
+        let s = BackgroundOutputStore::default();
+        s.record(99, "nope");
+        s.record_token(99, "nope");
+        assert!(s.tail("bg-1", None).is_empty());
+    }
+
+    #[test]
+    fn tail_returns_lines_in_order() {
+        let s = BackgroundOutputStore::default();
+        s.bind("bg-1", 1);
+        s.record(1, "first");
+        s.record(1, "second");
+        assert_eq!(s.tail("bg-1", None), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn tokens_are_joined_until_a_newline() {
+        let s = BackgroundOutputStore::default();
+        s.bind("bg-1", 1);
+        s.record_token(1, "hello ");
+        s.record_token(1, "world\nnext");
+        assert_eq!(s.tail("bg-1", None), vec!["hello world"]);
+        s.flush(1);
+        assert_eq!(s.tail("bg-1", None), vec!["hello world", "next"]);
+    }
+
+    #[test]
+    fn tail_respects_tail_lines() {
+        let s = BackgroundOutputStore::default();
+        s.bind("bg-1", 1);
+        for i in 0..10 {
+            s.record(1, &format!("line {i}"));
+        }
+        let tail = s.tail("bg-1", Some(3));
+        assert_eq!(tail, vec!["line 7", "line 8", "line 9"]);
+    }
+
+    #[test]
+    fn buffer_survives_task_finish() {
+        let s = BackgroundOutputStore::default();
+        s.bind("bg-1", 1);
+        s.record(1, "kept");
+        s.flush(1);
+        assert_eq!(s.tail("bg-1", None), vec!["kept"]);
+    }
+
+    #[test]
+    fn oldest_tasks_are_pruned() {
+        let s = BackgroundOutputStore::default();
+        for i in 0..=(BG_OUTPUT_MAX_TASKS as u64) {
+            s.bind(&format!("bg-{i}"), i);
+            s.record(i, "line");
+        }
+        assert!(s.tail("bg-0", None).is_empty(), "oldest task pruned");
+        assert_eq!(s.tail("bg-1", None), vec!["line"]);
+    }
+
+    #[test]
+    fn lines_are_capped_in_length_and_count() {
+        let s = BackgroundOutputStore::default();
+        s.bind("bg-1", 1);
+        let huge = "x".repeat(BG_OUTPUT_LINE_CAP * 2);
+        s.record(1, &huge);
+        let tail = s.tail("bg-1", None);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].chars().count(), BG_OUTPUT_LINE_CAP);
+
+        for i in 0..(BG_OUTPUT_MAX_LINES + 50) {
+            s.record(1, &format!("l{i}"));
+        }
+        assert_eq!(
+            s.tail("bg-1", Some(BG_OUTPUT_MAX_LINES)).len(),
+            BG_OUTPUT_MAX_LINES
+        );
     }
 }

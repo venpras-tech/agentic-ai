@@ -65,6 +65,99 @@
   text-overflow: ellipsis;
 }
 
+.editor-tree-search {
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.editor-tree-search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.editor-tree-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-input, #0e1016);
+  color: var(--text-primary);
+}
+
+.editor-tree-search-btn {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  font-size: 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.editor-tree-search-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.editor-tree-semantic {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.editor-tree-search-error {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: #e99;
+}
+
+.editor-tree-results {
+  max-height: 40vh;
+  overflow: auto;
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.editor-tree-result {
+  text-align: left;
+  padding: 3px 6px;
+  font-size: 0.8rem;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.editor-tree-result:hover {
+  background: var(--bg-hover);
+}
+
+.editor-tree-result-path {
+  display: block;
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--link, #7ab7ff);
+}
+
+.editor-tree-result-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
 .editor-main-panel {
   display: flex;
   flex-direction: column;
@@ -87,6 +180,89 @@
   padding: 8px 14px;
   border-bottom: 1px solid var(--border-color);
   background: var(--bg-sidebar);
+}
+
+.editor-history-panel {
+  flex-shrink: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-primary);
+}
+
+.editor-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  font-weight: 600;
+  opacity: 0.8;
+  margin-bottom: 6px;
+}
+
+.editor-history-close {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.editor-history-empty {
+  font-size: 0.78rem;
+  opacity: 0.65;
+}
+
+.editor-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.editor-history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 0.75rem;
+}
+
+.editor-history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.editor-history-meta code {
+  font-size: 0.65rem;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.editor-history-restore {
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-sidebar);
+  color: var(--text-primary);
+  font-size: 0.7rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.editor-history-restore:hover:not(:disabled) {
+  border-color: var(--accent);
 }
 
 .editor-main-filename {
@@ -118,6 +294,114 @@
 
 .editor-save {
   margin-left: auto;
+}
+
+.editor-diag-off {
+  opacity: 0.6;
+}
+
+.editor-diag-panel {
+  flex-shrink: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-primary);
+}
+
+.editor-diag-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  opacity: 0.8;
+  margin-bottom: 6px;
+}
+
+.editor-diag-dirty {
+  font-style: normal;
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.editor-diag-close {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.editor-diag-empty {
+  font-size: 0.78rem;
+  opacity: 0.65;
+}
+
+.editor-diag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.editor-diag-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 6px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.editor-diag-row:hover {
+  background: var(--bg-hover);
+}
+
+.editor-diag-dot {
+  flex-shrink: 0;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.editor-diag-error {
+  background: var(--err-color, #e03131);
+}
+
+.editor-diag-warning {
+  background: var(--warn-color, #f08c00);
+}
+
+.editor-diag-info {
+  background: var(--info-color, #2f6fdf);
+}
+
+.editor-diag-hint {
+  background: var(--hint-color, #8a8f98);
+}
+
+.editor-diag-loc {
+  flex-shrink: 0;
+  font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 0.7rem;
+  opacity: 0.8;
+}
+
+.editor-diag-msg {
+  min-width: 0;
+  word-break: break-word;
 }
 
 .editor-icon-btn {
@@ -158,7 +442,7 @@
 
 .editor-pre {
   margin: 0;
-  padding: 14px 30px 18px 18px;
+  padding: 14px 30px 18px calc(18px + var(--gutter-w, 12px));
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 0.875rem;
   line-height: 1.55;
@@ -204,7 +488,7 @@
   inset: 0;
   width: 100%;
   height: 100%;
-  padding: 14px 18px;
+  padding: 14px calc(18px + var(--gutter-w, 12px));
   border: none;
   outline: none;
   resize: none;
@@ -221,6 +505,58 @@
   overflow-wrap: normal;
   overflow: auto;
   z-index: 1;
+}
+
+/* LSP diagnostic gutter: pinned to the left edge, scrolls vertically in sync
+   with the textarea. Markers are only shown when printable; text/caret padding
+   leaves the reserved gutter width clear. */
+.editor-gutter {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--gutter-w, 12px);
+  overflow: hidden;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.editor-gutter-marker {
+  position: absolute;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  transform: translateY(-50%);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.editor-gutter-error {
+  background: var(--err-color, #e03131);
+  box-shadow: 0 0 0 1px rgba(224, 49, 49, 0.35);
+}
+
+.editor-gutter-warning {
+  background: var(--warn-color, #f08c00);
+  box-shadow: 0 0 0 1px rgba(240, 140, 0, 0.35);
+}
+
+.editor-gutter-info {
+  background: var(--info-color, #2f6fdf);
+  box-shadow: 0 0 0 1px rgba(47, 111, 223, 0.35);
+}
+
+.editor-gutter-hint {
+  background: var(--hint-color, #8a8f98);
+  box-shadow: 0 0 0 1px rgba(138, 143, 152, 0.35);
+}
+
+.editor-gutter-marker:hover {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
 }
 
 .editor-placeholder {

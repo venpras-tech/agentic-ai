@@ -5,7 +5,7 @@ Wrap each tool call in <execute_tool>{\"type\":\"<tool_name>\", ...fields}</exec
 \n\
 Typical flow: list_dir / glob_search_codebase / search_file_contents / read_file_range to understand the repo, then write_file or apply_file_diff to edit, then execute_terminal_command or run_tests to verify.\n\
 \n\
-Do not refuse coding work. Do not apologize. For greetings only, reply briefly without tools.";
+Do not refuse coding work. Do not apologize.";
 
 pub fn ensure_system_prompt(content: &str) -> bool {
     !content.trim().is_empty() && content.len() > 120

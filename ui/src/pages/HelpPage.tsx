@@ -61,6 +61,8 @@ function HelpPage() {
           <dd>New chat</dd>
           <dt><kbd>Ctrl+K</kbd></dt>
           <dd>Focus chat input</dd>
+          <dt><kbd>Ctrl+Shift+P</kbd></dt>
+          <dd>Open the command palette (navigate pages, new chat, toggle theme…)</dd>
           <dt><kbd>Ctrl+Shift+H</kbd></dt>
           <dd>Toggle chat history panel</dd>
           <dt><kbd>Ctrl+1</kbd>–<kbd>5</kbd></dt>

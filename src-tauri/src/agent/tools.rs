@@ -24,21 +24,22 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::ToolContext;
 use globset::{GlobBuilder, GlobSet};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{json, Value};
-use super::ToolContext;
+use streaming_iterator::StreamingIterator;
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
-use streaming_iterator::StreamingIterator;
 
-use crate::engine::{ChatTurn, InferenceRequest, TextGenerator, WorkerEvent};
+use super::edits::{propose_edit, FileEditSpec};
 use super::{
-    now_ms, mcp, plan, policy, rag, skills, todo,
-    AgentToolEvent, FileChangedEvent, HitlGateEvent, PermissionDecision, PermissionRequestEvent,
-    QuestionRequestEvent, ToolCall, ToolResult, TodoUpdateEvent, ToolState,
+    hooks, mcp, now_ms, plan, policy, rag, skills, todo, AgentToolEvent, HitlGateEvent,
+    PermissionDecision, PermissionRequestEvent, QuestionRequestEvent, TodoUpdateEvent, ToolCall,
+    ToolResult, ToolState,
 };
+use crate::engine::{ChatTurn, InferenceRequest, TextGenerator, WorkerEvent};
 
 // ---------------------------------------------------------------------------
 // Dispatcher chokepoint
@@ -60,23 +61,83 @@ pub async fn dispatch(
     let tool = call.name();
     let summary = call.summary();
 
-    emit_tool_event(app, state, &id, tool, "running", &summary, started_at, None, None);
+    emit_tool_event(
+        app, state, &id, tool, "running", &summary, started_at, None, None,
+    );
+
+    // P3.1 workspace hooks: a user-defined `pre_tool_use` command can veto the
+    // call before policy sees it (Claude PreToolUse parity). Fail-open by
+    // design — a broken/missing hooks.json never blocks the agent.
+    let workspaces = state.workspace.lock().await.clone();
+    let primary = workspaces.first().cloned();
+    if let Some(ws) = primary.as_deref() {
+        let cfg = hooks::load(ws);
+        if !cfg.pre_tool_use.is_empty() {
+            let session = state.session_id.load(std::sync::atomic::Ordering::SeqCst);
+            let payload = hooks::payload("pre_tool_use", ws, Some(call), session);
+            if let hooks::HookOutcome::Deny(reason) =
+                hooks::run_hooks(ws, &cfg.pre_tool_use, &payload, Some(tool)).await
+            {
+                let elapsed = started_at.max(now_ms()) - started_at;
+                emit_tool_event(
+                    app,
+                    state,
+                    &id,
+                    tool,
+                    "error",
+                    &summary,
+                    started_at,
+                    Some(elapsed),
+                    Some(reason.clone()),
+                );
+                audit(
+                    state,
+                    primary.as_deref(),
+                    &id,
+                    tool,
+                    &summary,
+                    "hook-deny",
+                    started_at,
+                    elapsed,
+                    Some(false),
+                    Some(&reason),
+                );
+                let _ = app.emit(
+                    "agent://hook",
+                    serde_json::json!({
+                        "event": "pre_tool_use",
+                        "tool": tool,
+                        "status": "deny",
+                        "detail": reason.clone(),
+                        "sessionId": session,
+                    }),
+                );
+                return Ok(ToolResult::err(
+                    tool,
+                    "denied by pre_tool_use hook".into(),
+                    reason,
+                ));
+            }
+        }
+    }
 
     // `ask_question` / `send_to_user` are themselves the interaction primitive —
     // they never require a further permission gate.
-    let outcome = if matches!(call, ToolCall::AskQuestion { .. } | ToolCall::SendToUser { .. }) {
+    let outcome = if matches!(
+        call,
+        ToolCall::AskQuestion { .. } | ToolCall::SendToUser { .. }
+    ) {
         (
             "allow".to_string(),
             run_tool(app, state, call, &interrupt).await,
         )
     } else {
-        let workspaces = state.workspace.lock().await.clone();
-        let primary = workspaces.first().cloned();
         let verdict = policy::check(state, call, &workspaces);
         match verdict {
-            policy::Verdict::Allow => {
-                ("allow".to_string(), run_tool(app, state, call, &interrupt).await)
-            }
+            policy::Verdict::Allow => (
+                "allow".to_string(),
+                run_tool(app, state, call, &interrupt).await,
+            ),
             policy::Verdict::Deny(reason) => (
                 "deny".to_string(),
                 Ok(ToolResult::err(tool, "denied".into(), reason)),
@@ -107,7 +168,14 @@ pub async fn dispatch(
         Ok(r) => ("error", r.error.clone()),
         Err(e) => ("error", Some(e.clone())),
     };
-    emit_tool_event(
+    let exit_code = result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.stats.as_ref())
+        .and_then(|s| s.get("exit_code"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    emit_tool_event_full(
         app,
         state,
         &id,
@@ -116,6 +184,7 @@ pub async fn dispatch(
         &summary,
         started_at,
         Some(elapsed),
+        exit_code,
         detail,
     );
 
@@ -139,8 +208,23 @@ pub async fn dispatch(
         }
     }
 
-    let workspaces = state.workspace.lock().await.clone();
-    let primary = workspaces.first().cloned();
+    // P3.1 post_tool_use: notify the user's hook of the completed call. The
+    // hook cannot block (the tool already ran) — its stdout is ignored.
+    if let Some(ws) = primary.as_deref() {
+        let cfg = hooks::load(ws);
+        if !cfg.post_tool_use.is_empty() {
+            let session = state.session_id.load(std::sync::atomic::Ordering::SeqCst);
+            let mut payload = hooks::payload("post_tool_use", ws, Some(call), session);
+            let (ok, err_text, out_text) = match &result {
+                Ok(r) => (r.success, r.error.clone(), r.stdout.clone()),
+                Err(e) => (false, Some(e.clone()), None),
+            };
+            payload =
+                hooks::with_tool_output(payload, ok, err_text.as_deref(), out_text.as_deref());
+            let _ = hooks::run_hooks(ws, &cfg.post_tool_use, &payload, Some(tool)).await;
+        }
+    }
+
     let (ok, err_text) = match &result {
         Ok(r) => (Some(r.success), r.error.clone()),
         Err(e) => (Some(false), Some(e.clone())),
@@ -210,16 +294,26 @@ async fn triage_permission(
     };
 
     match decision {
-        PermissionDecision::AllowOnce => {
-            ("granted".into(), run_tool(app, state, call, &CancellationToken::new()).await)
-        }
+        PermissionDecision::AllowOnce => (
+            "granted".into(),
+            run_tool(app, state, call, &CancellationToken::new()).await,
+        ),
         PermissionDecision::AllowSession => {
             policy::remember_session(state, call);
-            ("granted-session".into(), run_tool(app, state, call, &CancellationToken::new()).await)
+            // Persist the grant so a restart doesn't force re-approval. The
+            // legacy path saved here; the command rewrite left this load-only.
+            state.save_session_allow();
+            (
+                "granted-session".into(),
+                run_tool(app, state, call, &CancellationToken::new()).await,
+            )
         }
         PermissionDecision::AlwaysAllow => {
             let _ = policy::remember_always(primary, call);
-            ("granted-always".into(), run_tool(app, state, call, &CancellationToken::new()).await)
+            (
+                "granted-always".into(),
+                run_tool(app, state, call, &CancellationToken::new()).await,
+            )
         }
         PermissionDecision::Deny => (
             "declined".into(),
@@ -262,12 +356,7 @@ async fn review_command(app: &ToolContext, state: &ToolState, call: &ToolCall) -
 /// LLM-backed tools (`analyze_bug`, `review_code`, `summarize_changes`,
 /// permission reviews). Returns `None` when no model is loaded or it fails —
 /// callers degrade gracefully instead of erroring to the model.
-async fn llm_brief(
-    state: &ToolState,
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-) -> Option<String> {
+async fn llm_brief(state: &ToolState, system: &str, user: &str, max_tokens: u32) -> Option<String> {
     let pool = state.engine.lock().await.clone()?;
     let mut gen = pool.handle(0);
     let session_id = state.session_id.load(std::sync::atomic::Ordering::SeqCst);
@@ -291,8 +380,12 @@ async fn llm_brief(
     };
     let (tx, _rx) = crossbeam_channel::unbounded::<WorkerEvent>();
     let itok = CancellationToken::new();
-    match gen.generate(&request, session_id, &itok, &tx) {
-        Ok(out) => {
+    // `generate` is CPU-bound (llama.cpp); keep it off the async runtime so a
+    // brief doesn't stall the agent loop for other tasks.
+    let generated =
+        tokio::task::spawn_blocking(move || gen.generate(&request, session_id, &itok, &tx)).await;
+    match generated {
+        Ok(Ok(out)) => {
             let t = out.full_text.trim().to_string();
             if t.is_empty() {
                 None
@@ -300,7 +393,7 @@ async fn llm_brief(
                 Some(t)
             }
         }
-        Err(_) => None,
+        _ => None,
     }
 }
 
@@ -320,6 +413,30 @@ fn emit_tool_event(
     duration_ms: Option<u64>,
     detail: Option<String>,
 ) {
+    emit_tool_event_full(
+        app, state, id, tool, status, summary, started_at, duration_ms, None, detail,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tool_event_full(
+    app: &ToolContext,
+    state: &ToolState,
+    id: &str,
+    tool: &str,
+    status: &str,
+    summary: &str,
+    started_at: u64,
+    duration_ms: Option<u64>,
+    exit_code: Option<i32>,
+    detail: Option<String>,
+) {
+    let session_id = state.session_id.load(std::sync::atomic::Ordering::SeqCst);
+    // Mirror the tool lifecycle into the background-task output ring buffer
+    // (unbound sessions are ignored by the store).
+    state
+        .background_output
+        .record(session_id, &format!("[{tool}] {status} · {summary}"));
     let _ = app.emit(
         "agent://tool-event",
         AgentToolEvent {
@@ -329,26 +446,9 @@ fn emit_tool_event(
             summary: summary.to_string(),
             started_at,
             duration_ms,
+            exit_code,
             detail,
-            session_id: state.session_id.load(std::sync::atomic::Ordering::SeqCst),
-        },
-    );
-}
-
-fn emit_file_changed(
-    app: &ToolContext,
-    path: &str,
-    kind: &str,
-    diff: Option<String>,
-    before: Option<String>,
-) {
-    let _ = app.emit(
-        "agent://file-changed",
-        FileChangedEvent {
-            path: path.to_string(),
-            kind: kind.to_string(),
-            diff,
-            before,
+            session_id,
         },
     );
 }
@@ -412,7 +512,9 @@ pub async fn open_todo_count(state: &ToolState) -> Result<usize, String> {
         .primary_workspace()
         .await
         .ok_or_else(|| "No workspace set".to_string())?;
-    Ok(todo::TodoList::load(&ws).map(|l| l.open_count()).unwrap_or(0))
+    Ok(todo::TodoList::load(&ws)
+        .map(|l| l.open_count())
+        .unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +558,7 @@ async fn run_tool(
         }
         ToolCall::ApplyFileDiff { path, diff } => {
             let p = resolve(root.as_deref(), path);
-            apply_diff_tool(app, &p, diff).await
+            apply_diff_tool(app, state, &p, diff).await
         }
         ToolCall::ExecuteTerminalCommand { command, timeout_secs, cwd } => {
             let dir = cwd
@@ -512,7 +614,7 @@ async fn run_tool(
         ToolCall::RunTests { command } => run_tests(first_ws(&ws).unwrap_or(Path::new(".")), command.as_deref(), interrupt).await,
         ToolCall::WriteFile { path, content } => {
             let p = resolve(root.as_deref(), path);
-            write_file(app, &p, content).await
+            write_file(app, state, &p, content).await
         }
         ToolCall::CreateSkill { name, description, content } => create_skill(state, name, description.as_deref(), content),
         ToolCall::ReadSkill { name } => read_skill(state, name),
@@ -602,7 +704,7 @@ async fn run_tool(
         }
         ToolCall::DownloadFile { url, path } => {
             let p = resolve(root.as_deref(), path);
-            download_file(url, &p, &ws).await
+            download_file(url, &p).await
         }
         ToolCall::RunPython { code, timeout_secs } => {
             let ws_root = root.ok_or_else(|| "No workspace set".to_string())?;
@@ -776,7 +878,10 @@ async fn search_file_contents(
     let mut files_scanned = 0usize;
     let mut walker = WalkBuilder::new(root);
     walker.hidden(false).parents(false);
-    walker.git_ignore(respect_gitignore).git_exclude(respect_gitignore).git_global(respect_gitignore);
+    walker
+        .git_ignore(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .git_global(respect_gitignore);
     walker.standard_filters(respect_gitignore);
     for entry in walker.build() {
         if hits.len() >= 500 {
@@ -834,10 +939,35 @@ fn likely_text(path: &Path) -> bool {
         let ext = ext.to_ascii_lowercase();
         if matches!(
             ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp"
-                | "mp3" | "wav" | "ogg" | "flac" | "mp4" | "webm" | "mov"
-                | "zip" | "tar" | "gz" | "bz2" | "7z" | "exe" | "dll" | "so" | "dylib"
-                | "woff" | "woff2" | "ttf" | "otf" | "pdf" | "bin"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "ico"
+                | "bmp"
+                | "mp3"
+                | "wav"
+                | "ogg"
+                | "flac"
+                | "mp4"
+                | "webm"
+                | "mov"
+                | "zip"
+                | "tar"
+                | "gz"
+                | "bz2"
+                | "7z"
+                | "exe"
+                | "dll"
+                | "so"
+                | "dylib"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
+                | "pdf"
+                | "bin"
         ) {
             return false;
         }
@@ -846,11 +976,16 @@ fn likely_text(path: &Path) -> bool {
 }
 
 fn ts_language(path: &Path) -> Option<Language> {
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("rs") => Some(tree_sitter_rust::LANGUAGE.into()),
         Some("py") => Some(tree_sitter_python::LANGUAGE.into()),
-        Some("ts") | Some("mts") | Some("cts") => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Some("ts") | Some("mts") | Some("cts") => {
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        }
         Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => {
             Some(tree_sitter_typescript::LANGUAGE_TSX.into())
         }
@@ -902,7 +1037,13 @@ fn queued_outline(
 ) -> Result<(), String> {
     let root = tree.root_node();
     let mut visited = HashSet::new();
-    fn visit(node: &Node, depth: usize, max_depth: usize, out: &mut String, visited: &mut HashSet<usize>) {
+    fn visit(
+        node: &Node,
+        depth: usize,
+        max_depth: usize,
+        out: &mut String,
+        visited: &mut HashSet<usize>,
+    ) {
         if depth > max_depth {
             return;
         }
@@ -934,16 +1075,32 @@ fn queued_outline(
                 .unwrap_or_default();
             let (start_l, start_c) = (node.start_position().row + 1, node.start_position().column);
             let indent = "  ".repeat(depth.saturating_sub(1));
-            let label = if name.is_empty() { label.to_string() } else { format!("{label} {name}") };
+            let label = if name.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} {name}")
+            };
             out.push_str(&format!("{indent}{label} @ {start_l}:{start_c}\n"));
         }
         let kind = node.kind();
         let is_container = matches!(
             kind,
-            "function_declaration" | "function_item" | "struct_item" | "class_declaration"
-                | "class_definition" | "enum_item" | "trait_item" | "impl_item" | "mod_item"
-                | "function_definition" | "method_definition" | "interface_declaration"
-                | "translation_unit" | "program" | "module" | "source_file"
+            "function_declaration"
+                | "function_item"
+                | "struct_item"
+                | "class_declaration"
+                | "class_definition"
+                | "enum_item"
+                | "trait_item"
+                | "impl_item"
+                | "mod_item"
+                | "function_definition"
+                | "method_definition"
+                | "interface_declaration"
+                | "translation_unit"
+                | "program"
+                | "module"
+                | "source_file"
         );
         if is_container {
             let mut w = node.walk();
@@ -965,18 +1122,31 @@ fn read_file_range(path: &Path, start_line: u64, end_line: u64) -> Result<ToolRe
     let start = (start_line.max(1) as usize).saturating_sub(1).min(total);
     let end = (end_line as usize).min(total).max(start + 1);
     let mut out = String::new();
-    for (i, line) in lines.iter().enumerate().skip(start).take(end.saturating_sub(start)) {
+    for (i, line) in lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
         out.push_str(&format!("{}: {line}\n", i + 1));
     }
     Ok(ToolResult::ok(
         "read_file_range",
-        format!("Read {} lines ({start_line}..={end_line}) of `{}`", end.saturating_sub(start), path.display()),
+        format!(
+            "Read {} lines ({start_line}..={end_line}) of `{}`",
+            end.saturating_sub(start),
+            path.display()
+        ),
         Some(format!("[{} lines total]\n{out}", total)),
         Some(json!({ "lines": total })),
     ))
 }
 
-fn read_file_chars(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Result<ToolResult, String> {
+fn read_file_chars(
+    path: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ToolResult, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read `{}`: {e}", path.display()))?;
     let offset = offset.unwrap_or(0).min(text.chars().count());
@@ -984,33 +1154,50 @@ fn read_file_chars(path: &Path, offset: Option<usize>, limit: Option<usize>) -> 
     let slice: String = text.chars().skip(offset).take(limit).collect();
     Ok(ToolResult::ok(
         "read_file_chars",
-        format!("Read {} char(s) of `{}` from char {offset}", slice.chars().count(), path.display()),
+        format!(
+            "Read {} char(s) of `{}` from char {offset}",
+            slice.chars().count(),
+            path.display()
+        ),
         Some(slice),
         Some(json!({ "totalChars": text.chars().count() })),
     ))
 }
 
-async fn write_file(app: &ToolContext, path: &Path, content: &str) -> Result<ToolResult, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
+async fn write_file(
+    app: &ToolContext,
+    state: &ToolState,
+    path: &Path,
+    content: &str,
+) -> Result<ToolResult, String> {
     let before = std::fs::read_to_string(path).ok();
-    std::fs::write(path, content)
-        .map_err(|e| format!("Failed to write `{}`: {e}", path.display()))?;
-    emit_file_changed(app, &path.to_string_lossy(), "write", None, before);
-    Ok(ToolResult::ok(
-        "write_file",
-        format!("Wrote {} byte(s) to `{}`", content.len(), path.display()),
-        None,
-        Some(json!({ "bytes": content.len() })),
-    ))
+    let root = state
+        .primary_workspace()
+        .await
+        .or_else(|| path.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+    let spec = FileEditSpec {
+        path: path.to_string_lossy().into_owned(),
+        line_start: None,
+        line_end: None,
+        patch: None,
+        search: None,
+        replace: None,
+        full_content: Some(content.to_string()),
+        reason: Some(format!("write_file: {} byte(s)", content.len())),
+    };
+    propose_edit(app, state, "write_file", &root, &spec, before).await
 }
 
-/// Apply a unified diff to a file (the primary edit tool). Handles
-/// context-matched hunks, new files (`@@ -0,0 +1,n @@`), and reports exact
-/// mismatch locations so the model can self-correct.
-async fn apply_diff_tool(app: &ToolContext, path: &Path, diff: &str) -> Result<ToolResult, String> {
+/// Propose a unified-diff edit for user review before touching the disk
+/// (handles context-matched hunks, new files `@@ -0,0 +1,n @@`, and reports
+/// exact mismatch locations so the model can self-correct).
+async fn apply_diff_tool(
+    app: &ToolContext,
+    state: &ToolState,
+    path: &Path,
+    diff: &str,
+) -> Result<ToolResult, String> {
     let content = if path.exists() {
         std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read `{}`: {e}", path.display()))?
@@ -1018,36 +1205,30 @@ async fn apply_diff_tool(app: &ToolContext, path: &Path, diff: &str) -> Result<T
         String::new()
     };
 
-    let new_file = !path.exists() || content.is_empty();
-    let result = if new_file {
-        // Treat as a brand-new file: the diff's `+` block becomes the content.
-        apply_new_file(diff)?
-    } else {
-        apply_unified_diff(&content, diff)?
+    let root = state
+        .primary_workspace()
+        .await
+        .or_else(|| path.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+    let after_count = content.lines().count() + 1;
+    let spec = FileEditSpec {
+        path: path.to_string_lossy().into_owned(),
+        line_start: None,
+        line_end: None,
+        patch: Some(diff.to_string()),
+        search: None,
+        replace: None,
+        full_content: None,
+        reason: Some(format!(
+            "apply_file_diff on `{}` (≈{after_count} lines)",
+            path.display()
+        )),
     };
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, &result)
-        .map_err(|e| format!("Failed to write `{}`: {e}", path.display()))?;
-    let generated = similar::TextDiff::from_lines(&content, &result);
-    let unified = generated
-        .unified_diff()
-        .header("before", "after")
-        .to_string();
-    emit_file_changed(app, &path.to_string_lossy(), "diff", Some(unified), Some(content.clone()));
-    Ok(ToolResult::ok(
-        "apply_file_diff",
-        format!("Applied edit to `{}` ({} → {} line(s))", path.display(), content.lines().count(), result.lines().count()),
-        None,
-        Some(json!({ "old_lines": content.lines().count(), "new_lines": result.lines().count() })),
-    ))
+    propose_edit(app, state, "apply_file_diff", &root, &spec, Some(content)).await
 }
 
 /// Build a new file from a diff whose old side is empty/absent.
-fn apply_new_file(diff: &str) -> Result<String, String> {
+pub(crate) fn apply_new_file(diff: &str) -> Result<String, String> {
     let mut out = String::new();
     for line in diff.lines() {
         let l = line.trim_end();
@@ -1071,13 +1252,16 @@ fn apply_new_file(diff: &str) -> Result<String, String> {
 }
 
 /// Parse hunks of a standard unified diff and apply them to `original`.
-fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> {
+pub(crate) fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> {
     let orig_lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
 
     let hunk_re = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
         .map_err(|e| e.to_string())?;
 
-    fn parse_hunks(diff: &str, hunk_re: &Regex) -> Result<Vec<(usize, Vec<String>, Vec<String>)>, String> {
+    fn parse_hunks(
+        diff: &str,
+        hunk_re: &Regex,
+    ) -> Result<Vec<(usize, Vec<String>, Vec<String>)>, String> {
         let mut out = Vec::new();
         let mut cur: Option<(usize, Vec<String>, Vec<String>)> = None;
         for line in diff.lines() {
@@ -1123,7 +1307,11 @@ fn apply_unified_diff(original: &str, diff: &str) -> Result<String, String> {
             let mut mismatch = None;
             for (k, expected) in old.iter().enumerate() {
                 if idx + k >= result.len() {
-                    mismatch = Some(format!("hunk {} references line {} past EOF", i + 1, idx + k + 1));
+                    mismatch = Some(format!(
+                        "hunk {} references line {} past EOF",
+                        i + 1,
+                        idx + k + 1
+                    ));
                     break;
                 }
                 if result[idx + k].trim_end() != expected.trim_end() {
@@ -1151,14 +1339,11 @@ fn list_dir(path: &Path) -> Result<ToolResult, String> {
         return Err(format!("`{}` is not a directory", path.display()));
     }
     let mut entries: Vec<(bool, String)> = Vec::new();
-    for e in std::fs::read_dir(path)
-        .map_err(|e| format!("Failed to list `{}`: {e}", path.display()))?
+    for e in
+        std::fs::read_dir(path).map_err(|e| format!("Failed to list `{}`: {e}", path.display()))?
     {
         let e = e.map_err(|e| e.to_string())?;
-        let is_dir = e
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
         entries.push((is_dir, e.file_name().to_string_lossy().into_owned()));
     }
     entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1178,12 +1363,20 @@ fn list_dir(path: &Path) -> Result<ToolResult, String> {
 fn create_folder(path: &Path) -> Result<ToolResult, String> {
     std::fs::create_dir_all(path)
         .map_err(|e| format!("Failed to create `{}`: {e}", path.display()))?;
-    Ok(ToolResult::ok("create_folder", format!("Created folder `{}`", path.display()), None, None))
+    Ok(ToolResult::ok(
+        "create_folder",
+        format!("Created folder `{}`", path.display()),
+        None,
+        None,
+    ))
 }
 
 fn copy_path(src: &Path, dst: &Path, can_overwrite: bool) -> Result<ToolResult, String> {
     if dst.exists() && !can_overwrite {
-        return Err(format!("Destination `{}` already exists (pass canOverwrite=true to replace)", dst.display()));
+        return Err(format!(
+            "Destination `{}` already exists (pass canOverwrite=true to replace)",
+            dst.display()
+        ));
     }
     if src.is_dir() {
         copy_dir_recursive(src, dst)?;
@@ -1191,9 +1384,15 @@ fn copy_path(src: &Path, dst: &Path, can_overwrite: bool) -> Result<ToolResult, 
         if let Some(p) = dst.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
         }
-        std::fs::copy(src, dst).map_err(|e| format!("copy `{}` → `{}`: {e}", src.display(), dst.display()))?;
+        std::fs::copy(src, dst)
+            .map_err(|e| format!("copy `{}` → `{}`: {e}", src.display(), dst.display()))?;
     }
-    Ok(ToolResult::ok("copy_file_or_folder", format!("Copied `{}` → `{}`", src.display(), dst.display()), None, None))
+    Ok(ToolResult::ok(
+        "copy_file_or_folder",
+        format!("Copied `{}` → `{}`", src.display(), dst.display()),
+        None,
+        None,
+    ))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
@@ -1217,16 +1416,27 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 
 fn move_path(src: &Path, dst: &Path, can_overwrite: bool) -> Result<ToolResult, String> {
     if dst.exists() && !can_overwrite {
-        return Err(format!("Destination `{}` already exists (pass canOverwrite=true to replace)", dst.display()));
+        return Err(format!(
+            "Destination `{}` already exists (pass canOverwrite=true to replace)",
+            dst.display()
+        ));
     }
     if let Some(p) = dst.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
     }
     if can_overwrite && dst.exists() {
-        std::fs::remove_file(dst).or_else(|_| std::fs::remove_dir_all(dst)).map_err(|e| e.to_string())?;
+        std::fs::remove_file(dst)
+            .or_else(|_| std::fs::remove_dir_all(dst))
+            .map_err(|e| e.to_string())?;
     }
-    std::fs::rename(src, dst).map_err(|e| format!("move `{}` → `{}`: {e}", src.display(), dst.display()))?;
-    Ok(ToolResult::ok("move_file_or_folder", format!("Moved `{}` → `{}`", src.display(), dst.display()), None, None))
+    std::fs::rename(src, dst)
+        .map_err(|e| format!("move `{}` → `{}`: {e}", src.display(), dst.display()))?;
+    Ok(ToolResult::ok(
+        "move_file_or_folder",
+        format!("Moved `{}` → `{}`", src.display(), dst.display()),
+        None,
+        None,
+    ))
 }
 
 fn delete_path(path: &Path) -> Result<ToolResult, String> {
@@ -1234,7 +1444,12 @@ fn delete_path(path: &Path) -> Result<ToolResult, String> {
         return Err(format!("`{}` does not exist", path.display()));
     }
     trash::delete(path).map_err(|e| format!("Trash `{}` failed: {e}", path.display()))?;
-    Ok(ToolResult::ok("delete_file_or_folder", format!("Moved `{}` to the Trash", path.display()), None, None))
+    Ok(ToolResult::ok(
+        "delete_file_or_folder",
+        format!("Moved `{}` to the Trash", path.display()),
+        None,
+        None,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,7 +1478,10 @@ async fn run_command_checked(
         .spawn()
         .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
 
-    async fn log_read(buf: &mut Vec<u8>, mut f: impl tokio::io::AsyncRead + Unpin) -> io::Result<()> {
+    async fn log_read(
+        buf: &mut Vec<u8>,
+        mut f: impl tokio::io::AsyncRead + Unpin,
+    ) -> io::Result<()> {
         use tokio::io::AsyncReadExt;
         let mut tmp = [0u8; 4096];
         loop {
@@ -1421,7 +1639,10 @@ fn detect_test_command(ws: &Path) -> Result<String, String> {
             }
         }
     }
-    if ws.join("pytest.ini").exists() || ws.join("pyproject.toml").exists() || ws.join("setup.py").is_file() {
+    if ws.join("pytest.ini").exists()
+        || ws.join("pyproject.toml").exists()
+        || ws.join("setup.py").is_file()
+    {
         return Ok("python -m pytest".into());
     }
     Err("Cannot detect a test runner in this workspace. Specify a `command` explicitly (e.g. \"npm test\", \"cargo test\", \"pytest\").".into())
@@ -1443,7 +1664,12 @@ async fn run_interp(
     timeout_secs: Option<u64>,
     interrupt: &CancellationToken,
 ) -> Result<ToolResult, String> {
-    let bin = if interp == "python" && std::process::Command::new("python").arg("--version").output().is_err() {
+    let bin = if interp == "python"
+        && std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
         "python3"
     } else {
         interp
@@ -1454,7 +1680,14 @@ async fn run_interp(
     let file = dir.join(format!("run-{}-{}.{ext}", std::process::id(), now_ms()));
     std::fs::write(&file, code).map_err(|e| format!("write script: {e}"))?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(60));
-    let res = run_command_checked(bin, &[file.to_str().unwrap()], Some(ws), timeout, Some(interrupt)).await;
+    let res = run_command_checked(
+        bin,
+        &[file.to_str().unwrap()],
+        Some(ws),
+        timeout,
+        Some(interrupt),
+    )
+    .await;
     let _ = std::fs::remove_file(&file);
     match res {
         Ok((code, out, err)) => {
@@ -1463,11 +1696,24 @@ async fn run_interp(
                 stdout.push_str("\n");
                 stdout.push_str(&err);
             }
-            let tool = if interp == "python" { "run_python" } else { "run_javascript" };
-            if code == 0 {
-                Ok(ToolResult::ok(tool, format!("`{bin}` exited 0"), Some(truncate(&stdout, 60_000)), Some(json!({ "exit_code": 0 }))))
+            let tool = if interp == "python" {
+                "run_python"
             } else {
-                Ok(ToolResult::err(tool, format!("`{bin}` exited {code}"), truncate(&stdout, 60_000)))
+                "run_javascript"
+            };
+            if code == 0 {
+                Ok(ToolResult::ok(
+                    tool,
+                    format!("`{bin}` exited 0"),
+                    Some(truncate(&stdout, 60_000)),
+                    Some(json!({ "exit_code": 0 })),
+                ))
+            } else {
+                Ok(ToolResult::err(
+                    tool,
+                    format!("`{bin}` exited {code}"),
+                    truncate(&stdout, 60_000),
+                ))
             }
         }
         Err(e) => Err(e),
@@ -1506,10 +1752,17 @@ fn replace_constants(s: &str) -> String {
     let mut idx = 0;
     while idx + 1 <= out.len() {
         if &out[idx..(idx + 1).min(out.len())] == "e" {
-            let before = idx.checked_sub(1).and_then(|b| out.as_bytes().get(b)).copied();
+            let before = idx
+                .checked_sub(1)
+                .and_then(|b| out.as_bytes().get(b))
+                .copied();
             let after = out.as_bytes().get(idx + 1).copied();
-            let prev_digit = before.map(|b| b.is_ascii_digit() || b == b'.' || b == b'_').unwrap_or(false);
-            let next_digit = after.map(|b| b.is_ascii_digit() || b == b'.').unwrap_or(false);
+            let prev_digit = before
+                .map(|b| b.is_ascii_digit() || b == b'.' || b == b'_')
+                .unwrap_or(false);
+            let next_digit = after
+                .map(|b| b.is_ascii_digit() || b == b'.')
+                .unwrap_or(false);
             if !prev_digit && !next_digit {
                 out.replace_range(idx..idx + 1, "2.718281828459045");
                 idx += 16;
@@ -1560,7 +1813,9 @@ fn expr_tokenize(s: &str) -> Result<Vec<Tok>, String> {
                     i += 1;
                 } else if (ch == 'e' || ch == 'E')
                     && i + 1 < bytes.len()
-                    && (bytes[i + 1] as char == '-' || bytes[i + 1] as char == '+' || (bytes[i + 1] as char).is_ascii_digit())
+                    && (bytes[i + 1] as char == '-'
+                        || bytes[i + 1] as char == '+'
+                        || (bytes[i + 1] as char).is_ascii_digit())
                 {
                     i += 2;
                     while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
@@ -1623,23 +1878,19 @@ fn shunting_yard(tokens: Vec<Tok>) -> Result<Vec<Tok>, String> {
             }
             Tok::Fun(_) => ops.push(tok),
             Tok::LParen => ops.push(tok),
-            Tok::RParen => {
-                loop {
-                    match ops.pop() {
-                        Some(Tok::LParen) => break,
-                        Some(o) => out.push(o),
-                        None => return Err("Mismatched parentheses".into()),
-                    }
+            Tok::RParen => loop {
+                match ops.pop() {
+                    Some(Tok::LParen) => break,
+                    Some(o) => out.push(o),
+                    None => return Err("Mismatched parentheses".into()),
                 }
-            }
-            Tok::Comma => {
-                loop {
-                    match ops.last() {
-                        Some(Tok::LParen) | None => break,
-                        _ => out.push(ops.pop().unwrap()),
-                    }
+            },
+            Tok::Comma => loop {
+                match ops.last() {
+                    Some(Tok::LParen) | None => break,
+                    _ => out.push(ops.pop().unwrap()),
                 }
-            }
+            },
             Tok::Op(c) => {
                 let unary = matches!(
                     &prev,
@@ -1656,7 +1907,11 @@ fn shunting_yard(tokens: Vec<Tok>) -> Result<Vec<Tok>, String> {
                     };
                     while let Some(Tok::Op(o)) = ops.last() {
                         let p_o = prec(*o);
-                        let pop = if c == '^' { p_o > prec(c) } else { p_o >= prec(c) };
+                        let pop = if c == '^' {
+                            p_o > prec(c)
+                        } else {
+                            p_o >= prec(c)
+                        };
                         if !pop {
                             break;
                         }
@@ -1767,11 +2022,21 @@ fn first_ws(ws: &[PathBuf]) -> Option<&Path> {
 
 async fn git_status(ws: &[PathBuf]) -> Result<ToolResult, String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    let (code, out, err) = run_git(&Some(root), &["status".into(), "--porcelain=v1".into(), "--branch".into()], Duration::from_secs(60)).await?;
+    let (code, out, err) = run_git(
+        &Some(root),
+        &["status".into(), "--porcelain=v1".into(), "--branch".into()],
+        Duration::from_secs(60),
+    )
+    .await?;
     if code != 0 {
         return Err(format!("git status failed: {err}"));
     }
-    Ok(ToolResult::ok("git_status", "Workspace git status".to_string(), Some(truncate(&out, 40_000)), Some(json!({ "exit_code": code }))))
+    Ok(ToolResult::ok(
+        "git_status",
+        "Workspace git status".to_string(),
+        Some(truncate(&out, 40_000)),
+        Some(json!({ "exit_code": code })),
+    ))
 }
 
 async fn git_diff(ws: &[PathBuf], path: Option<&str>) -> Result<ToolResult, String> {
@@ -1791,20 +2056,44 @@ async fn git_diff(ws: &[PathBuf], path: Option<&str>) -> Result<ToolResult, Stri
         return Err(format!("git diff failed: {err0}{err1}"));
     }
     let body = format!("{stat}\n\n{full}");
-    Ok(ToolResult::ok("git_diff", "Workspace diff".to_string(), Some(truncate(&body, 80_000)), None))
+    Ok(ToolResult::ok(
+        "git_diff",
+        "Workspace diff".to_string(),
+        Some(truncate(&body, 80_000)),
+        None,
+    ))
 }
 
 async fn git_commit(ws: &[PathBuf], message: &str) -> Result<ToolResult, String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    let (addc, _, adderr) = run_git(&Some(root), &["add".into(), "-A".into()], Duration::from_secs(60)).await?;
+    let (addc, _, adderr) = run_git(
+        &Some(root),
+        &["add".into(), "-A".into()],
+        Duration::from_secs(60),
+    )
+    .await?;
     if addc != 0 {
         return Err(format!("git add failed: {adderr}"));
     }
-    let (c, out, err) = run_git(&Some(root), &["commit".into(), "-m".into(), message.to_string()], Duration::from_secs(60)).await?;
+    let (c, out, err) = run_git(
+        &Some(root),
+        &["commit".into(), "-m".into(), message.to_string()],
+        Duration::from_secs(60),
+    )
+    .await?;
     if c != 0 {
-        return Ok(ToolResult::err("git_commit", "Commit failed".to_string(), truncate(&err, 4000)));
+        return Ok(ToolResult::err(
+            "git_commit",
+            "Commit failed".to_string(),
+            truncate(&err, 4000),
+        ));
     }
-    Ok(ToolResult::ok("git_commit", "Committed changes".to_string(), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_commit",
+        "Committed changes".to_string(),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 /// Create a checkpoint commit (`git add -A` + `git commit`). Additive and
@@ -1814,19 +2103,45 @@ pub async fn git_checkpoint(
     interrupt: &CancellationToken,
     message: Option<&str>,
 ) -> Result<ToolResult, String> {
-    let ws = state.primary_workspace().await.ok_or_else(|| "No workspace set".to_string())?;
+    let ws = state
+        .primary_workspace()
+        .await
+        .ok_or_else(|| "No workspace set".to_string())?;
     let msg = message.unwrap_or("ai: checkpoint").to_string();
     let args: Vec<String> = vec!["add".into(), "-A".into()];
-    let (ac, _, aerr) = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await?;
+    let (ac, _, aerr) = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await?;
     if ac != 0 {
         return Err(format!("git add failed: {aerr}"));
     }
     let args: Vec<String> = vec!["commit".into(), "-m".into(), msg];
-    let (c, out, err) = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await?;
+    let (c, out, err) = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await?;
     if c != 0 {
-        return Ok(ToolResult::err("git_checkpoint", "Checkpoint commit failed".to_string(), truncate(&err, 4000)));
+        return Ok(ToolResult::err(
+            "git_checkpoint",
+            "Checkpoint commit failed".to_string(),
+            truncate(&err, 4000),
+        ));
     }
-    Ok(ToolResult::ok("git_checkpoint", "Created a git checkpoint".to_string(), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_checkpoint",
+        "Created a git checkpoint".to_string(),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 /// List recent commits as `{hash, subject, relative}` values for the
@@ -1835,13 +2150,23 @@ pub async fn git_checkpoints(
     state: &ToolState,
     interrupt: &CancellationToken,
 ) -> Result<Vec<Value>, String> {
-    let ws = state.primary_workspace().await.ok_or_else(|| "No workspace set".to_string())?;
+    let ws = state
+        .primary_workspace()
+        .await
+        .ok_or_else(|| "No workspace set".to_string())?;
     let args: Vec<String> = vec![
         "log".into(),
         "-20".into(),
         "--pretty=format:%H%x1f%s%x1f%cr".into(),
     ];
-    let (c, out, err) = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(60), Some(interrupt)).await?;
+    let (c, out, err) = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(60),
+        Some(interrupt),
+    )
+    .await?;
     if c != 0 {
         return Err(format!("git log failed: {err}"));
     }
@@ -1862,14 +2187,33 @@ pub async fn git_revert(
     interrupt: &CancellationToken,
     commit: Option<&str>,
 ) -> Result<ToolResult, String> {
-    let ws = state.primary_workspace().await.ok_or_else(|| "No workspace set".to_string())?;
+    let ws = state
+        .primary_workspace()
+        .await
+        .ok_or_else(|| "No workspace set".to_string())?;
     let hash = commit.unwrap_or("HEAD");
     let args: Vec<String> = vec!["reset".into(), "--hard".into(), hash.to_string()];
-    let (c, out, err) = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await?;
+    let (c, out, err) = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await?;
     if c != 0 {
-        return Ok(ToolResult::err("git_revert", "Revert failed".to_string(), truncate(&err, 4000)));
+        return Ok(ToolResult::err(
+            "git_revert",
+            "Revert failed".to_string(),
+            truncate(&err, 4000),
+        ));
     }
-    Ok(ToolResult::ok("git_revert", format!("Reset to `{hash}`"), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_revert",
+        format!("Reset to `{hash}`"),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 async fn git_blame(
@@ -1879,7 +2223,11 @@ async fn git_blame(
     end: Option<u64>,
 ) -> Result<ToolResult, String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
     let mut args = vec!["blame".to_string()];
     if let (Some(s), Some(e)) = (start, end) {
         args.push(format!("-L {s},{e}"));
@@ -1890,7 +2238,12 @@ async fn git_blame(
     if c != 0 {
         return Err(format!("git blame: {err}"));
     }
-    Ok(ToolResult::ok("git_blame", format!("Blame for {rel}"), Some(truncate(&out, 40_000)), None))
+    Ok(ToolResult::ok(
+        "git_blame",
+        format!("Blame for {rel}"),
+        Some(truncate(&out, 40_000)),
+        None,
+    ))
 }
 
 async fn git_push(
@@ -1914,7 +2267,12 @@ async fn git_push(
     if c != 0 {
         return Err(format!("git push failed: {err}"));
     }
-    Ok(ToolResult::ok("git_push", "Pushed to remote".to_string(), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_push",
+        "Pushed to remote".to_string(),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 async fn git_pull(ws: &[PathBuf]) -> Result<ToolResult, String> {
@@ -1923,25 +2281,52 @@ async fn git_pull(ws: &[PathBuf]) -> Result<ToolResult, String> {
     if c != 0 {
         return Err(format!("git pull failed: {err}"));
     }
-    Ok(ToolResult::ok("git_pull", "Pulled from remote".to_string(), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_pull",
+        "Pulled from remote".to_string(),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 async fn git_create_branch(ws: &[PathBuf], name: &str) -> Result<ToolResult, String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    let (ec, _, _) = run_git(&Some(root), &["rev-parse".into(), "--verify".into(), format!("refs/heads/{name}")], Duration::from_secs(30)).await?;
+    let (ec, _, _) = run_git(
+        &Some(root),
+        &[
+            "rev-parse".into(),
+            "--verify".into(),
+            format!("refs/heads/{name}"),
+        ],
+        Duration::from_secs(30),
+    )
+    .await?;
     if ec == 0 {
         return Err(format!("Branch `{name}` already exists"));
     }
-    let (c, out, err) = run_git(&Some(root), &["switch".into(), "-c".into(), name.to_string()], Duration::from_secs(60)).await?;
+    let (c, out, err) = run_git(
+        &Some(root),
+        &["switch".into(), "-c".into(), name.to_string()],
+        Duration::from_secs(60),
+    )
+    .await?;
     if c != 0 {
         return Err(format!("git switch -c `{name}` failed: {err}"));
     }
-    Ok(ToolResult::ok("git_create_branch", format!("Created and switched to `{name}`"), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "git_create_branch",
+        format!("Created and switched to `{name}`"),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 async fn run_gh(ws: &[PathBuf], args: &[String]) -> Result<(i32, String, String), String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    run_git(&Some(root), args, Duration::from_secs(120)).await.map(|(c, o, e)| (c, o, e))
+    // `gh`, not `git`: this backs the GitHub tools (`gh pr status`, `gh run
+    // list`, `gh pr create`). Running them through `git` made every call fail
+    // with an unknown-subcommand error.
+    run_command_checked_owned("gh", args, Some(root), Duration::from_secs(120), None).await
 }
 
 async fn git_pr_status(ws: &[PathBuf]) -> Result<ToolResult, String> {
@@ -1949,15 +2334,34 @@ async fn git_pr_status(ws: &[PathBuf]) -> Result<ToolResult, String> {
     if c != 0 && err.contains("gh") {
         return Err(format!("`gh` CLI not available: {err}"));
     }
-    Ok(ToolResult::ok("git_pr_status", "Pull-request status".to_string(), Some(truncate(&if c == 0 { out } else { err }, 30_000)), None))
+    Ok(ToolResult::ok(
+        "git_pr_status",
+        "Pull-request status".to_string(),
+        Some(truncate(&if c == 0 { out } else { err }, 30_000)),
+        None,
+    ))
 }
 
 async fn git_ci_status(ws: &[PathBuf]) -> Result<ToolResult, String> {
-    let (c, out, err) = run_gh(ws, &["run".to_string(), "list".to_string(), "--limit".to_string(), "8".to_string()]).await?;
+    let (c, out, err) = run_gh(
+        ws,
+        &[
+            "run".to_string(),
+            "list".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    )
+    .await?;
     if c != 0 {
         return Err(format!("`gh run list` failed (is gh installed?): {err}"));
     }
-    Ok(ToolResult::ok("git_ci_status", "Recent CI runs".to_string(), Some(truncate(&out, 30_000)), None))
+    Ok(ToolResult::ok(
+        "git_ci_status",
+        "Recent CI runs".to_string(),
+        Some(truncate(&out, 30_000)),
+        None,
+    ))
 }
 
 async fn create_pr(ws: &[PathBuf], title: &str, body: Option<&str>) -> Result<ToolResult, String> {
@@ -1975,7 +2379,12 @@ async fn create_pr(ws: &[PathBuf], title: &str, body: Option<&str>) -> Result<To
     if c != 0 {
         return Err(format!("`gh pr create` failed: {err}"));
     }
-    Ok(ToolResult::ok("create_pr", format!("Opened PR: {title}"), Some(truncate(&out, 4000)), None))
+    Ok(ToolResult::ok(
+        "create_pr",
+        format!("Opened PR: {title}"),
+        Some(truncate(&out, 4000)),
+        None,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2009,14 +2418,14 @@ fn create_skill(
         .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
     let file = dir.join(format!("{name}.md"));
     if file.exists() {
-        return Err(format!("Skill `{name}` already exists at {}", file.display()));
+        return Err(format!(
+            "Skill `{name}` already exists at {}",
+            file.display()
+        ));
     }
     let desc = description.unwrap_or("").trim();
-    let md = format!(
-        "---\nname: {name}\ndescription: {desc}\n---\n\n{content}\n"
-    );
-    std::fs::write(&file, md)
-        .map_err(|e| format!("Failed to write `{}`: {e}", file.display()))?;
+    let md = format!("---\nname: {name}\ndescription: {desc}\n---\n\n{content}\n");
+    std::fs::write(&file, md).map_err(|e| format!("Failed to write `{}`: {e}", file.display()))?;
 
     // Reflect immediately into the in-memory knowledge state.
     {
@@ -2052,14 +2461,21 @@ fn read_skill(state: &ToolState, name: &str) -> Result<ToolResult, String> {
         Some(s) => Ok(ToolResult::ok(
             "read_skill",
             format!("Skill `{name}`"),
-            Some(format!("# {}\n\n(description: {})\n\n{}", s.name, s.description, s.content)),
+            Some(format!(
+                "# {}\n\n(description: {})\n\n{}",
+                s.name, s.description, s.content
+            )),
             None,
         )),
         None => Err(format!("No skill named `{name}`")),
     }
 }
 
-fn suggest_skills(state: &ToolState, prompt: &str, path: Option<&str>) -> Result<ToolResult, String> {
+fn suggest_skills(
+    state: &ToolState,
+    prompt: &str,
+    path: Option<&str>,
+) -> Result<ToolResult, String> {
     let suggestions = state.knowledge.suggest(prompt, path);
     if suggestions.is_empty() {
         return Ok(ToolResult::ok(
@@ -2071,7 +2487,10 @@ fn suggest_skills(state: &ToolState, prompt: &str, path: Option<&str>) -> Result
     }
     let mut body = String::new();
     for (score, s) in &suggestions {
-        body.push_str(&format!("- **{}** (score {}): {}\n", s.name, score, s.description));
+        body.push_str(&format!(
+            "- **{}** (score {}): {}\n",
+            s.name, score, s.description
+        ));
     }
     Ok(ToolResult::ok(
         "suggest_skills",
@@ -2102,37 +2521,51 @@ async fn call_mcp_tool(
 ) -> Result<ToolResult, String> {
     let config_dir = app_config_dir(app);
 
-    // Resolve the server config: catalog match by name first, else ad-hoc.
+    // Resolve the server config: catalog match by name first, else ad-hoc stdio.
     let servers = mcp::load_catalog(&config_dir).unwrap_or_default();
-    let mut bin: Option<String> = None;
-    let mut args: Vec<String> = Vec::new();
-    if let Some(name) = server {
-        let cfg = servers
+    let cfg = if let Some(name) = server {
+        servers
             .iter()
             .find(|c| c.name == *name)
-            .ok_or_else(|| format!("MCP server `{name}` not configured"))?;
-        bin = Some(cfg.bin.clone());
-        args = cfg.args.clone();
+            .cloned()
+            .ok_or_else(|| format!("MCP server `{name}` not configured"))?
     } else if let Some(b) = server_bin {
-        bin = Some(b.clone());
-        args = server_args.to_vec();
-    }
-    let bin = bin.ok_or_else(|| "call_mcp_tool requires either a configured `server` name or `serverBin`".to_string())?;
+        mcp::McpServerConfig {
+            name: b.clone(),
+            bin: b.clone(),
+            args: server_args.to_vec(),
+            ..Default::default()
+        }
+    } else {
+        return Err(
+            "call_mcp_tool requires either a configured `server` name or `serverBin`".to_string(),
+        );
+    };
 
-    let key = format!("{} {}", bin, args.join(" "));
+    // Honour per-server enable + per-tool allow-list for catalogued servers.
+    // Ad-hoc `serverBin` calls (no catalog entry) stay allowed for back-compat.
+    if !cfg.enabled {
+        return Err(format!(
+            "MCP server `{}` is disabled in Settings — enable it to call its tools",
+            cfg.name
+        ));
+    }
+    if server.is_some() && !cfg.tool_allowed(tool) {
+        return Err(format!(
+            "MCP tool `{tool}` is not enabled for server `{}` — adjust its allowed tools in Settings",
+            cfg.name
+        ));
+    }
+
+    let key = cfg.cache_key();
     let handle = {
         let mut cache = state.mcp_servers.lock().await;
         if let Some(h) = cache.get(&key) {
             h.clone()
         } else {
-            let cfg = servers
-                .iter()
-                .find(|c| c.bin == bin && c.args == args)
-                .cloned();
-            let env = cfg.as_ref().map(|c| c.env.clone()).unwrap_or_default();
-            let h = mcp::McpHandle::spawn(&bin, &args, &env)
+            let h = mcp::McpClient::connect(&cfg)
                 .await
-                .map_err(|e| format!("Failed to start MCP server `{bin}`: {e}"))?;
+                .map_err(|e| format!("Failed to start MCP server `{}`: {e}", cfg.name))?;
             let arc = std::sync::Arc::new(tokio::sync::Mutex::new(h));
             cache.insert(key.clone(), arc.clone());
             arc
@@ -2168,8 +2601,10 @@ fn list_mcp_servers(app: &ToolContext) -> Result<ToolResult, String> {
         .map(|s| {
             json!({
                 "name": s.name,
+                "transport": s.transport,
                 "bin": s.bin,
                 "args": s.args,
+                "url": s.url,
                 "enabled": s.enabled,
                 "allowed_tools": s.allowed_tools,
             })
@@ -2198,9 +2633,8 @@ async fn add_mcp_server(
         name: name.to_string(),
         bin: bin.to_string(),
         args: args.to_vec(),
-        env: Default::default(),
-        allowed_tools: Vec::new(),
         enabled: true,
+        ..Default::default()
     });
     mcp::save_catalog(&config_dir, &servers).map_err(|e| e.to_string())?;
     Ok(servers)
@@ -2233,7 +2667,11 @@ fn attach_file(state: &ToolState, path: &Path) -> Result<rag::AttachedFile, Stri
     if text.len() > 10_000_000 {
         return Err(format!("`{}` is too large to index", path.display()));
     }
-    state.rag.lock().unwrap().attach(&path.to_string_lossy(), &text)
+    state
+        .rag
+        .lock()
+        .unwrap()
+        .attach(&path.to_string_lossy(), &text)
 }
 
 fn search_attached(state: &ToolState, query: &str, top_k: usize) -> Result<ToolResult, String> {
@@ -2248,7 +2686,9 @@ fn search_attached(state: &ToolState, query: &str, top_k: usize) -> Result<ToolR
     }
     let mut body = String::new();
     for (file, offset, score, text) in &hits {
-        body.push_str(&format!("{file} (offset {offset}, score {score:.3}):\n{text}\n\n"));
+        body.push_str(&format!(
+            "{file} (offset {offset}, score {score:.3}):\n{text}\n\n"
+        ));
     }
     Ok(ToolResult::ok(
         "search_attached_files",
@@ -2281,7 +2721,11 @@ pub async fn transcribe_file(state: &ToolState, path: &Path) -> Result<String, S
     let model = std::env::var("AI_EDITOR_WHISPER_MODEL")
         .ok()
         .filter(|m| !m.is_empty())
-        .ok_or_else(|| String::from("Set AI_EDITOR_WHISPER_MODEL to a whisper.cpp ggml model (e.g. ggml-base.bin)."))?;
+        .ok_or_else(|| {
+            String::from(
+                "Set AI_EDITOR_WHISPER_MODEL to a whisper.cpp ggml model (e.g. ggml-base.bin).",
+            )
+        })?;
 
     let dir = super::scratchpad_root().join("transcribe");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -2317,7 +2761,8 @@ pub async fn transcribe_file(state: &ToolState, path: &Path) -> Result<String, S
         return Err(format!("Whisper failed (exit {code}): {err}"));
     }
     let json_path = format!("{out_base}.json");
-    let text = std::fs::read_to_string(&json_path).map_err(|e| format!("No transcript produced: {e}"))?;
+    let text =
+        std::fs::read_to_string(&json_path).map_err(|e| format!("No transcript produced: {e}"))?;
     let _ = std::fs::remove_file(&json_path);
     let mut transcript = String::new();
     if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -2356,7 +2801,9 @@ fn find_whisper_bin() -> Option<String> {
 
 async fn transcribe_audio_tool(path: &Path, _language: Option<&str>) -> Result<ToolResult, String> {
     // `transcribe_file` already falls back to a solid engine message.
-    let mut out = transcribe_file(&ToolState::default(), path).await.map_err(|e| e)?;
+    let mut out = transcribe_file(&ToolState::default(), path)
+        .await
+        .map_err(|e| e)?;
     if out.is_empty() {
         out = "(no speech detected)".to_string();
     }
@@ -2426,7 +2873,10 @@ fn update_plan(
         .or_else(|| plan::PlanState::load(ws))
         .ok_or_else(|| "No active plan".to_string())?;
     if item < 1 || item > plan.items.len() {
-        return Err(format!("Plan item #{item} is out of range (1..={})", plan.items.len()));
+        return Err(format!(
+            "Plan item #{item} is out of range (1..={})",
+            plan.items.len()
+        ));
     }
     let pstatus = plan::PlanStatus::from_label(status)
         .ok_or_else(|| format!("Unknown plan status `{status}`"))?;
@@ -2474,7 +2924,9 @@ impl SemIndex {
         let mut docs: Vec<SemDoc> = Vec::with_capacity(files.len());
         let mut df: HashMap<String, u32> = HashMap::new();
         for f in files {
-            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            let Ok(text) = std::fs::read_to_string(f) else {
+                continue;
+            };
             if text.len() > 1_500_000 {
                 continue;
             }
@@ -2515,7 +2967,11 @@ impl SemIndex {
                         dot += (*qw as f32) * w * (*dw as f32) * w;
                     }
                 }
-                let sim = if qn > 0.0 { dot / (qn.max(qn) * d.len.max(d.len)) } else { 0.0 };
+                let sim = if qn > 0.0 {
+                    dot / (qn.max(qn) * d.len.max(d.len))
+                } else {
+                    0.0
+                };
                 (sim, d)
             })
             .collect();
@@ -2555,10 +3011,10 @@ fn words_re() -> &'static Regex {
 }
 
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "this", "that", "with", "from", "have", "was", "were",
-    "has", "its", "not", "but", "you", "your", "all", "can", "will", "just", "would",
-    "there", "their", "what", "when", "which", "who", "about", "into", "than", "then",
-    "them", "these", "those", "still", "only", "might", "could", "should", "some",
+    "the", "and", "for", "are", "this", "that", "with", "from", "have", "was", "were", "has",
+    "its", "not", "but", "you", "your", "all", "can", "will", "just", "would", "there", "their",
+    "what", "when", "which", "who", "about", "into", "than", "then", "them", "these", "those",
+    "still", "only", "might", "could", "should", "some",
 ];
 
 async fn semantic_search(
@@ -2583,12 +3039,20 @@ async fn semantic_search(
                 let i = cache.as_ref().unwrap();
                 // Need a clone to release the lock before search (no borrow
                 // here because we clone documents below via search).
-                SemIndex { key: i.key.clone(), docs: i.docs.clone(), idf: i.idf.clone() }
+                SemIndex {
+                    key: i.key.clone(),
+                    docs: i.docs.clone(),
+                    idf: i.idf.clone(),
+                }
             }
             _ => {
                 let files = collect_search_files(root, include, respect_gitignore)?;
                 let idx = SemIndex::build(key.clone(), &files)?;
-                *cache = Some(SemIndex { key, docs: idx.docs.clone(), idf: idx.idf.clone() });
+                *cache = Some(SemIndex {
+                    key,
+                    docs: idx.docs.clone(),
+                    idf: idx.idf.clone(),
+                });
                 idx
             }
         }
@@ -2624,7 +3088,10 @@ fn collect_search_files(
     let mut files = Vec::new();
     let mut walker = WalkBuilder::new(root);
     walker.hidden(false).parents(false);
-    walker.git_ignore(respect_gitignore).git_exclude(respect_gitignore).git_global(respect_gitignore);
+    walker
+        .git_ignore(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .git_global(respect_gitignore);
     walker.standard_filters(respect_gitignore);
     for entry in walker.build() {
         if files.len() >= 4000 {
@@ -2672,13 +3139,20 @@ pub struct RepoSymbol {
 }
 
 impl RepoGraph {
-    pub fn build(key: String, root: &Path, respect_gitignore: bool, top_n: usize) -> Result<RepoGraph, String> {
+    pub fn build(
+        key: String,
+        root: &Path,
+        respect_gitignore: bool,
+        top_n: usize,
+    ) -> Result<RepoGraph, String> {
         let files = collect_search_files(root, None, respect_gitignore)?;
         let mut defs: Vec<(PathBuf, u32, String, String)> = Vec::new(); // path, line, name, kind
         let mut by_file: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut def_file: HashMap<String, (PathBuf, u32, String)> = HashMap::new();
         for f in &files {
-            let Some((_, tree, text)) = parse_tree(f)? else { continue };
+            let Some((_, tree, text)) = parse_tree(f)? else {
+                continue;
+            };
             let names = extract_defs(&tree, &text);
             let mut local = Vec::new();
             for (name, kind, line) in &names {
@@ -2691,7 +3165,10 @@ impl RepoGraph {
         }
 
         // Co-occurrence edges: symbols sharing a file get a symmetric edge.
-        let all_symbols: Vec<String> = defs.iter().map(|(_, _, n, _)| format!("{}.{}", "", n)).collect();
+        let all_symbols: Vec<String> = defs
+            .iter()
+            .map(|(_, _, n, _)| format!("{}.{}", "", n))
+            .collect();
         let _ = all_symbols;
         // Better: unique symbol keys.
         let ids: Vec<String> = def_file.keys().cloned().collect();
@@ -2714,7 +3191,10 @@ impl RepoGraph {
         // Iterative PageRank (damping 0.85, 30 iterations).
         let n = ids.len();
         if n == 0 {
-            return Ok(RepoGraph { key, symbols: Vec::new() });
+            return Ok(RepoGraph {
+                key,
+                symbols: Vec::new(),
+            });
         }
         let mut rank = vec![1.0 / n as f32; n];
         for _ in 0..30 {
@@ -2732,14 +3212,18 @@ impl RepoGraph {
             rank = next;
         }
 
-        let mut ranked: Vec<(f32, &String)> = ids.iter().zip(rank.iter()).map(|(k, r)| (*r, k)).collect();
+        let mut ranked: Vec<(f32, &String)> =
+            ids.iter().zip(rank.iter()).map(|(k, r)| (*r, k)).collect();
         ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let symbols = ranked
             .into_iter()
             .take(top_n.min(300))
             .filter(|(s, _)| *s > 0.0)
             .map(|(score, key)| {
-                let (path, line, kind) = def_file.get(key).cloned().unwrap_or_else(|| (PathBuf::new(), 0, String::new()));
+                let (path, line, kind) = def_file
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| (PathBuf::new(), 0, String::new()));
                 let name = key.rsplit('.').next().unwrap_or("").to_string();
                 RepoSymbol {
                     symbol: name,
@@ -2779,7 +3263,11 @@ fn extract_defs(tree: &tree_sitter::Tree, _text: &str) -> Vec<(String, String, u
         if let Some((label, _)) = kind {
             if let Some(name) = node.child_by_field_name("name") {
                 if let Ok(name_str) = name.utf8_text(&[]) {
-                    out.push((name_str.to_string(), label.to_string(), node.start_position().row as u32 + 1));
+                    out.push((
+                        name_str.to_string(),
+                        label.to_string(),
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             }
         }
@@ -2793,11 +3281,7 @@ fn extract_defs(tree: &tree_sitter::Tree, _text: &str) -> Vec<(String, String, u
     out
 }
 
-async fn view_repo_map(
-    state: &ToolState,
-    root: &Path,
-    top_n: usize,
-) -> Result<ToolResult, String> {
+async fn view_repo_map(state: &ToolState, root: &Path, top_n: usize) -> Result<ToolResult, String> {
     let key = root.to_string_lossy().into_owned();
     let graph = {
         let mut cache = state.repo_graph.lock().await;
@@ -2809,10 +3293,16 @@ async fn view_repo_map(
             _ => {
                 let built = RepoGraph::build(key.clone(), root, true, top_n)?;
                 let mtime = now_ms();
-                cache.insert(key.clone(), (mtime, RepoGraph {
-                    key: built.key.clone(),
-                    symbols: built.symbols.clone(),
-                }));
+                cache.insert(
+                    key.clone(),
+                    (
+                        mtime,
+                        RepoGraph {
+                            key: built.key.clone(),
+                            symbols: built.symbols.clone(),
+                        },
+                    ),
+                );
                 built
             }
         }
@@ -2896,8 +3386,15 @@ fn read_lints(path: &Path) -> Result<ToolResult, String> {
 fn collect_syntax_errors(path: &Path, tree: &tree_sitter::Tree, out: &mut Vec<String>) {
     fn walk(node: &Node, path: &Path, out: &mut Vec<String>) {
         if node.is_error() || node.is_missing() {
-            let (l, c) = (node.start_position().row + 1, node.start_position().column + 1);
-            out.push(format!("{}:{l}:{c}: syntax error at `{}`", path.display(), node.kind()));
+            let (l, c) = (
+                node.start_position().row + 1,
+                node.start_position().column + 1,
+            );
+            out.push(format!(
+                "{}:{l}:{c}: syntax error at `{}`",
+                path.display(),
+                node.kind()
+            ));
         }
         let mut w = node.walk();
         for child in node.named_children(&mut w) {
@@ -2915,13 +3412,25 @@ fn collect_cheap_checks(path: &Path, tree: &tree_sitter::Tree, out: &mut Vec<Str
     while let Some(node) = stack.pop() {
         match node.kind() {
             "debugger_statement" => {
-                let (l, c) = (node.start_position().row + 1, node.start_position().column + 1);
-                out.push(format!("{}:{l}:{c}: stray `debugger` statement", path.display()));
+                let (l, c) = (
+                    node.start_position().row + 1,
+                    node.start_position().column + 1,
+                );
+                out.push(format!(
+                    "{}:{l}:{c}: stray `debugger` statement",
+                    path.display()
+                ));
             }
             "catch_clause" => {
                 if node.named_child_count() < 2 {
-                    let (l, c) = (node.start_position().row + 1, node.start_position().column + 1);
-                    out.push(format!("{}:{l}:{c}: empty catch block swallows errors", path.display()));
+                    let (l, c) = (
+                        node.start_position().row + 1,
+                        node.start_position().column + 1,
+                    );
+                    out.push(format!(
+                        "{}:{l}:{c}: empty catch block swallows errors",
+                        path.display()
+                    ));
                 }
             }
             _ => {}
@@ -2946,7 +3455,9 @@ fn tree_sitter_query(path: &Path, query: &str, max_results: usize) -> Result<Too
         let mut it = cursor.matches(&query, tree.root_node(), text.as_bytes());
         while lines.len() < max_results {
             let Some(m) = it.next() else { break };
-            let Some(first) = m.captures.first() else { continue };
+            let Some(first) = m.captures.first() else {
+                continue;
+            };
             let (start_l, start_c) = (
                 first.node.start_position().row + 1,
                 first.node.start_position().column + 1,
@@ -2955,7 +3466,11 @@ fn tree_sitter_query(path: &Path, query: &str, max_results: usize) -> Result<Too
             for cap in m.captures.iter() {
                 let name = &query.capture_names()[cap.index as usize];
                 if let Ok(t) = cap.node.utf8_text(text.as_bytes()) {
-                    parts.push(format!("{}={}", name, t.chars().take(80).collect::<String>()));
+                    parts.push(format!(
+                        "{}={}",
+                        name,
+                        t.chars().take(80).collect::<String>()
+                    ));
                 }
             }
             lines.push(format!("{start_l}:{start_c}: {}", parts.join(" ")));
@@ -2981,7 +3496,10 @@ fn tree_sitter_query(path: &Path, query: &str, max_results: usize) -> Result<Too
 fn url_safe(url: &str) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL `{url}`: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("Only http/https URLs are allowed, got `{}`", parsed.scheme()));
+        return Err(format!(
+            "Only http/https URLs are allowed, got `{}`",
+            parsed.scheme()
+        ));
     }
     let host = parsed
         .host_str()
@@ -3002,10 +3520,7 @@ fn url_safe(url: &str) -> Result<(), String> {
     }
     if let Some(octets) = host.split('.').collect::<Vec<_>>().first() {
         if host.split('.').count() == 4 {
-            let parts: Vec<u32> = host
-                .split('.')
-                .filter_map(|p| p.parse().ok())
-                .collect();
+            let parts: Vec<u32> = host.split('.').filter_map(|p| p.parse().ok()).collect();
             if parts.len() == 4 {
                 let a = parts[0];
                 if (a == 172 && (16..=31).contains(&parts[1])) || a == 100 {
@@ -3098,10 +3613,7 @@ async fn http_get(url: &str, cap_bytes: usize) -> Result<String, String> {
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Read body: {e}"))?;
+    let text = resp.text().await.map_err(|e| format!("Read body: {e}"))?;
     let clipped: String = text.chars().take(cap_bytes).collect();
     if !status.is_success() {
         return Err(format!("HTTP {status} from {url}"));
@@ -3110,15 +3622,13 @@ async fn http_get(url: &str, cap_bytes: usize) -> Result<String, String> {
 }
 
 async fn web_search(query: &str, max_results: usize) -> Result<ToolResult, String> {
-    let url = format!(
-        "https://html.duckduckgo.com/html/?q={}",
-        url_encode(query)
-    );
-    let html = http_get(&url, 400_000).await.map_err(|e| format!("web_search: {e}"))?;
-    let anchors = Regex::new(r#"(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
-        .unwrap();
-    let snippets = Regex::new(r#"(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#)
-        .unwrap();
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    let html = http_get(&url, 400_000)
+        .await
+        .map_err(|e| format!("web_search: {e}"))?;
+    let anchors =
+        Regex::new(r#"(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
+    let snippets = Regex::new(r#"(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#).unwrap();
     let snippets: Vec<String> = snippets
         .captures_iter(&html)
         .take(max_results)
@@ -3137,7 +3647,10 @@ async fn web_search(query: &str, max_results: usize) -> Result<ToolResult, Strin
             href.to_string()
         };
         let snippet = snippets.get(i).cloned().unwrap_or_default();
-        results.push(format!("{}. **{title}**\n   {final_url}\n   {snippet}", i + 1));
+        results.push(format!(
+            "{}. **{title}**\n   {final_url}\n   {snippet}",
+            i + 1
+        ));
     }
     if results.is_empty() {
         return Ok(ToolResult::ok(
@@ -3172,7 +3685,7 @@ async fn web_extract(url: &str) -> Result<ToolResult, String> {
     ))
 }
 
-async fn download_file(url: &str, dst: &Path, workspaces: &[PathBuf]) -> Result<ToolResult, String> {
+async fn download_file(url: &str, dst: &Path) -> Result<ToolResult, String> {
     url_safe(url)?;
     let client = reqwest::Client::builder()
         .user_agent("ai-editor-agent/0.1")
@@ -3185,32 +3698,17 @@ async fn download_file(url: &str, dst: &Path, workspaces: &[PathBuf]) -> Result<
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Read body: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("Read body: {e}"))?;
     if !status.is_success() {
         return Err(format!("HTTP {status} from {url}"));
     }
     if bytes.len() > 200_000_000 {
         return Err("Download exceeds the 200 MB safety cap".into());
     }
-    if dst.is_absolute() {
-        // writting outside the workspace must have been policy-vetted already
-    } else {
-        let root = first_ws(workspaces).ok_or_else(|| "No workspace set".to_string())?;
-        let abs = root.join(dst);
-        std::fs::write(&abs, &bytes)
-            .map_err(|e| format!("Failed to write `{}`: {e}", abs.display()))?;
-        return Ok(ToolResult::ok(
-            "download_file",
-            format!("Downloaded {} byte(s) to {}", bytes.len(), abs.display()),
-            None,
-            Some(json!({ "bytes": bytes.len() })),
-        ));
-    }
-    std::fs::write(dst, &bytes)
-        .map_err(|e| format!("Failed to write `{}`: {e}", dst.display()))?;
+    // The destination is policy-scoped upstream (`policy::call_target_paths`
+    // lists `DownloadFile`), so an absolute path outside the workspace only
+    // reaches here after an explicit approval decision.
+    std::fs::write(dst, &bytes).map_err(|e| format!("Failed to write `{}`: {e}", dst.display()))?;
     Ok(ToolResult::ok(
         "download_file",
         format!("Downloaded {} byte(s) to {}", bytes.len(), dst.display()),
@@ -3232,7 +3730,11 @@ async fn ask_question(
     let request_id = state.next_question_id();
     let choices = choices.map(|c| c.to_vec()).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.pending_questions.lock().await.insert(request_id.clone(), tx);
+    state
+        .pending_questions
+        .lock()
+        .await
+        .insert(request_id.clone(), tx);
     let _ = app.emit(
         "agent://question-request",
         QuestionRequestEvent {
@@ -3275,7 +3777,11 @@ pub async fn hitl_gate(
 ) -> Result<bool, String> {
     let request_id = state.next_hitl_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.pending_hitl.lock().await.insert(request_id.clone(), tx);
+    state
+        .pending_hitl
+        .lock()
+        .await
+        .insert(request_id.clone(), tx);
     let tools: Vec<String> = pending.iter().map(|c| c.summary()).collect();
     let _ = app.emit(
         "agent://hitl-gate",
@@ -3290,8 +3796,7 @@ pub async fn hitl_gate(
     let decision = tokio::time::timeout(Duration::from_secs(600), rx)
         .await
         .map_err(|_| {
-            "The approval request timed out before you decided — treat as denied."
-                .to_string()
+            "The approval request timed out before you decided — treat as denied.".to_string()
         })?
         .map_err(|_| "The approval channel closed before you decided.".to_string())?;
     state.pending_hitl.lock().await.remove(&request_id);
@@ -3304,10 +3809,25 @@ pub async fn hitl_gate(
 
 async fn summarize_changes(state: &ToolState, ws: &[PathBuf]) -> Result<ToolResult, String> {
     let root = first_ws(ws).ok_or_else(|| "No workspace set".to_string())?;
-    let (_, status_out, _) = run_git(&Some(root), &["status".into(), "--porcelain=v1".into()], Duration::from_secs(60)).await?;
+    let (_, status_out, _) = run_git(
+        &Some(root),
+        &["status".into(), "--porcelain=v1".into()],
+        Duration::from_secs(60),
+    )
+    .await?;
     let mut parts = vec![format!("# Uncommitted changes\n\n{status_out}")];
-    let (c0, staged, _) = run_git(&Some(root), &["diff".into(), "--cached".into(), "--stat".into()], Duration::from_secs(60)).await?;
-    let (c1, unstaged, _) = run_git(&Some(root), &["diff".into(), "--stat".into()], Duration::from_secs(60)).await?;
+    let (c0, staged, _) = run_git(
+        &Some(root),
+        &["diff".into(), "--cached".into(), "--stat".into()],
+        Duration::from_secs(60),
+    )
+    .await?;
+    let (c1, unstaged, _) = run_git(
+        &Some(root),
+        &["diff".into(), "--stat".into()],
+        Duration::from_secs(60),
+    )
+    .await?;
     if c0 == 0 && !staged.trim().is_empty() {
         parts.push(format!("\n## Staged\n{staged}"));
     }
@@ -3349,8 +3869,10 @@ async fn analyze_bug(
     stack: &str,
     path: Option<&Path>,
 ) -> Result<ToolResult, String> {
-    let loc_re = Regex::new(r"(?m)([A-Za-z0-9_\.\-/\\]+\.(?:rs|py|ts|tsx|js|go|java|c|cc|cpp|rb)(?::\d+){1,2})")
-        .unwrap();
+    let loc_re = Regex::new(
+        r"(?m)([A-Za-z0-9_\.\-/\\]+\.(?:rs|py|ts|tsx|js|go|java|c|cc|cpp|rb)(?::\d+){1,2})",
+    )
+    .unwrap();
     let mut refs = Vec::new();
     for cap in loc_re.captures_iter(stack) {
         let loc = cap.get(1).unwrap().as_str().to_string();
@@ -3364,7 +3886,11 @@ async fn analyze_bug(
         if parts.len() >= 2 {
             let file = parts[2].to_string();
             let p = PathBuf::from(&file);
-            let resolved = if p.is_absolute() { p } else { root.map(|r| r.join(&file)).unwrap_or(p) };
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                root.map(|r| r.join(&file)).unwrap_or(p)
+            };
             if let Ok(text) = std::fs::read_to_string(&resolved) {
                 if let Some(path_focus) = path {
                     let _ = path_focus;
@@ -3373,8 +3899,16 @@ async fn analyze_bug(
                     let lines: Vec<&str> = text.lines().collect();
                     let start = first.saturating_sub(8).min(lines.len());
                     let end = (first + 8).min(lines.len());
-                    context.push_str(&format!("\n--- {} (around line {first}) ---\n", resolved.display()));
-                    for (i, l) in lines.iter().enumerate().skip(start).take(end.saturating_sub(start)) {
+                    context.push_str(&format!(
+                        "\n--- {} (around line {first}) ---\n",
+                        resolved.display()
+                    ));
+                    for (i, l) in lines
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(end.saturating_sub(start))
+                    {
                         context.push_str(&format!("{}: {l}\n", i + 1));
                     }
                 }
@@ -3407,7 +3941,12 @@ async fn analyze_bug(
     )
     .await
     {
-        return Ok(ToolResult::ok("analyze_bug", "Bug analysis complete".into(), Some(analysis), None));
+        return Ok(ToolResult::ok(
+            "analyze_bug",
+            "Bug analysis complete".into(),
+            Some(analysis),
+            None,
+        ));
     }
 
     if context.is_empty() {
@@ -3441,7 +3980,8 @@ async fn review_code(
     } else {
         // Default to reviewing the full uncommitted diff.
         let ws_path = root.unwrap_or_else(|| Path::new("."));
-        let (c, out, _) = run_git(&Some(ws_path), &["diff".into()], Duration::from_secs(60)).await?;
+        let (c, out, _) =
+            run_git(&Some(ws_path), &["diff".into()], Duration::from_secs(60)).await?;
         if c == 0 {
             content = truncate(&out, 16_000);
         }
@@ -3490,12 +4030,36 @@ async fn maybe_auto_checkpoint(state: &ToolState, interrupt: &CancellationToken)
     if !first {
         return;
     }
-    let Some(ws) = state.primary_workspace().await else { return };
+    let Some(ws) = state.primary_workspace().await else {
+        return;
+    };
     let mut args: Vec<String> = vec!["add".into(), "-A".into()];
-    let _ = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await;
-    if let Err(_) = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await {
+    let _ = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await;
+    if let Err(_) = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await
+    {
         return;
     }
     args = vec!["commit".into(), "-m".into(), "ai: auto-checkpoint".into()];
-    let _ = run_command_checked_owned("git", &args, Some(&ws), Duration::from_secs(120), Some(interrupt)).await;
+    let _ = run_command_checked_owned(
+        "git",
+        &args,
+        Some(&ws),
+        Duration::from_secs(120),
+        Some(interrupt),
+    )
+    .await;
 }

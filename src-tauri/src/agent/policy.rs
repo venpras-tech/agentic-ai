@@ -30,13 +30,18 @@ use super::ToolCall;
 pub enum Verdict {
     Allow,
     Deny(String),
-    Ask { request_id: String },
+    Ask {
+        request_id: String,
+    },
     /// A recursive **folder** delete (vs a single file). Never auto-approved,
     /// never session-remembered — the user must confirm every one, even when
     /// the tool is configured `allow` or was granted earlier in the session.
     /// `detail` carries the resolved target and entry count for a stronger
     /// warning.
-    AskFolderDelete { request_id: String, detail: String },
+    AskFolderDelete {
+        request_id: String,
+        detail: String,
+    },
 }
 
 /// Configured policy for one tool.
@@ -62,6 +67,14 @@ pub struct PolicyConfig {
     pub default: String,
     #[serde(default)]
     pub rules: Vec<PolicyRule>,
+    /// Per-category auto-approve matrix (Cline-style). Maps a category key
+    /// (see [`Category`]) to `true` to skip the approval dialog for every tool
+    /// in that category. Absent keys fall back to the normal ask flow. This is
+    /// a *lowering* control only: red-zone commands, recursive folder deletes,
+    /// `always_ask` tools, and subagent child restrictions are never unlocked
+    /// by it.
+    #[serde(default)]
+    pub auto_approve: std::collections::BTreeMap<String, bool>,
 }
 
 impl Default for PolicyConfig {
@@ -69,7 +82,89 @@ impl Default for PolicyConfig {
         Self {
             default: "ask".into(),
             rules: Vec::new(),
+            auto_approve: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+/// Coarse tool categories for the auto-approve matrix. The string keys are the
+/// stable identifiers stored in `policy.json` and surfaced to the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Read,
+    Edit,
+    Shell,
+    GitWrite,
+    Mcp,
+    Browser,
+    Other,
+}
+
+impl Category {
+    pub fn key(self) -> &'static str {
+        match self {
+            Category::Read => "read",
+            Category::Edit => "edit",
+            Category::Shell => "shell",
+            Category::GitWrite => "gitWrite",
+            Category::Mcp => "mcp",
+            Category::Browser => "browser",
+            Category::Other => "other",
+        }
+    }
+}
+
+/// Every category key the UI should render in the matrix, in display order.
+pub const CATEGORY_KEYS: [&str; 7] = [
+    "read", "edit", "shell", "gitWrite", "mcp", "browser", "other",
+];
+
+/// Classify a tool name into its auto-approve category.
+pub fn category(tool: &str) -> Category {
+    match tool {
+        "glob_search_codebase"
+        | "search_file_contents"
+        | "semantic_search_codebase"
+        | "view_file_structure"
+        | "read_file_range"
+        | "read_file_chars"
+        | "list_dir"
+        | "read_skill"
+        | "read_plan"
+        | "get_scratchpad_folder"
+        | "git_status"
+        | "git_diff"
+        | "git_blame"
+        | "git_pr_status"
+        | "git_ci_status"
+        | "summarize_changes"
+        | "read_lints"
+        | "view_repo_map"
+        | "suggest_skills"
+        | "attach_file"
+        | "search_attached_files"
+        | "detach_file"
+        | "tree_sitter_query"
+        | "list_mcp_servers"
+        | "get_todo_list" => Category::Read,
+        "apply_file_diff"
+        | "write_file"
+        | "create_folder"
+        | "copy_file_or_folder"
+        | "move_file_or_folder"
+        | "delete_file_or_folder" => Category::Edit,
+        "execute_terminal_command" | "run_python" | "run_javascript" | "run_tests"
+        | "calculate" => Category::Shell,
+        "git_commit"
+        | "git_checkpoint"
+        | "git_revert"
+        | "git_push"
+        | "git_pull"
+        | "git_create_branch"
+        | "create_pr" => Category::GitWrite,
+        "call_mcp_tool" | "add_mcp_server" | "remove_mcp_server" => Category::Mcp,
+        "browse_web" | "web_search" | "web_extract" | "download_file" => Category::Browser,
+        _ => Category::Other,
     }
 }
 
@@ -150,7 +245,10 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
         };
         let inside_any = workspaces.iter().any(|ws| is_within(&full, ws));
         if !inside_any && !grant_covers(state, &full, call_wants_write(call)) {
-            let roots_display: Vec<String> = workspaces.iter().map(|w| format!("`{}`", w.display())).collect();
+            let roots_display: Vec<String> = workspaces
+                .iter()
+                .map(|w| format!("`{}`", w.display()))
+                .collect();
             return Verdict::Deny(format!(
                 "Path `{path}` is outside all open workspaces ({}). Refusing to touch files outside the project.",
                 roots_display.join(", ")
@@ -204,9 +302,7 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
     if let ToolCall::DeleteFileOrFolder { path } = call {
         if let Some(abs) = resolve_abs(workspaces, path) {
             if abs.is_dir() {
-                let n = std::fs::read_dir(&abs)
-                    .map(|rd| rd.count())
-                    .unwrap_or(0);
+                let n = std::fs::read_dir(&abs).map(|rd| rd.count()).unwrap_or(0);
                 return Verdict::AskFolderDelete {
                     request_id: state.next_request_id(),
                     detail: format!(
@@ -217,6 +313,18 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
                     ),
                 };
             }
+        }
+    }
+
+    // 3c. Per-category auto-approve matrix (P5.3). Checked after the
+    //     red-zone, subagent, and folder-delete gates so those stay
+    //     unconditional, and before the tool-level ask flow so an approved
+    //     category skips the dialog. `always_ask` tools are still excluded
+    //     below — an approved `browser` category never unlocks `download_file`.
+    if !always_ask(tool) {
+        let cat = category(tool).key();
+        if cfg.auto_approve.get(cat).copied().unwrap_or(false) {
+            return Verdict::Allow;
         }
     }
 
@@ -472,7 +580,8 @@ fn call_target_paths(call: &ToolCall) -> Vec<String> {
         | ToolCall::ApplyFileDiff { path, .. }
         | ToolCall::WriteFile { path, .. }
         | ToolCall::CreateFolder { path }
-        | ToolCall::DeleteFileOrFolder { path } => vec![path.clone()],
+        | ToolCall::DeleteFileOrFolder { path }
+        | ToolCall::DownloadFile { path, .. } => vec![path.clone()],
         ToolCall::CopyFileOrFolder { src, dst, .. }
         | ToolCall::MoveFileOrFolder { src, dst, .. } => vec![src.clone(), dst.clone()],
         _ => Vec::new(),
@@ -512,6 +621,9 @@ fn is_within(path: &Path, root: &Path) -> bool {
 pub struct PolicySnapshot {
     pub default: String,
     pub rules: Vec<PolicyRule>,
+    /// Per-category auto-approve matrix (`category key -> enabled`).
+    #[serde(default)]
+    pub auto_approve: std::collections::BTreeMap<String, bool>,
     /// YOLO sub-mode flag (session-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
@@ -520,12 +632,83 @@ pub struct PolicySnapshot {
     pub path_grants: Vec<super::PathGrant>,
 }
 
+/// Persist the edited policy (default + rules) to `{workspace}/.ai/policy.json`.
+///
+/// The injected `__red_zone__` rule is never written back out — the UI cannot
+/// weaken it, and it is re-injected on every load.
+#[cfg(test)]
+pub fn save_policy(
+    workspace: Option<&Path>,
+    default: &str,
+    rules: &[PolicyRule],
+) -> Result<(), String> {
+    save_policy_with_matrix(workspace, default, rules, &std::collections::BTreeMap::new())
+}
+
+/// Persist the edited policy, including the per-category auto-approve matrix.
+pub fn save_policy_with_matrix(
+    workspace: Option<&Path>,
+    default: &str,
+    rules: &[PolicyRule],
+    auto_approve: &std::collections::BTreeMap<String, bool>,
+) -> Result<(), String> {
+    let Some(ws) = workspace else {
+        return Ok(());
+    };
+    let valid = |p: &str| matches!(p, "allow" | "ask" | "deny");
+    if !valid(default) {
+        return Err(format!(
+            "Invalid default policy `{default}` (expected allow/ask/deny)."
+        ));
+    }
+    for r in rules {
+        if !valid(&r.policy) {
+            return Err(format!(
+                "Invalid policy `{}` for tool `{}` (expected allow/ask/deny).",
+                r.policy, r.tool
+            ));
+        }
+        if r.tool == "__red_zone__" {
+            return Err("The built-in red zone cannot be edited or persisted.".into());
+        }
+        if r.tool.trim().is_empty() {
+            return Err("Policy rules must name a tool.".into());
+        }
+    }
+    // Only known category keys are persisted, and only when enabled, so the
+    // file stays minimal and typo-proof.
+    let matrix: std::collections::BTreeMap<String, bool> = auto_approve
+        .iter()
+        .filter(|(k, v)| **v && CATEGORY_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let dir = ws.join(".ai");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let cfg = PolicyConfig {
+        default: default.to_string(),
+        // Reject nothing; strip the red zone defensively in case a caller
+        // passed a snapshot that still carries it.
+        rules: rules
+            .iter()
+            .cloned()
+            .filter(|r| r.tool != "__red_zone__")
+            .collect(),
+        auto_approve: matrix,
+    };
+    let text = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("Failed to serialize policy: {e}"))?;
+    let path = dir.join("policy.json");
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
 /// Effective static policy (default + rules) for the UI.
 pub fn snapshot(workspace: Option<&Path>) -> PolicySnapshot {
     let cfg = load_policy(workspace);
     PolicySnapshot {
         default: cfg.default,
         rules: cfg.rules,
+        auto_approve: cfg.auto_approve,
         yolo: None,
         path_grants: Vec::new(),
     }
@@ -615,10 +798,7 @@ mod tests {
             url: "https://example.com/file.zip".into(),
             path: "file.zip".into(),
         };
-        assert!(matches!(
-            check(&state, &call, w(&ws)),
-            Verdict::Ask { .. }
-        ));
+        assert!(matches!(check(&state, &call, w(&ws)), Verdict::Ask { .. }));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -681,10 +861,7 @@ mod tests {
         assert!(matches!(check(&state, &shell, w(&ws)), Verdict::Deny(_)));
         drop(guard);
         // Back on the parent thread everything is unrestricted again.
-        assert!(matches!(
-            check(&state, &write, w(&ws)),
-            Verdict::Ask { .. }
-        ));
+        assert!(matches!(check(&state, &write, w(&ws)), Verdict::Ask { .. }));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -743,10 +920,7 @@ mod tests {
         // Upgrade to write → scoping passes (no more Deny); the tool's own
         // ask-policy still applies (grants never bypass per-tool approval).
         state.path_grants.lock().unwrap()[0].mode = "write".into();
-        assert!(matches!(
-            check(&state, &write, w(&ws)),
-            Verdict::Ask { .. }
-        ));
+        assert!(matches!(check(&state, &write, w(&ws)), Verdict::Ask { .. }));
         // Without any grant covering it, an unrelated outside path stays denied.
         let other = ToolCall::ReadFileRange {
             path: std::env::temp_dir()
@@ -776,8 +950,14 @@ mod tests {
         };
         match check(&state, &dir, w(&ws)) {
             Verdict::AskFolderDelete { detail, .. } => {
-                assert!(detail.contains("test"), "detail should name the target: {detail}");
-                assert!(detail.contains("2"), "detail should count entries: {detail}");
+                assert!(
+                    detail.contains("test"),
+                    "detail should name the target: {detail}"
+                );
+                assert!(
+                    detail.contains("2"),
+                    "detail should count entries: {detail}"
+                );
             }
             other => panic!("expected AskFolderDelete, got {other:?}"),
         }
@@ -805,6 +985,124 @@ mod tests {
         };
         assert_eq!(check(&state, &file, w(&ws)), Verdict::Allow);
 
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn save_policy_round_trips_without_red_zone() {
+        let ws = std::env::temp_dir().join(format!("ai-editor-policy-save-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let rules = vec![PolicyRule {
+            tool: "execute_terminal_command".into(),
+            policy: "allow".into(),
+            command_patterns: vec!["cargo test".into()],
+        }];
+        save_policy(Some(&ws), "ask", &rules).unwrap();
+        let on_disk = std::fs::read_to_string(ws.join(".ai/policy.json")).unwrap();
+        assert!(
+            !on_disk.contains("__red_zone__"),
+            "red zone must never be persisted: {on_disk}"
+        );
+        assert!(on_disk.contains("cargo test"));
+        // Reloading re-injects the red zone at index 0.
+        let cfg = load_policy(Some(&ws));
+        assert_eq!(cfg.rules[0].tool, "__red_zone__");
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[1].tool, "execute_terminal_command");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn save_policy_rejects_edits_to_red_zone_and_bad_policies() {
+        let ws = std::env::temp_dir().join(format!("ai-editor-policy-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        // Editing the red zone block outright.
+        let red = vec![PolicyRule {
+            tool: "__red_zone__".into(),
+            policy: "allow".into(),
+            command_patterns: Vec::new(),
+        }];
+        assert!(save_policy(Some(&ws), "ask", &red).is_err());
+        // Invalid per-rule policy string.
+        let bad = vec![PolicyRule {
+            tool: "write_file".into(),
+            policy: "sometimes".into(),
+            command_patterns: Vec::new(),
+        }];
+        assert!(save_policy(Some(&ws), "ask", &bad).is_err());
+        // Invalid default.
+        assert!(save_policy(Some(&ws), "always", &[]).is_err());
+        assert!(
+            !ws.join(".ai/policy.json").exists(),
+            "failed saves write nothing"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn category_classifies_known_tools() {
+        assert_eq!(category("read_file_range"), Category::Read);
+        assert_eq!(category("write_file"), Category::Edit);
+        assert_eq!(category("execute_terminal_command"), Category::Shell);
+        assert_eq!(category("git_commit"), Category::GitWrite);
+        assert_eq!(category("call_mcp_tool"), Category::Mcp);
+        assert_eq!(category("browse_web"), Category::Browser);
+        assert_eq!(category("ask_question"), Category::Other);
+    }
+
+    #[test]
+    fn auto_approve_matrix_unlocks_a_category() {
+        let ws = std::env::temp_dir().join(format!("ai-editor-matrix-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut matrix = std::collections::BTreeMap::new();
+        matrix.insert("edit".to_string(), true);
+        save_policy_with_matrix(Some(&ws), "ask", &[], &matrix).unwrap();
+
+        let state = super::super::ToolState::default();
+        let write = ToolCall::WriteFile {
+            path: ws.join("a.txt").to_string_lossy().to_string(),
+            content: "x".into(),
+        };
+        assert_eq!(check(&state, &write, w(&ws)), Verdict::Allow);
+
+        // A different category (shell) stays on the ask flow.
+        let shell = ToolCall::ExecuteTerminalCommand {
+            command: "echo hi".into(),
+            timeout_secs: None,
+            cwd: None,
+        };
+        assert!(matches!(check(&state, &shell, w(&ws)), Verdict::Ask { .. }));
+
+        // The matrix round-trips through the file.
+        let snap = snapshot(Some(&ws));
+        assert_eq!(snap.auto_approve.get("edit"), Some(&true));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn auto_approve_never_unlocks_always_ask_or_red_zone() {
+        let ws = std::env::temp_dir().join(format!("ai-editor-matrix2-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut matrix = std::collections::BTreeMap::new();
+        matrix.insert("browser".to_string(), true);
+        matrix.insert("shell".to_string(), true);
+        save_policy_with_matrix(Some(&ws), "ask", &[], &matrix).unwrap();
+
+        let state = super::super::ToolState::default();
+        // download_file is always_ask even under an approved `browser` category.
+        let dl = ToolCall::DownloadFile {
+            url: "https://example.com/x".into(),
+            path: ws.join("x").to_string_lossy().to_string(),
+        };
+        assert!(matches!(check(&state, &dl, w(&ws)), Verdict::Ask { .. }));
+
+        // Red-zone shell stays denied even under an approved `shell` category.
+        let rz = ToolCall::ExecuteTerminalCommand {
+            command: "git push --force".into(),
+            timeout_secs: None,
+            cwd: None,
+        };
+        assert!(matches!(check(&state, &rz, w(&ws)), Verdict::Deny(_)));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -78,6 +78,34 @@ describe("parseChatSegments", () => {
       "text",
     ]);
   });
+
+  it("returns the cached array for repeated identical input", () => {
+    const src = "A\n<agent_thought>r</agent_thought>\nB";
+    const first = parseChatSegments(src);
+    const second = parseChatSegments(src);
+    expect(second).toBe(first);
+    expect(second).toEqual([
+      { kind: "text", text: "A\n" },
+      { kind: "reasoning", text: "r" },
+      { kind: "text", text: "\nB" },
+    ]);
+  });
+
+  it("distinguishes distinct inputs", () => {
+    const a = parseChatSegments("alpha");
+    const b = parseChatSegments("beta");
+    expect(a).not.toBe(b);
+    expect(a[0]).toEqual({ kind: "text", text: "alpha" });
+    expect(b[0]).toEqual({ kind: "text", text: "beta" });
+  });
+
+  it("keeps parsing correct past the cache limit", () => {
+    for (let i = 0; i < 300; i++) parseChatSegments(`unique-${i}`);
+    const segments = parseChatSegments("<tool_call name=\"grep\"></tool_call>");
+    expect(segments[0]).toMatchObject({ kind: "tool", name: "grep", status: "running" });
+    const plain = parseChatSegments("re-check");
+    expect(plain).toEqual([{ kind: "text", text: "re-check" }]);
+  });
 });
 
 describe("stripChatTags", () => {

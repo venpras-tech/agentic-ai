@@ -1,5 +1,58 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+
+type EnginePayload = Record<string, unknown>;
+type EngineHandler = (data: EnginePayload) => void;
+type UnlistenFn = () => void;
+
+type EngineListenerEntry = {
+  handlers: EngineHandler[];
+  unlisten: UnlistenFn;
+};
+
+// We need to support async listen() — use Promise-wrapped entries.
+const engineListeners = new Map<string, Promise<EngineListenerEntry>>();
+
+function addEngineListener(event: string, handler: EngineHandler): Promise<() => void> {
+  let entryPromise = engineListeners.get(event);
+  if (!entryPromise) {
+    const handlers: EngineHandler[] = [];
+    entryPromise = listen(event, (e) => {
+      const payload = (e.payload as EnginePayload) ?? {};
+      for (let i = handlers.length - 1; i >= 0; i--) {
+        try {
+          handlers[i](payload);
+        } catch {
+          // ignore handler error
+        }
+      }
+    })
+      .then((unlisten) => ({ handlers, unlisten }))
+      .catch((err) => {
+        engineListeners.delete(event);
+        throw err;
+      });
+    engineListeners.set(event, entryPromise);
+  }
+
+  return entryPromise.then(({ handlers, unlisten }) => {
+    handlers.push(handler);
+    let removed = false;
+    return () => {
+      if (removed) return;
+      removed = true;
+      const idx = handlers.indexOf(handler);
+      if (idx >= 0) handlers.splice(idx, 1);
+      if (handlers.length === 0) {
+        try {
+          unlisten();
+        } finally {
+          engineListeners.delete(event);
+        }
+      }
+    };
+  });
+}
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export function isTauriRuntime(): boolean {
@@ -33,6 +86,8 @@ export interface StreamInferenceRequest {
   prompt: string;
   maxTokens: number;
   stopWords: string[];
+  /** Base64 image attachments (vision-capable remote providers). */
+  images?: ImageAttachment[];
 }
 
 export interface AgentTaskRequest {
@@ -69,6 +124,56 @@ export interface ContextUsage {
   messageCount: number;
   overflow: boolean;
   breakdown?: Record<string, number>;
+}
+
+/** Workspace text index summary surfaced by `index_status`/`index_rebuild`. */
+export interface IndexStatus {
+  indexedFiles: number;
+  totalChars: number;
+  workspace: string | null;
+  lastBuilt: string | null;
+}
+
+/** One `path:line` match from `index_search` / `index_semantic_search`. */
+export interface IndexSearchHit {
+  path: string;
+  line: string;
+  lineNumber: number;
+}
+
+/** One LSP diagnostic for a file (1-based line/column, server-severity string). */
+export interface LspDiagnostic {
+  path: string;
+  line: number;
+  column: number;
+  severity: string;
+  message: string;
+  code: string | null;
+}
+
+/** Response from `lsp_diagnostics`: which server answered (if any) + findings. */
+export interface LspDiagnostics {
+  server: string | null;
+  diagnostics: LspDiagnostic[];
+}
+
+/** One generation step on `agent://run-trace` (per-step tool/token/duration). */
+export interface RunTrace {
+  sessionId: number;
+  stepIndex: number;
+  group: string;
+  tools: string[];
+  durationMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  outcome: string;
+  timestampMs: number;
+}
+
+export interface LogFileInfo {
+  name: string;
+  bytes: number;
+  modifiedMs: number;
 }
 
 /** One JSONL record the frontend persists for a chat turn. `turnId` makes the
@@ -111,8 +216,9 @@ export interface ForkInfo {
 }
 
 export interface PolicyRule {
-  pattern: string;
-  decision: string;
+  tool: string;
+  policy: string; // "allow" | "ask" | "deny"
+  commandPatterns: string[];
 }
 
 export interface PathGrant {
@@ -138,6 +244,7 @@ export interface PermissionRequest {
 export interface PolicySnapshot {
   default: string;
   rules: PolicyRule[];
+  autoApprove?: Record<string, boolean>;
   yolo?: boolean;
   pathGrants: PathGrant[];
 }
@@ -152,6 +259,70 @@ export interface AuditEntry {
   latencyMs: number;
   success?: boolean;
   error?: string;
+}
+
+/** Lifecycle of one proposed file edit as seen by the UI badges. */
+export type EditStatus = "pending" | "applied" | "rejected" | "failed" | "conflict";
+
+/** One proposed file change waiting on (or resolved by) the user review. */
+export interface FileEdit {
+  id: string;
+  /** Workspace-relative path (forward slashes) when inside the workspace, else absolute. */
+  path: string;
+  /** 1-based inclusive line range the edit targets, when known. */
+  lineStart?: number;
+  lineEnd?: number;
+  /** "patch" | "search_replace" | "full_content". */
+  kind: string;
+  /** Unified diff of before -> after, for the review pane. */
+  diff?: string;
+  /** Full pre-change content. */
+  before?: string;
+  /** Full post-change content, computed but not yet written. */
+  after?: string;
+  /** Free-form reason/summary supplied by the agent. */
+  reason?: string;
+  status: EditStatus;
+  error?: string;
+}
+
+/** Bundle of edits from one tool call, keyed by group id. Carried over
+ * `agent://edit-proposed` / `agent://edit-applied` / `agent://edit-failed`. */
+export interface EditBatchEvent {
+  sessionId: number;
+  groupId: string;
+  edits: FileEdit[];
+  timestampMs: number;
+}
+
+/** Payload of the `vencoder-open-editor` window event: an absolute path, or a
+ *  path plus a 1-based line to focus in the editor. */
+export type OpenEditorTarget = string | { path: string; line?: number };
+
+/** A proposed-edit batch held while the user reviews it. */
+export interface PendingEditGroup {
+  id: string;
+  sessionId: number;
+  tool: string;
+  edits: FileEdit[];
+}
+
+/** Result of a post-edit verify pass (`agent_run_verify` / `agent://verify-result`). */
+export interface VerifyRunResult {
+  ok: boolean;
+  command: string;
+  exitCode?: number;
+  report: string;
+}
+
+/** Pre-apply snapshot of one edited file (restorable via checkpointRestore). */
+export interface FileCheckpoint {
+  id: string;
+  path: string;
+  timestampMs: number;
+  editId: string;
+  /** sha256 of the snapshot content, for conflict checks. */
+  contentHash: string;
 }
 
 export interface BackgroundTaskInfo {
@@ -201,13 +372,26 @@ export interface TerminalInfo {
   cwd: string;
 }
 
+export type McpTransport = "stdio" | "http";
+
 export interface McpServerConfig {
   name: string;
+  transport: McpTransport;
   bin: string;
   args: string[];
+  url?: string | null;
+  headers?: Record<string, string>;
   env: Record<string, string>;
   allowedTools: string[];
   enabled: boolean;
+}
+
+export interface McpProbeResult {
+  name: string;
+  ok: boolean;
+  error: string | null;
+  tools: string[];
+  cached: boolean;
 }
 
 export interface Skill {
@@ -240,12 +424,16 @@ export const api = {
     tauriInvoke("configure_remote_model", { config }),
   listRemoteModels: (config: Record<string, unknown>) =>
     tauriInvoke<string[]>("list_remote_models", { config }),
+  remoteConfigLoad: () =>
+    tauriInvoke<Record<string, unknown> | null>("remote_config_load"),
   unloadModel: () => tauriInvoke<void>("unload_model"),
   modelStatus: () => tauriInvoke<Record<string, unknown> | null>("model_status"),
   loadedModelPath: () => tauriInvoke<string | null>("loaded_model_path"),
   mcpLoadCatalog: () => tauriInvoke<McpServerConfig[]>("mcp_catalog_load"),
   mcpSaveCatalog: (servers: McpServerConfig[]) =>
     tauriInvoke<void>("mcp_catalog_save", { servers }),
+  mcpServerProbe: (name: string) =>
+    tauriInvoke<McpProbeResult>("mcp_server_probe", { name }),
   knowledgeReport: () => tauriInvoke<KnowledgeReport>("knowledge_report_cmd"),
   knowledgeScan: () => tauriInvoke<KnowledgeReport>("knowledge_scan"),
   skillSetActive: (name: string, active: boolean) =>
@@ -273,8 +461,49 @@ export const api = {
     tauriInvoke<void>("agent_set_yolo", { on }),
   agentPolicySnapshot: () =>
     tauriInvoke<PolicySnapshot>("agent_policy_snapshot"),
+  agentPolicySave: (
+    defaultPolicy: string,
+    rules: PolicyRule[],
+    autoApprove?: Record<string, boolean>,
+  ) =>
+    tauriInvoke<void>("agent_policy_save", {
+      default: defaultPolicy,
+      rules,
+      autoApprove: autoApprove ?? {},
+    }),
 
   contextStatus: () => tauriInvoke<ContextUsage>("context_status"),
+  indexStatus: () => tauriInvoke<IndexStatus>("index_status"),
+  indexRebuild: (workspace: string) =>
+    tauriInvoke<IndexStatus>("index_rebuild", { workspace }),
+  indexSearch: (workspace: string, query: string, maxResults?: number) =>
+    tauriInvoke<IndexSearchHit[]>("index_search", {
+      workspace,
+      query,
+      maxResults: maxResults ?? null,
+    }),
+  indexSemanticSearch: (workspace: string, query: string, maxResults?: number) =>
+    tauriInvoke<IndexSearchHit[]>("index_semantic_search", {
+      workspace,
+      query,
+      maxResults: maxResults ?? null,
+    }),
+  startFileWatcher: (path: string) =>
+    tauriInvoke<void>("start_file_watcher", { path }),
+  stopFileWatcher: () => tauriInvoke<void>("stop_file_watcher"),
+  lspDiagnostics: (path: string) => tauriInvoke<LspDiagnostics>("lsp_diagnostics", { path }),
+  contextSetSelection: (selection: {
+    path: string;
+    startLine?: number | null;
+    endLine?: number | null;
+    content: string;
+  }) =>
+    tauriInvoke<ContextUsage>("context_set_selection", {
+      path: selection.path,
+      startLine: selection.startLine ?? null,
+      endLine: selection.endLine ?? null,
+      content: selection.content,
+    }),
   contextPushTurn: (role: string, content: string) =>
     tauriInvoke<ContextUsage>("context_push_turn", { role, content }),
   contextSetSystemPrompt: (content: string) =>
@@ -309,18 +538,37 @@ export const api = {
   agentRevokePath: (path: string) => tauriInvoke<void>("agent_revoke_path", { path }),
   agentAuditLog: (limit?: number) => tauriInvoke<AuditEntry[]>("agent_audit_log", { limit }),
 
+  // ---- edit review / checkpoints ----
+  listPendingEdits: () => tauriInvoke<PendingEditGroup[]>("agent_list_pending_edits"),
+  applyEdits: (groupId: string, editIds?: string[]) =>
+    tauriInvoke<FileEdit[]>("agent_apply_edits", { groupId, editIds }),
+  rejectEdits: (groupId: string, editIds?: string[], reason?: string) =>
+    tauriInvoke<FileEdit[]>("agent_reject_edits", { groupId, editIds, reason }),
+  /** Resolve conflict-status edits: `overwrite=true` force-writes the proposed
+   *  content; `overwrite=false` keeps the disk version and rejects the edit. */
+  resolveEditConflict: (groupId: string, overwrite: boolean, editIds?: string[]) =>
+    tauriInvoke<FileEdit[]>("agent_resolve_edit_conflict", { groupId, overwrite, editIds }),
+  runVerify: (files?: string[]) =>
+    tauriInvoke<VerifyRunResult>("agent_run_verify", { files }),
+  checkpointList: () => tauriInvoke<FileCheckpoint[]>("agent_checkpoint_list"),
+  checkpointRestore: (ids?: string[]) =>
+    tauriInvoke<number>("agent_checkpoint_restore", { ids }),
+
   // ---- background tasks ----
   agentRunBackground: (request: AgentTaskRequest) =>
     tauriInvoke<number>("agent_run_background", { request }),
   listBackgroundTasks: () => tauriInvoke<BackgroundTaskInfo[]>("list_background_tasks"),
   abortBackgroundTask: (taskId: string) =>
     tauriInvoke<void>("abort_background_task", { taskId }),
+  backgroundTaskOutput: (taskId: string, tailLines?: number) =>
+    tauriInvoke<string[]>("background_task_output", { taskId, tailLines }),
 
   // ---- RAG attachments ----
   agentAttachFile: (path: string) =>
     tauriInvoke<AttachedFileInfo>("agent_attach_file", { path }),
   agentDetachFile: (path: string) => tauriInvoke<void>("agent_detach_file", { path }),
   agentListAttachments: () => tauriInvoke<AttachedFileInfo[]>("agent_list_attachments"),
+  pickTextFile: () => tauriInvoke<string | null>("pick_text_file"),
 
   // ---- editor autocomplete ----
   // Backend is complete and routed through the `autocomplete` provider role,
@@ -347,6 +595,11 @@ export const api = {
   openModelsDir: () => tauriInvoke<string>("open_models_dir"),
   agentSetWorkspace: (root: string) =>
     tauriInvoke<void>("agent_set_workspace", { root }),
+  agentGetWorkspaces: () => tauriInvoke<string[]>("agent_get_workspaces"),
+  agentAddWorkspace: (root: string) =>
+    tauriInvoke<string[]>("agent_add_workspace", { root }),
+  agentRemoveWorkspace: (root: string) =>
+    tauriInvoke<string[]>("agent_remove_workspace", { root }),
   listDirectory: (root: string, relative: string | null = null) =>
     tauriInvoke<Array<{ name: string; path: string; isDir: boolean }>>("list_directory", { root, relative }),
   readTextFile: (path: string) =>
@@ -397,6 +650,12 @@ export const api = {
   openUrl: (url: string) =>
     invoke("plugin:opener|open_url", { url }),
   consoleHistory: () => tauriInvoke<string[]>("console_history"),
+  logDir: () => tauriInvoke<string | null>("log_dir"),
+  logFiles: () => tauriInvoke<LogFileInfo[]>("log_files"),
+  logRead: (name: string, maxLines?: number) =>
+    tauriInvoke<string[]>("log_read", { name, maxLines }),
+  logOpenDir: () => tauriInvoke<void>("log_open_dir"),
+  logClear: () => tauriInvoke<number>("log_clear"),
 
   providersList: () => tauriInvoke<Array<Record<string, unknown>>>("providers_list"),
   providersUpsert: (provider: Record<string, unknown>) =>
@@ -435,6 +694,7 @@ export const api = {
     onDone?: (data: Record<string, unknown>) => void;
     onError?: (data: Record<string, unknown>) => void;
     onStarted?: (data: Record<string, unknown>) => void;
+    onPromptEval?: (data: Record<string, unknown>) => void;
     onModelLoaded?: (data: Record<string, unknown>) => void;
     onLoadProgress?: (data: Record<string, unknown>) => void;
     onTool?: (data: Record<string, unknown>) => void;
@@ -453,19 +713,30 @@ export const api = {
     onSkillsChanged?: (data: Record<string, unknown>) => void;
     onWorkspaceChanged?: (data: Record<string, unknown>) => void;
     onContextTrimmed?: (data: Record<string, unknown>) => void;
+    onThinkingUpdated?: (data: Record<string, unknown>) => void;
+    onThinkingSnapshot?: (data: Record<string, unknown>) => void;
+    onEditApplied?: (data: Record<string, unknown>) => void;
+    onEditFailed?: (data: Record<string, unknown>) => void;
+    onRunTrace?: (data: Record<string, unknown>) => void;
+    onEditProposed?: (data: Record<string, unknown>) => void;
+    onIndexProgress?: (data: Record<string, unknown>) => void;
+    onVerifyResult?: (data: Record<string, unknown>) => void;
+    onSubagentRun?: (data: Record<string, unknown>) => void;
+    onHook?: (data: Record<string, unknown>) => void;
   }) => {
     const events: Array<[string, keyof typeof handlers]> = [
       ["inference-started", "onStarted"],
+      ["inference-prompt-eval", "onPromptEval"],
       ["inference-token", "onToken"],
       ["inference-done", "onDone"],
       ["inference-error", "onError"],
       ["model-loaded", "onModelLoaded"],
       ["model-load-progress", "onLoadProgress"],
       ["agent://tool-event", "onTool"],
-      ["execution-aborted", "onAborted"],
-      ["agent-step", "onStep"],
-      ["agent-subtask", "onSubtask"],
-      ["agent://file-changed", "onFileChanged"],
+      ["agent://aborted", "onAborted"],
+      ["agent://step", "onStep"],
+      ["agent://subtask", "onSubtask"],
+      ["workspace://file-changed", "onFileChanged"],
       ["agent://tool-output", "onToolOutput"],
       ["agent://plan-step", "onPlanStep"],
       ["agent://todo-update", "onTodoUpdate"],
@@ -473,19 +744,49 @@ export const api = {
       ["agent://hitl-gate", "onHitlGate"],
       ["agent://permission-request", "onPermission"],
       ["agent://question-request", "onQuestion"],
-      ["agent-knowledge", "onKnowledge"],
+      ["agent://knowledge", "onKnowledge"],
       ["agent://skills-changed", "onSkillsChanged"],
-      ["workspace://file-changed", "onWorkspaceChanged"],
+      ["agent://workspace-changed", "onWorkspaceChanged"],
       ["agent://context-trimmed", "onContextTrimmed"],
+      ["agent://thinking-updated", "onThinkingUpdated"],
+      ["agent://thinking-snapshot", "onThinkingSnapshot"],
+      ["agent://edit-applied", "onEditApplied"],
+      ["agent://edit-failed", "onEditFailed"],
+      ["agent://run-trace", "onRunTrace"],
+      ["agent://edit-proposed", "onEditProposed"],
+      ["index://progress", "onIndexProgress"],
+      ["agent://verify-result", "onVerifyResult"],
+      ["agent://subagent-run", "onSubagentRun"],
+      ["agent://hook", "onHook"],
     ];
-    const unlisteners: (() => void)[] = [];
-    for (const [evt, handler] of events) {
-      if (handlers[handler]) {
-        const un = await listen(evt, (e) => handlers[handler]!(e.payload as Record<string, unknown>));
-        unlisteners.push(un);
+    const unlisteners: Array<() => void> = [];
+    try {
+      for (const [evt, handler] of events) {
+        if (handlers[handler]) {
+          const un = await addEngineListener(evt, (payload) => {
+            const h = handlers[handler];
+            if (h) {
+              h(payload);
+            }
+          });
+          unlisteners.push(un);
+        }
       }
+    } catch (err) {
+      for (let i = unlisteners.length - 1; i >= 0; i--) {
+        try {
+          unlisteners[i]();
+        } catch {}
+      }
+      throw err;
     }
-    return () => { for (const un of unlisteners) un(); };
+    return () => {
+      for (let i = unlisteners.length - 1; i >= 0; i--) {
+        try {
+          unlisteners[i]();
+        } catch {}
+      }
+    };
   },
 };
 

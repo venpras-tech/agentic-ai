@@ -1,13 +1,26 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useApp } from "../context/AppContext";
 import {
   api,
   isTauriRuntime,
+  type EditBatchEvent,
   type PermissionDecision,
   type PermissionRequest,
+  type PendingEditGroup,
+  type RunTrace,
 } from "../lib/ipc";
-import { parseChatSegments } from "../lib/chatParse";
+import {
+  IDLE_STAGE,
+  reduceAgentStage,
+  type AgentStageEvent,
+  type AgentStageState,
+} from "../lib/agentStages";
 import { appendTurn, assistantTurnId } from "../lib/sessionLog";
+import {
+  emptyExecutionGraph,
+  execGraphReducer,
+  type ExecutionGraphAction,
+} from "../lib/execGraph";
 import type { LiveToolState } from "../components/MessageList";
 
 /** A blocking `ask_question` from the agent. */
@@ -35,6 +48,17 @@ export interface SubtaskState {
   total: number;
   title: string;
   status: string;
+}
+
+/** A first-class subagent (`task`) run reported by `agent://subagent-run`. */
+export interface SubagentRunState {
+  key: number;
+  profile: string;
+  status: string;
+  summary: string;
+  startedAt: number;
+  durationMs?: number;
+  leasedWorkers?: number;
 }
 
 export interface BackgroundTaskState {
@@ -66,13 +90,51 @@ export function setActiveChatId(chatId: string | null): void {
   activeChatId = chatId;
 }
 
+/** Re-dispatch an applied/updated edit batch as a DOM event so panes outside
+ *  the React context (e.g. `EditorPane`) can reload the affected file. */
+function announceEditApplied(edits: unknown): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("vencoder-edit-applied", { detail: { edits } }));
+}
+
+/** Append one `agent://run-trace` step to the turn's trace list. Steps are
+ *  emitted in order and never repeated, so a late/duplicate emit for a step we
+ *  already recorded replaces it in place instead of growing the list twice. */
+export function appendRunTrace(prev: RunTrace[], step: RunTrace): RunTrace[] {
+  if (!step || typeof step.stepIndex !== "number") return prev;
+  const at = prev.findIndex((s) => s.stepIndex === step.stepIndex);
+  if (at === -1) return [...prev, step];
+  if (prev[at] === step) return prev;
+  return prev.map((s, i) => (i === at ? step : s));
+}
+
+/** Fold one batch event into the pending list; groups are created on first
+ *  sight and dropped again once nothing left in them is actionable, so the
+ *  review panel only shows batches the user still has a decision on
+ *  (`pending` to approve, or `conflict` to resolve via reload/overwrite). */
+export function mergeEditBatch(prev: PendingEditGroup[], evt: EditBatchEvent): PendingEditGroup[] {
+  if (!evt.groupId) return prev;
+  const incoming = new Map(evt.edits.map((e) => [e.id, e]));
+  let found = false;
+  const next = prev.map((g) => {
+    if (g.id !== evt.groupId) return g;
+    found = true;
+    return { ...g, edits: g.edits.map((e) => incoming.get(e.id) ?? e) };
+  });
+  if (!found) {
+    next.push({ id: evt.groupId, sessionId: evt.sessionId, tool: "edit", edits: evt.edits });
+  }
+  return next.filter((g) => g.edits.some((e) => e.status === "pending" || e.status === "conflict"));
+}
+
 type StreamHandlers = {
   updateLastMessage: ReturnType<typeof useApp>["updateLastMessage"];
   setProcessing: ReturnType<typeof useApp>["setProcessing"];
   addActivity: ReturnType<typeof useApp>["addActivity"];
   setHitlGate: ReturnType<typeof useApp>["setHitlGate"];
   setLiveTools: Dispatch<SetStateAction<Record<string, LiveToolState>>>;
-  clearResolvedKey: () => void;
+  pushStage: (event: AgentStageEvent) => void;
+  dispatchGraph: Dispatch<ExecutionGraphAction>;
 };
 
 /**
@@ -87,19 +149,26 @@ export function useAgentStream() {
     addActivity,
     updateLastMessage,
     setProcessing,
-    isProcessing,
     hitlGate,
     setHitlGate,
     projectPath,
+    bumpHistory,
   } = useApp();
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolState>>({});
   const [planSteps, setPlanSteps] = useState<PlanStepState[]>([]);
   const [todos, setTodos] = useState<TodoItemState[]>([]);
   const [subtasks, setSubtasks] = useState<SubtaskState[]>([]);
+  const [subagentRuns, setSubagentRuns] = useState<SubagentRunState[]>([]);
   const [bgTasks, setBgTasks] = useState<BackgroundTaskState[]>([]);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
   const [question, setQuestion] = useState<QuestionRequest | null>(null);
-  const resolvedKeyRef = useRef<string>("");
+  const [pendingEdits, setPendingEdits] = useState<PendingEditGroup[]>([]);
+  const [reviewing, setReviewing] = useState(false);
+  const [trimToast, setTrimToast] = useState<{ dropped: number; remaining: number } | null>(null);
+  const [verifyToast, setVerifyToast] = useState<{ ok: boolean; command: string; output: string } | null>(null);
+  const [stage, setStage] = useState<AgentStageState>(IDLE_STAGE);
+  const [execGraph, dispatchExecGraph] = useReducer(execGraphReducer, emptyExecutionGraph);
+  const runTraceRef = useRef<RunTrace[]>([]);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const projectRef = useRef(projectPath);
@@ -112,9 +181,10 @@ export function useAgentStream() {
     addActivity,
     setHitlGate,
     setLiveTools,
-    clearResolvedKey: () => {
-      resolvedKeyRef.current = "";
+    pushStage: (event) => {
+      setStage((prev) => reduceAgentStage(prev, event, Date.now()));
     },
+    dispatchGraph: dispatchExecGraph,
   };
 
   // Detached runs outlive the page, so seed the timeline from the backend
@@ -140,6 +210,22 @@ export function useAgentStream() {
     };
   }, []);
 
+  // Detached runs may leave edits awaiting review; a reload must restore the
+  // pending batches so nothing is stranded.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let cancelled = false;
+    void api
+      .listPendingEdits()
+      .then((groups) => {
+        if (!cancelled) setPendingEdits(groups ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let unlisten: (() => void) | null = null;
@@ -153,19 +239,28 @@ export function useAgentStream() {
           const delta =
             (data as { delta?: string }).delta ?? (data as { content?: string }).content;
           if (delta) h.updateLastMessage({ content: (c) => (c || "") + delta });
+          h.pushStage({ type: "token" });
         },
         onStarted: () => {
           const h = handlersRef.current;
           if (!h) return;
           h.setProcessing(true);
           h.setLiveTools({});
-          h.clearResolvedKey();
+          h.dispatchGraph({ type: "reset" });
+          h.pushStage({ type: "started" });
           h.addActivity("Agent started", "status");
+        },
+        onPromptEval: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const tokens = Number((data as { promptTokens?: number }).promptTokens) || 0;
+          h.pushStage({ type: "prompt", tokens });
         },
         onDone: (data) => {
           const h = handlersRef.current;
           if (!h) return;
           h.setProcessing(false);
+          h.pushStage({ type: "done" });
           const d = data as {
             done?: {
               outcome?: string;
@@ -193,9 +288,11 @@ export function useAgentStream() {
                 turnId: activeTurnId ? assistantTurnId(activeTurnId) : undefined,
               },
               activeChatId,
+              bumpHistory,
             );
           }
           activeTurnId = "";
+          runTraceRef.current = [];
           const stats = [
             done.outputTokens != null ? `${done.outputTokens} tok` : null,
             done.tokensPerSec ? `${done.tokensPerSec.toFixed(1)} tok/s` : null,
@@ -209,6 +306,7 @@ export function useAgentStream() {
           const h = handlersRef.current;
           if (!h) return;
           h.setProcessing(false);
+          h.pushStage({ type: "error" });
           const msg = (data as { message?: string }).message || "Agent error";
           h.addActivity(msg, "error");
           h.updateLastMessage({
@@ -220,6 +318,7 @@ export function useAgentStream() {
           const h = handlersRef.current;
           if (!h) return;
           h.setProcessing(false);
+          h.pushStage({ type: "done" });
           h.updateLastMessage({ streaming: false });
           h.addActivity("Execution aborted", "status");
         },
@@ -238,8 +337,16 @@ export function useAgentStream() {
         onTool: (data) => {
           const h = handlersRef.current;
           if (!h) return;
-          const d = data as { id?: string; tool?: string; status?: string; summary?: string };
+          const d = data as {
+            id?: string;
+            tool?: string;
+            status?: string;
+            summary?: string;
+            durationMs?: number;
+            exitCode?: number;
+          };
           const label = d.tool ? d.tool : "tool";
+          h.pushStage({ type: "tool", tool: d.tool, status: d.status });
           if (d.id) {
             const id = d.id;
             const tool = d.tool ?? "tool";
@@ -247,8 +354,19 @@ export function useAgentStream() {
             const summary = d.summary ?? "";
             h.setLiveTools((prev) => ({
               ...prev,
-              [id]: { id, tool, status, summary, output: prev[id]?.output },
+              [id]: {
+                id,
+                tool,
+                status,
+                summary,
+                output: prev[id]?.output,
+                durationMs: d.durationMs ?? prev[id]?.durationMs,
+                exitCode: d.exitCode ?? prev[id]?.exitCode,
+              },
             }));
+            const graphStatus =
+              status === "done" ? "done" : status === "error" ? "error" : "running";
+            h.dispatchGraph({ type: "tool", id, name: tool, status: graphStatus, summary });
           }
           if (d.status === "running") {
             h.addActivity(`${label} starting…`, "tool");
@@ -286,6 +404,8 @@ export function useAgentStream() {
           };
           const s = d.step;
           if (!s) return;
+          h.pushStage({ type: "step" });
+          h.dispatchGraph({ type: "step", group: s.group ?? "" });
           const label = s.group ? `${s.group} — step ${s.step ?? "?"}` : `Step ${s.step ?? "?"}`;
           const bits = [
             s.toolCalls ? `${s.toolCalls} tool call${s.toolCalls === 1 ? "" : "s"}` : null,
@@ -311,6 +431,13 @@ export function useAgentStream() {
             title: st.title ?? `Subtask ${index}`,
             status: st.status ?? "running",
           };
+          h.dispatchGraph({
+            type: "subtask",
+            index,
+            total: st.total ?? 0,
+            title: st.title ?? `Subtask ${index}`,
+            status: st.status ?? "running",
+          });
           setSubtasks((prev) => {
             const next = prev.filter((x) => x.index !== index);
             next.push(entry);
@@ -320,6 +447,61 @@ export function useAgentStream() {
           h.addActivity(
             `Subtask ${index}/${st.total ?? "?"} ${st.status ?? ""} — ${st.title ?? ""}`.trim(),
             st.status === "failed" ? "error" : "status",
+          );
+        },
+        onSubagentRun: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const d = data as {
+            profile?: string;
+            status?: string;
+            summary?: string;
+            startedAt?: number;
+            durationMs?: number;
+            leasedWorkers?: number;
+          };
+          const profile = d.profile ?? "subagent";
+          const status = d.status ?? "started";
+          setSubagentRuns((prev) => {
+            const entry: SubagentRunState = {
+              key: (d.startedAt ?? Date.now()) ^ prev.length,
+              profile,
+              status,
+              summary: d.summary ?? "",
+              startedAt: d.startedAt ?? Date.now(),
+              durationMs: d.durationMs,
+              leasedWorkers: d.leasedWorkers,
+            };
+            const next = prev.filter(
+              (x) =>
+                !(
+                  x.profile === profile &&
+                  x.status === "started" &&
+                  status !== "started"
+                ),
+            );
+            next.push(entry);
+            return next;
+          });
+          const label = `Subagent ${profile} ${status}`;
+          h.addActivity(
+            d.summary ? `${label} — ${d.summary}` : label,
+            status === "error" ? "error" : "status",
+          );
+        },
+        onHook: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const d = data as {
+            event?: string;
+            tool?: string;
+            status?: string;
+            detail?: string;
+          };
+          const label = `Hook ${d.event ?? "hook"}${d.tool ? ` ${d.tool}` : ""}${d.status ? ` ${d.status}` : ""}`;
+          h.addActivity(
+            d.detail ? `${label} — ${d.detail}` : label,
+            d.status === "deny" ? "error" : "status",
           );
         },
         onPlanStep: (data) => {
@@ -334,6 +516,13 @@ export function useAgentStream() {
           };
           const index = d.itemIndex ?? 0;
           if (!index) return;
+          h.dispatchGraph({
+            type: "planStep",
+            planId: d.planId ?? "",
+            itemIndex: index,
+            title: d.title ?? `Step ${index}`,
+            status: d.status ?? "in_progress",
+          });
           setPlanSteps((prev) => {
             const next = prev.filter((x) => x.index !== index);
             next.push({
@@ -433,13 +622,66 @@ export function useAgentStream() {
             `Context trimmed — dropped ${d.dropped ?? 0}, ${d.remaining ?? 0} turns kept`,
             "status",
           );
+          setTrimToast({ dropped: d.dropped ?? 0, remaining: d.remaining ?? 0 });
+        },
+        onRunTrace: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const next = appendRunTrace(runTraceRef.current, data as unknown as RunTrace);
+          if (next !== runTraceRef.current) {
+            runTraceRef.current = next;
+            h.updateLastMessage({ trace: next });
+          }
+        },
+        onEditProposed: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const evt = data as unknown as EditBatchEvent;
+          if (!evt.groupId) return;
+          setPendingEdits((prev) => mergeEditBatch(prev, evt));
+          const count = evt.edits.filter((e) => e.status === "pending").length;
+          h.addActivity(
+            count > 0 ? `Edit proposed — ${count} file${count === 1 ? "" : "s"} awaiting review` : "Edit proposed",
+            "status",
+          );
+        },
+        onEditApplied: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const evt = data as unknown as EditBatchEvent;
+          if (!evt.groupId) return;
+          setPendingEdits((prev) => mergeEditBatch(prev, evt));
+          const applied = evt.edits.filter((e) => e.status === "applied").length;
+          const rejected = evt.edits.filter((e) => e.status === "rejected").length;
+          if (applied > 0) h.addActivity(`Edit${applied > 1 ? "s" : ""} applied — ${applied} file${applied === 1 ? "" : "s"} updated`, "status");
+          if (rejected > 0) h.addActivity(`Edit${rejected > 1 ? "s" : ""} rejected`, "status");
+        },
+        onEditFailed: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const evt = data as unknown as EditBatchEvent;
+          if (!evt.groupId) return;
+          setPendingEdits((prev) => mergeEditBatch(prev, evt));
+          const failed = evt.edits.filter((e) => e.status === "failed" || e.status === "conflict");
+          const detail = failed.map((e) => e.error || e.path).filter(Boolean).join("; ");
+          h.addActivity(
+            detail ? `Edit failed — ${detail}` : "Edit failed",
+            "error",
+          );
         },
         onSkillsChanged: () => {
-          handlersRef.current?.addActivity("Skills changed — reloaded", "status");
+          handlersRef.current?.addActivity("Skills changed", "status");
+          window.dispatchEvent(new CustomEvent("vencoder-skills-changed"));
         },
-        onModelLoaded: () => {
-          handlersRef.current?.addActivity("Model loaded", "status");
+        onVerifyResult: (data) => {
+          const h = handlersRef.current;
+          if (!h) return;
+          const evt = data as { ok?: boolean; command?: string; output?: string };
+          const label = evt.command ? ` \`${evt.command}\`` : "";
+          h.addActivity(evt.ok ? `Verify passed${label}` : `Verify found issues${label}`, evt.ok ? "status" : "error");
+          setVerifyToast({ ok: !!evt.ok, command: evt.command ?? "", output: evt.output ?? "" });
         },
+        onModelLoaded: () => {},
         onLoadProgress: () => {},
       })
       .then((un) => {
@@ -454,39 +696,23 @@ export function useAgentStream() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!isProcessing || messages.length === 0) return;
-    const last = messages[messages.length - 1];
-    if (last.role !== "assistant" || !last.streaming) return;
-    const gate = parseChatSegments(last.content).find((s) => s.kind === "gate");
-    if (gate) {
-      const reason = (gate as { reason: string }).reason;
-      const key = `|${reason}`;
-      if (resolvedKeyRef.current === key) return;
-      if (!hitlGate || hitlGate.reason !== reason) {
-        setHitlGate((prev) => (!prev ? { requestId: "", reason } : prev));
-      }
-    } else if (hitlGate) {
+// The gate is driven purely by the backend `agent://hitl-gate` event.
+  // A previous text-marker parser also tried to infer the gate from streamed
+  // assistant text; its guard keyed `|${reason}` while `resolveGate` recorded
+  // `${requestId}|${reason}`, so it never matched and a leftover marker in the
+  // transcript could re-open an already-resolved gate with an empty requestId
+  // (which then aborted the run and re-issued the prompt). The event carries
+  // the requestId, so it is the only source of truth.
+  const resolveGate = useCallback(
+    async (approved: boolean) => {
+      const gate = hitlGate;
+      if (!gate?.requestId) return;
       setHitlGate(null);
-    }
-  }, [messages, isProcessing, setHitlGate, hitlGate]);
-
-  const resolveGate = async (approved: boolean) => {
-    const gate = hitlGate;
-    if (!gate) return;
-    setHitlGate(null);
-    resolvedKeyRef.current = `${gate.requestId}|${gate.reason}`;
-    if (gate.requestId) {
       await api.hitlRespond(gate.requestId, approved).catch(() => {});
-      addActivity(approved ? "Approved — resuming…" : "Denied — agent will reroute…", "status");
-      return;
-    }
-    void api.abortAgentExecution().catch(() => {});
-    const text = approved
-      ? `[HITL Approved] ${gate.reason}`
-      : `[HITL Denied] ${gate.reason} — do not perform this action. Propose an alternative or reroute.`;
-    window.dispatchEvent(new CustomEvent("vencoder-send-prompt", { detail: text }));
-  };
+      addActivity(approved ? "Approved - resuming." : "Denied - agent will reroute.", "status");
+    },
+    [hitlGate, setHitlGate, addActivity],
+  );
 
   const respondPermission = useCallback(
     async (decision: PermissionDecision) => {
@@ -512,22 +738,137 @@ export function useAgentStream() {
     [question],
   );
 
+  // Auto-dismiss the context-trim toast after a few seconds.
+  useEffect(() => {
+    if (!trimToast) return;
+    const t = setTimeout(() => setTrimToast(null), 6000);
+    return () => clearTimeout(t);
+  }, [trimToast]);
+
+  const applyEditGroup = useCallback(
+    async (groupId: string, editIds?: string[]) => {
+      setReviewing(true);
+      try {
+        const files = await api.applyEdits(groupId, editIds);
+        announceEditApplied(files);
+        setPendingEdits((prev) =>
+          mergeEditBatch(prev, {
+            sessionId: 0,
+            groupId,
+            edits: files,
+            timestampMs: Date.now(),
+          }),
+        );
+      } catch (err) {
+        addActivity(
+          `Could not apply edits: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+        void api.listPendingEdits().then((groups) => setPendingEdits(groups ?? [])).catch(() => {});
+      } finally {
+        setReviewing(false);
+      }
+    },
+    [addActivity],
+  );
+
+  const rejectEditGroup = useCallback(
+    async (groupId: string, editIds?: string[], reason?: string) => {
+      setReviewing(true);
+      try {
+        const files = await api.rejectEdits(groupId, editIds, reason);
+        announceEditApplied(files);
+        setPendingEdits((prev) =>
+          mergeEditBatch(prev, {
+            sessionId: 0,
+            groupId,
+            edits: files,
+            timestampMs: Date.now(),
+          }),
+        );
+      } catch (err) {
+        addActivity(
+          `Could not reject edits: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+        void api.listPendingEdits().then((groups) => setPendingEdits(groups ?? [])).catch(() => {});
+      } finally {
+        setReviewing(false);
+      }
+    },
+    [addActivity],
+  );
+
+  const resolveConflict = useCallback(
+    async (groupId: string, overwrite: boolean, editIds?: string[]) => {
+      setReviewing(true);
+      try {
+        const files = await api.resolveEditConflict(groupId, overwrite, editIds);
+        announceEditApplied(files);
+        setPendingEdits((prev) =>
+          mergeEditBatch(prev, {
+            sessionId: 0,
+            groupId,
+            edits: files,
+            timestampMs: Date.now(),
+          }),
+        );
+      } catch (err) {
+        addActivity(
+          `Could not resolve edit conflict: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+        void api.listPendingEdits().then((groups) => setPendingEdits(groups ?? [])).catch(() => {});
+      } finally {
+        setReviewing(false);
+      }
+    },
+    [addActivity],
+  );
+
   return {
     liveTools,
+    stage,
     hitlGate,
     resolveGate,
     planSteps,
     todos,
     subtasks,
+    subagentRuns,
     bgTasks,
+    execGraph,
+    clearExecGraph: () => dispatchExecGraph({ type: "reset" }),
     permission,
     respondPermission,
     question,
     respondQuestion,
+    pendingEdits,
+    applyEditGroup,
+    rejectEditGroup,
+    resolveConflict,
+    reviewing,
+    trimToast,
+    dismissTrimToast: () => setTrimToast(null),
+    verifyToast,
+    dismissVerifyToast: () => setVerifyToast(null),
+    runVerify: async (files?: string[]) => {
+      try {
+        const run = await api.runVerify(files);
+        setVerifyToast({ ok: run.ok, command: run.command, output: run.report });
+        return run;
+      } catch (err) {
+        const msg = String((err as { message?: string })?.message ?? err);
+        handlersRef.current?.addActivity(`Verify: ${msg}`, "error");
+        setVerifyToast({ ok: false, command: "", output: msg });
+        return null;
+      }
+    },
     clearRunState: () => {
       setPlanSteps([]);
       setTodos([]);
       setSubtasks([]);
+      setSubagentRuns([]);
+      dispatchExecGraph({ type: "reset" });
     },
     abortBackgroundTask: async (taskId: string) => {
       await api.abortBackgroundTask(taskId).catch(() => {});

@@ -1,0 +1,265 @@
+# Mission: Super agentic desktop AI — competitive parity + implementation spec
+
+## Repo
+- **UI:** `ui/` (React + Vite). **Backend:** `src-tauri/`. **IPC:** `ui/src/lib/ipc.ts`. **Docs:** `docs/commands-and-events.md`, `docs/manual-test-script.md`, `todos.txt`.
+- **Legacy:** root `src/` — reference only; do not ship from there.
+- **Rules:** No code comments unless asked. Liquibase N/A. Run `npm test` in `ui/`, `cargo test` and `cargo check` in `src-tauri/`. Update `todos.txt`, `docs/commands-and-events.md`, and `docs/manual-test-script.md` when done.
+
+**Strategic position:** Win on privacy, local GGUF inference, remote providers, and loopback OpenAI API. Match Cursor/Windsurf UX polish and Claude Code depth (subagents, MCP, permissions, verify loops).
+
+---
+
+## Current baseline (DO NOT re-implement — extend only)
+
+Already present:
+- `AgentStreamProvider` / `useAgentStream` — single `subscribeEngineEvents` for agent; `AppContext` model-load events only.
+- `AgentChatSurface`, `EditReviewPanel`, edit events (`agent://edit-proposed|applied|failed`), checkpoints, `applyEdits` / `rejectEdits`, `resolveEditConflict` in IPC + stream hook.
+- `useComposerSend`, `usePlanExecution`, `useMessageQueue`; steer + background toggle in `ChatComposer`; context meter + trim toast.
+- `agent://run-trace` in orchestrator + trace UI in `MessageList`; Virtuoso + `turnId` keys; live-tool dedupe vs parsed segments.
+- Ask/Agent/Plan via `buildAgentRequest` + `backendAgentMode("ask")` + read-only tool allow-list (`subagent.rs`).
+- Context slices: `useShell`, `useChat`, `useModel`, `useAgentSettings`, `useContextPane` in `AppContext.tsx`.
+- Index: `commands/index.rs`, `index_rebuild` / `index_search`; watcher `update_paths` in `watcher.rs` (debounced).
+- MCP catalog in `SettingsPage`; backend `mcp_server_probe` + `ipc.mcpServerProbe` (UI Test button not wired).
+- RAG: `agent_attach_file`, `contextSections`; skills/MCP/workflows in settings.
+- Security: `agentPolicySave` + editable policy in `SecurityPage`.
+- Terminal: `TerminalDrawer` on `WorkspacePage`; IPC `terminal_*`.
+- LSP: real bridge (`crate::lsp`); `EditorPane` diagnostics, Explain, **Fix diagnostics**.
+- Multi-workspace commands documented: `agent_get_workspaces`, `agent_add_workspace`, etc. (UI switcher incomplete).
+- Docs: `docs/commands-and-events.md`, `docs/manual-test-script.md`.
+
+---
+
+## Competitive baseline (what users expect vs this app)
+
+| Capability | Cursor Agent | Claude Code | Windsurf Cascade | **This app (current)** |
+|------------|--------------|-------------|------------------|------------------------|
+| Code search / index | Local Instant Grep; auto on project open; @folder | Grep/Glob/Read; MCP tool search defers schemas | Search + codebase context | `index_*` + watcher `update_paths`; **watcher/rebuild mainly from ProjectPage**, not on every workspace open |
+| Apply edits | Auto-apply + checkpoints + review hunks | Edit/Write + permission rules | Checkpoints, hunk UX, editable terminal cmds | **Strong:** edit review, checkpoints, `agent_resolve_edit_conflict` — **full conflict UI in EditReviewPanel** |
+| Terminal | Exit codes, background runs, editable commands | Bash + permissions / hooks | Turbo auto-run, @terminal mention | IPC + `TerminalDrawer`; **no @terminal mention UX** |
+| LSP / lint loop | Agent reads linter errors | LSP tool (subagents) | Auto-fix lint toggle | LSP + Fix diagnostics — **no post-apply `.ai/verify.json` harness** |
+| Subagents | Custom modes / skills | `.claude/agents`, `Agent()` permissions, bg subagents | Planner + task list | **Backend:** `subagent.rs` + `task` tool — **no `agent://subagent-run` UI nesting** |
+| MCP | Integrated | `.mcp.json`, probe, tool search | Plugins panel, **per-tool enable** | Catalog in Settings — **probe UI missing, no per-tool toggles** |
+| Modes | Agent / Ask / custom | `--tools`, dontAsk, plan | Code vs Chat | ask/agent/plan + modes/workflows — **Ask uses full agent loop** (no fast `stream_inference` path) |
+| Parallel work | Multiple agents, bg commands | Background subagents | Simultaneous Cascades | `agent_run_background` — **no output tail, weak multi-session UX** |
+| Tab completion | Cursor Tab | — | Supercomplete | `autocomplete_generate` — **no editor ghost UI** |
+| Context @ | @docs @git @web @folder | Skills, CLAUDE.md | Memories, rules, workflows | Context chips + skills — **@Codebase without search/status in composer** |
+| Permissions | Yolo + ask | allow/deny/dontAsk + hooks | Turbo | policy.json, yolo, permission prompts — **no hooks / PreToolUse** |
+| Session memory | Transcript search (local) | Cross-session (advanced) | Workspace↔chat mapping | JSONL sessions — **no transcript search; fork at chat level only** |
+| Git / PR | @PR, merged PR index (cloud) | via MCP | — | git tools + chips — **no PR/commit @ context** |
+| Offline / local | Cloud-first | API | Cloud | **Differentiator: local + remote + loopback API** — **agent HTTP endpoint under-documented** |
+| Observability | Checkpoints, steps | Hooks, subagent summaries | Task list | `run-trace`, audit — **add exportable run trace** |
+
+---
+
+## P0 — Parity blockers (ship first)
+
+### P0.1 Workspace intelligence on every open path
+**Competitors:** index/grep ready when project opens.
+
+**Backend (`src-tauri`):**
+- [ ] Optional `workspace_on_open(root)` OR ensure `agent_set_workspace` triggers debounced `index_rebuild` when workspace changes.
+- [ ] Emit index progress via `workspace://file-changed` extension or `index://progress` after rebuild.
+
+**Frontend (`ui/`):**
+- [ ] `useWorkspaceLifecycle` (or extend `useShell.setProjectPath`): `agentSetWorkspace` → `indexRebuild` → `startFileWatcher`; on clear → `stopFileWatcher`.
+- [ ] Use from `WorkspacePage`, `FileEditorPage`, folder pickers — **not only** `ProjectPage.tsx`.
+- [ ] Index status chip (files, chars, last built); manual **Reindex**; `workspace://file-changed` → refresh open editor.
+- [ ] `@Codebase` in `ContextSelector`: index status; optional query → `indexSearch` / `indexSemanticSearch`; add hits to context (`contextSections.ts` caps).
+
+**Acceptance:** Open `/workspace` → index + watcher within ~10s; disk edit → search finds content without manual rebuild.
+
+### P0.2 MCP UX (Windsurf / Claude parity)
+- [ ] Settings: **Test** per server → `api.mcpServerProbe(name)`; tools[], latency, error.
+- [ ] Per-tool enable/disable in catalog; persist `mcpSaveCatalog`.
+- [ ] **MCP tool search:** defer full MCP schemas in system prompt; load on demand or `tool_search` pseudo-tool (context budget).
+
+### P0.3 Edit review & conflicts (Cursor hunk UX)
+**Files:** `EditReviewPanel.tsx`, `MessageList.tsx`, `useAgentStream.ts`.
+
+- [ ] Wire `resolveEditConflict(groupId, overwrite, editIds)` for conflict rows.
+- [ ] **Open in editor** at `lineStart` (`vencoder-open-editor` or workspace query).
+- [ ] After apply: editor reload + refresh LSP diags.
+
+### P0.4 Multi-workspace UI
+- [ ] Workspace switcher (recent roots); chat/session per workspace key.
+- [ ] Index + watcher per active root.
+
+### P0.5 Finish context provider split
+- [ ] `useMemo` per slice in `AppContext.tsx`; migrate any remaining god `useApp()` consumers.
+
+---
+
+## P1 — Agent depth (Claude Code + Cursor)
+
+### P1.1 Subagent observability
+**Backend:** `subagent.rs`, `orchestrator.rs`, `agent/mod.rs`.
+
+- [ ] Emit `agent://subagent-run`: `{ parentSessionId, childId, profile, status, summary, durationMs }`.
+- [ ] Pool busy (`leased_workers`) → structured tool error + optional UI banner.
+
+**Frontend:** `AgentTimeline.tsx`, `useAgentStream.ts`.
+
+- [ ] Nested subagent cards; link to activity/session tail.
+
+### P1.2 Verify-after-edit loop
+- [ ] `.ai/verify.json`: `{ "command", "cwd", "timeoutSecs" }`.
+- [ ] After `apply_edits` when `verify: true`: run command + `lsp_diagnostics` on touched files; emit `agent://verify-result`.
+- [ ] One bounded self-heal on failure (`MAX_VERIFY_PASSES`).
+
+**Frontend:** toast + activity; optional Re-run verify in edit panel.
+
+### P1.3 Ask mode hardening
+- [ ] Setting: Ask uses `stream_inference` + context snapshot OR `maxSteps: 0` flag — document in Help.
+- [ ] Orchestrator: reject mutating tools when `agent_mode == "ask"`.
+- [ ] Hard block Agent send when local model below `isAgentCapableLocalModel` threshold (warn exists — add disable or force Ask).
+
+### P1.4 Background tasks & parallel sessions
+**Backend:**
+- [ ] `background_task_output(taskId, tail?)` + ring buffer in `background.rs`.
+
+**Frontend:**
+- [ ] Timeline pill → output drawer; **New agent** while one runs (bg or separate session).
+- [ ] Steer/stop on foreground session only.
+
+### P1.5 Session power UX
+- [ ] **Fork from message:** `sessionFork(..., forkTurnId: message.turnId, ...)`.
+- [ ] **Transcript search:** index session JSONL; Command palette / History search.
+- [ ] **Attachments panel:** `agentListAttachments`, detach, file picker in workspace sidebar.
+
+### P1.6 Composer / stream toolbar (reliability)
+- [ ] Context meter + trim toast (mostly done — verify on all routes).
+- [ ] Stop | Steer | Run in background (mostly done — verify no duplicate listeners).
+- [ ] Settings: `maxSteps`, `tokenBudget`, `verify`, `decompose` (mostly in Settings — expose quick strip in composer if missing).
+
+---
+
+## P2 — Code intelligence & editor (Cursor Tab + Windsurf)
+
+### P2.1 LSP enhancements
+**Files:** `src-tauri/src/lsp/`, `commands/lsp.rs`, `EditorPane.tsx`, settings `lspServers`.
+
+- [ ] Confirm rust-analyzer / typescript-language-server / pyright mapping; kill servers on workspace change.
+- [ ] Optional `lsp_format(path)`; gutter markers on debounced edit (extend current diag panel).
+
+### P2.2 Workspace search sidebar
+- [ ] Search tab in `FileTreePanel`: `indexSearch` + semantic; open file on click.
+- [ ] Merge or deep-link `/project` search into workspace.
+
+### P2.3 Inline autocomplete
+- [ ] `EditorPane`: debounced `api.autocomplete`; ghost-text overlay; Tab/Esc; setting toggle.
+
+### P2.4 Semantic index (optional)
+- [ ] `SemanticSearchBackend` trait; `embeddings` feature flag for ONNX/local embedder; default keyword/hash.
+
+### P2.5 Git context (local-first)
+- [ ] `@Commit` / `@Branch` chips → `git diff` / log snippets in `buildContext`.
+- [ ] Optional PR via MCP later — stub only.
+
+---
+
+## P3 — Extensibility & pro surfaces
+
+### P3.1 Hooks (Claude PreToolUse parity)
+- [ ] `.ai/hooks.json`: `pre_tool_use`, `post_tool_use`, `session_start` — JSON stdin/stdout; deny in `tools::dispatch` before policy.
+
+### P3.2 HTTP automation
+- [ ] `api_server.rs`: `POST /v1/agent/tasks` mirrors `agent_run_task`; curl examples in Settings.
+- [ ] Export run trace JSON from UI or `GET /v1/agent/sessions/{id}/trace`.
+
+### P3.3 Voice & terminal UX
+- [ ] Push-to-talk, errors, cancel recording.
+- [ ] @mention terminal selection from `TerminalDrawer` into composer.
+
+### P3.4 Cleanup
+- [ ] Implement or remove dead listener `agent://skills-changed` (per `commands-and-events.md`).
+
+---
+
+## P4 — Quality, tests, documentation
+
+### Vitest (`ui/`)
+- [ ] Workspace lifecycle hook (mock ipc).
+- [ ] `useMessageQueue` steer behavior.
+- [ ] Fork-at-turn, MCP probe UI flow (mock).
+- [ ] Extend `agentRequest.test.ts`, `useAgentStream.test.ts` patterns.
+
+### Rust (`src-tauri/`)
+- [ ] `mcp_server_probe` with mock stdio.
+- [ ] `update_paths` / watcher integration where feasible.
+- [ ] Subagent-run event, verify.json runner, hook deny test.
+- [ ] Edit-review + yolo + policy (extend `edits.rs` tests).
+
+### Performance
+- [ ] Memoize `parseChatSegments` per `turnId` + content hash in `MessageList`.
+- [ ] No second `subscribeEngineEvents` for tokens.
+
+### Documentation deliverables
+1. Update `docs/commands-and-events.md` — all new commands/events.
+2. Extend `docs/manual-test-script.md`: MCP test, auto-index, subagent card, fork, verify loop, conflict resolve.
+3. Mark `todos.txt` checkboxes.
+4. Short **competitive changelog**: feature × competitor matched × files touched.
+
+---
+
+## File map (primary touch points)
+
+| Area | Paths |
+|------|--------|
+| Orchestrator / events | `src-tauri/src/agent/orchestrator.rs`, `mod.rs`, `subagent.rs`, `background.rs` |
+| Edits / verify | `src-tauri/src/agent/edits.rs`, new `verify.rs` |
+| Index / watcher | `src-tauri/src/commands/index.rs`, `watcher.rs`, `main.rs` |
+| LSP | `src-tauri/src/lsp/`, `commands/lsp.rs` |
+| MCP | `src-tauri/src/commands/misc.rs`, `agent/mcp.rs` |
+| Hooks | new `src-tauri/src/agent/hooks.rs` |
+| IPC | `ui/src/lib/ipc.ts` |
+| Stream / timeline | `ui/src/hooks/useAgentStream.ts`, `components/chat/AgentTimeline.tsx` |
+| Workspace | `ui/src/pages/WorkspacePage.tsx`, `ProjectPage.tsx`, `components/editor/FileTreePanel.tsx`, `EditorPane.tsx` |
+| Composer / context | `ChatComposer.tsx`, `ContextSelector.tsx`, `lib/contextSections.ts`, `lib/agentPrepare.ts`, `lib/agentRequest.ts` |
+| Settings | `SettingsPage.tsx` |
+| Context | `ui/src/context/AppContext.tsx` |
+
+---
+
+## Implementation order (strict)
+
+1. P0.1 → P0.2 → P0.3 → P0.4 → P0.5  
+2. P1.1 → P1.2 → P1.3 → P1.4 → P1.5 → P1.6  
+3. P2.1 → P2.2 → P2.3 → (P2.4–P2.5 optional)  
+4. P3 → P4 throughout  
+
+Do not start P2 until P0 acceptance passes.
+
+---
+
+## Acceptance checklist (all must pass)
+
+- [ ] Open `/workspace` → auto-index + watcher without visiting `/project`.
+- [ ] MCP Test shows tools or clear error; disabled tools excluded from agent.
+- [ ] Edit conflict: resolve via UI; open file at hunk.
+- [ ] Subagent `explore` shows nested timeline + summary.
+- [ ] Apply edit → verify runs → one self-heal attempt on failure.
+- [ ] Ask mode never mutates disk; optional stream path works.
+- [ ] Background task output visible; abort works.
+- [ ] Fork from message N; transcript search finds old content.
+- [ ] Fix diagnostics resolves LSP errors on sample Rust/TS file.
+- [ ] `npm test` (ui) and `cargo test` green; manual script updated and passable.
+
+---
+
+## Out of scope
+
+- Cloud PR semantic index (GitHub-only) unless via MCP.
+- Full Monaco migration (CodeMirror 6 ghost layer OK for autocomplete).
+- Billing, teams, hosted sync.
+- Deleting legacy `src/`.
+- Installer/NSIS changes.
+- Neural embeddings production pipeline (interface/stub only in P2.4).
+
+---
+
+## Final deliverable
+
+When finished, output:
+1. Competitive changelog (feature → competitor parity → files).
+2. Table: Feature → IPC command/event → UI location.
+3. Any deferred P2.4/P3 items with rationale.

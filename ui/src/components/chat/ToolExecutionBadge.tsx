@@ -53,16 +53,24 @@ function ToolExecutionBadge({
   status,
   output,
   streaming,
+  durationMs,
+  exitCode,
+  args,
 }: {
   name: string;
   status: ToolStatus;
   output: string;
   streaming?: boolean;
+  durationMs?: number;
+  exitCode?: number;
+  args?: string;
 }) {
   const live = (status === "pending" || status === "running" || Boolean(streaming)) && Boolean(output);
   const [open, setOpen] = useState(live);
+  const [showArgs, setShowArgs] = useState(false);
   const cls = statusClass(status);
   const hasOutput = output.trim().length > 0;
+  const hasArgs = Boolean(args && args.trim());
 
   return (
     <div className={`chat-tool tool-${cls}${open ? " open" : ""}`}>
@@ -74,9 +82,45 @@ function ToolExecutionBadge({
       >
         <span className="chat-tool-glyph">{statusGlyph(status, open)}</span>
         <span className="chat-tool-name">{name.replaceAll("_", " ")}</span>
+        {hasArgs && (
+          <span
+            className="chat-tool-args-toggle"
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowArgs((v) => !v);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                setShowArgs((v) => !v);
+              }
+            }}
+            title={showArgs ? "Hide arguments" : "Show arguments"}
+          >
+            args
+          </span>
+        )}
+        {exitCode != null && (
+          <span className={`chat-tool-exit${exitCode === 0 ? " ok" : " err"}`} title={`Exit code ${exitCode}`}>
+            exit {exitCode}
+          </span>
+        )}
+        {durationMs != null && durationMs >= 0 && (
+          <span className="chat-tool-duration" title="Duration">
+            {(durationMs / 1000).toFixed(1)}s
+          </span>
+        )}
         <span className="chat-tool-status">{statusLabel(status)}</span>
         <span className="chat-tool-chevron">{open ? "▾" : "▸"}</span>
       </button>
+      {showArgs && hasArgs && (
+        <div className="chat-tool-args">
+          <pre className="chat-tool-args-pre">{args}</pre>
+        </div>
+      )}
       {open && hasOutput && (
         <div className="chat-tool-terminal">
           <div className="chat-tool-terminal-title">stdout / stderr</div>

@@ -135,3 +135,93 @@
 .decision-deny {
   color: #e5534b;
 }
+
+.policy-default-row {
+  display: block;
+  margin: 4px 0 10px;
+  font-size: 12px;
+}
+
+.policy-default-row span {
+  margin-right: 8px;
+}
+
+.policy-redzone {
+  margin: 4px 0 10px;
+  padding: 8px 12px;
+  border: 1px solid #e5534b;
+  border-radius: 6px;
+  background: rgba(229, 83, 75, 0.08);
+  font-size: 12px;
+}
+
+.policy-matrix {
+  margin: 4px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-hover);
+}
+
+.policy-matrix-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+
+.policy-matrix-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.policy-matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 6px 12px;
+}
+
+.policy-matrix-cell {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.policy-matrix-cell input {
+  grid-row: 1 / span 2;
+}
+
+.policy-matrix-label {
+  font-weight: 600;
+}
+
+.policy-matrix-desc {
+  grid-column: 2;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.policy-tool-input {
+  width: 200px;
+}
+
+.policy-patterns-input {
+  width: 100%;
+  min-width: 240px;
+}
+
+.policy-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.policy-saved {
+  color: #2ea043;
+  font-size: 12px;
+}

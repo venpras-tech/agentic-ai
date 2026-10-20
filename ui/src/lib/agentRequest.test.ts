@@ -90,6 +90,20 @@ describe("buildAgentRequest", () => {
     expect(buildAgentRequest({ ...base, settings: { token_budget: 700 } }).tokenBudget).toBe(700);
   });
 
+  it("prefers an explicit token budget over settings", () => {
+    const req = buildAgentRequest({ ...base, tokenBudget: 250, settings: { params: { tokenBudget: 900 } } });
+    expect(req.tokenBudget).toBe(250);
+    // An explicit 0 (Off) also wins over a budget buried in settings.
+    expect(buildAgentRequest({ ...base, tokenBudget: 0, settings: { tokenBudget: 900 } }).tokenBudget).toBeUndefined();
+  });
+
+  it("prefers an explicit decompose flag over settings", () => {
+    expect(buildAgentRequest({ ...base, decompose: true }).decompose).toBe(true);
+    expect(buildAgentRequest({ ...base, decompose: false, settings: { params: { decompose: true } } }).decompose).toBe(false);
+    expect(buildAgentRequest({ ...base, settings: { params: { decompose: true } } }).decompose).toBe(true);
+    expect(buildAgentRequest(base).decompose).toBe(false);
+  });
+
   it("omits images when none are attached", () => {
     expect(buildAgentRequest(base).images).toBeUndefined();
   });

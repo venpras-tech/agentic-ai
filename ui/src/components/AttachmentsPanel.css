@@ -1,0 +1,93 @@
+.attachments-panel {
+  margin: 4px 0 2px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  background: var(--bg-sidebar, rgba(0, 0, 0, 0.12));
+  font-size: 0.75rem;
+}
+
+.attachments-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+}
+
+.attachments-title {
+  flex: 1;
+  color: var(--text-secondary, #888);
+  font-weight: 600;
+}
+
+.attachments-add {
+  padding: 1px 8px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  background: none;
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.attachments-add:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-primary, inherit);
+}
+
+.attachments-add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.attachments-error {
+  padding: 2px 8px;
+  color: var(--error, #e5534b);
+  font-size: 0.72rem;
+}
+
+.attachments-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.attachments-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.attachments-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary, inherit);
+}
+
+.attachments-meta {
+  color: var(--text-secondary, #888);
+  white-space: nowrap;
+  font-size: 0.7rem;
+}
+
+.attachments-detach {
+  border: 0;
+  background: none;
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.attachments-detach:hover {
+  color: var(--error, #e5534b);
+}

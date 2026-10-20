@@ -1,0 +1,235 @@
+.execgraph {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+  max-height: 260px;
+  min-height: 0;
+}
+
+.execgraph-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.execgraph-heading {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.execgraph-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.execgraph-stats {
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.execgraph-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.execgraph-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.execgraph-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #a1a1aa;
+}
+
+.execgraph-dot.running {
+  background: #06b6d4;
+  animation: execgraph-pulse 1.1s ease-in-out infinite;
+}
+
+.execgraph-dot.done {
+  background: #10b981;
+}
+
+.execgraph-dot.failed {
+  background: #ef4444;
+}
+
+.execgraph-dot.pending {
+  background: #a1a1aa;
+}
+
+@keyframes execgraph-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.execgraph-clear,
+.execgraph-close {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+.execgraph-clear:hover,
+.execgraph-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.execgraph-close {
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 5px;
+}
+
+.execgraph-body {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding: 5px 12px;
+}
+
+.execgraph-empty {
+  margin: 0;
+  padding: 6px 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.execgraph-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.execgraph-row.current {
+  background: var(--accent-muted, rgba(14, 165, 233, 0.1));
+}
+
+.execgraph-row .execgraph-dot {
+  margin-top: 4px;
+  width: 8px;
+  height: 8px;
+}
+
+.execgraph-row-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.execgraph-row-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.execgraph-kind {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
+.execgraph-kind.plan {
+  background: var(--accent-muted, rgba(14, 165, 233, 0.15));
+  color: var(--accent);
+}
+
+.execgraph-kind.planstep {
+  background: rgba(139, 92, 246, 0.15);
+  color: #8b5cf6;
+}
+
+.execgraph-kind.phase {
+  background: rgba(14, 165, 233, 0.15);
+  color: #0ea5e9;
+}
+
+.execgraph-kind.subtask {
+  background: rgba(245, 158, 11, 0.18);
+  color: #b45309;
+}
+
+.execgraph-count {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+  color: var(--text-muted);
+}
+
+.execgraph-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.execgraph-row.current .execgraph-title {
+  color: var(--accent);
+}
+
+.execgraph-summary {
+  margin: 1px 0 0;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.execgraph-children {
+  margin-left: 5px;
+  border-left: 1px solid var(--border-color);
+  padding-left: 12px;
+}
+
+.execgraph-reopen {
+  flex-shrink: 0;
+  align-self: flex-end;
+  margin: 0 12px 4px;
+  padding: 2px 10px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.execgraph-reopen:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}

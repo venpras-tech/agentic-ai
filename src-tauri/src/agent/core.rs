@@ -6,7 +6,7 @@
 //! I'll inspect the workspace first.
 //!
 //! <execute_tool>
-//! { "type": "glob_search_codebase", "pattern": "**/*.ts", "root": null, "respect_gitignore": true }
+//! { "type": "glob_search_codebase", "pattern": "**/*.ts", "root": null, "respectGitignore": true }
 //! </execute_tool>
 //!
 //! Found 3 TypeScript entry points…
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn parses_single_tag() {
-        let md = "Let me look.\n\n<execute_tool>\n{ \"type\": \"glob_search_codebase\", \"pattern\": \"**/*.ts\", \"root\": null, \"respect_gitignore\": true }\n</execute_tool>\n\nDone.";
+        let md = "Let me look.\n\n<execute_tool>\n{ \"type\": \"glob_search_codebase\", \"pattern\": \"**/*.ts\", \"root\": null, \"respectGitignore\": true }\n</execute_tool>\n\nDone.";
         let mut warns = Vec::new();
         let calls = parse_tool_calls(md, &mut |w| warns.push(w));
         assert_eq!(calls.len(), 1);
@@ -210,7 +210,7 @@ mod tests {
         let required = schema["required"].as_array().unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "task");
-        assert!(schema["properties"]["subagent_type"].is_object());
+        assert!(schema["properties"]["subagentType"].is_object());
     }
 
     #[test]
@@ -275,6 +275,19 @@ mod tests {
         }
     }
 
+    /// A minimal value matching a schema property's declared type, so the
+    /// round-trip check below fails on *name* drift rather than a type
+    /// mismatch.
+    fn probe_value(spec: &serde_json::Value) -> serde_json::Value {
+        match spec.get("type").and_then(|t| t.as_str()) {
+            Some("integer") | Some("number") => serde_json::json!(1),
+            Some("boolean") => serde_json::json!(true),
+            Some("array") => serde_json::json!([]),
+            Some("object") => serde_json::json!({}),
+            _ => serde_json::json!("probe"),
+        }
+    }
+
     #[test]
     fn new_tool_schemas_registered() {
         let schemas = tool_schemas();
@@ -325,6 +338,55 @@ mod tests {
             assert!(
                 names.iter().any(|n| n == name),
                 "schema advertised for `{name}` but the dispatcher has no arm for it"
+            );
+        }
+
+        // Every advertised argument name must be the name serde actually
+        // accepts. `ToolCall` is `rename_all = "camelCase"`, so a schema that
+        // says `start_line` teaches the model to emit a payload serde rejects
+        // ("missing field startLine") — the call is silently dropped.
+        //
+        // The check round-trips a payload built from the schema itself rather
+        // than re-listing the accepted names, so it tracks `rename_all` for
+        // free instead of drifting the moment a field is added.
+        for (name, schema) in &schemas {
+            let props = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+
+            let mut payload = serde_json::Map::new();
+            payload.insert("type".to_string(), serde_json::json!(name));
+            for (prop, spec) in &props {
+                payload.insert(prop.clone(), probe_value(spec));
+            }
+            // Only the required fields matter for the "missing field" failure
+            // this guards against; optional ones being absent is fine.
+            for optional in props
+                .keys()
+                .filter(|p| !required.contains(&p.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                payload.remove(&optional);
+            }
+
+            let md = format!(
+                "<execute_tool>{}</execute_tool>",
+                serde_json::Value::Object(payload)
+            );
+            let mut warns = Vec::new();
+            let calls = parse_tool_calls(&md, &mut |w| warns.push(w));
+            assert!(
+                calls.len() == 1,
+                "the schema for `{name}` advertises argument names that serde \
+                 rejects ({warns:?}) — the model would emit a call that is dropped"
             );
         }
     }

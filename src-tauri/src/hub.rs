@@ -580,7 +580,10 @@ mod tests {
 
         let found = list_downloaded(&dir);
         assert_eq!(found.len(), 2);
-        let repo_hit = found.iter().find(|m| m.repo_id == "acme/demo-gguf").unwrap();
+        let repo_hit = found
+            .iter()
+            .find(|m| m.repo_id == "acme/demo-gguf")
+            .unwrap();
         assert_eq!(repo_hit.file_name, "q4.gguf");
         assert_eq!(repo_hit.size_bytes, 5);
         let local_hit = found.iter().find(|m| m.repo_id == "local").unwrap();

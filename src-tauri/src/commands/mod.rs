@@ -9,6 +9,8 @@
 pub mod agent;
 pub mod context;
 pub mod editor;
+pub mod index;
+pub mod lsp;
 pub mod misc;
 pub mod model;
 pub mod session;

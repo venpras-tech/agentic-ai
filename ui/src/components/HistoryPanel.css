@@ -167,6 +167,13 @@
   word-break: break-word;
   white-space: normal;
   line-height: 1.35;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.history-item-text:focus-visible {
+  outline: 2px solid var(--accent, #0ea5e9);
+  outline-offset: 1px;
 }
 
 .history-empty {

@@ -84,6 +84,7 @@ Template-less models get one plain-text completion string:
 ## Active file contents        ← role "context" (pinned file buffer)
 ## Project rules               ← role "rules" (.ai/rules.md)
 ## Skill instructions          ← role "skill" (@-mentioned skill)
+## Session hook output         ← role "hooks" (session_start hook stdout, P3.1)
 ## Approved plan               ← role "plan"
 ## User                        ← history user turns
 ## Assistant                   ← history assistant turns
@@ -246,3 +247,41 @@ Change checklist when touching this pipeline:
 2. Prompt/sampling change? Bump `PROJECT_STATUS.md`, re-run gates:
    `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
    and `npx tsc --noEmit && npm test && npm run build`.
+
+---
+
+## 8. Loopback HTTP API (automation)
+
+`api_server.rs` runs a dependency-free HTTP/1.1 loop on `127.0.0.1:{port}`
+(default 8080, toggled from Settings → LLM → Local model server). It is bound to
+loopback only. Alongside the OpenAI-compatible chat routes (`/v1/models`,
+`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, P3.2 adds):
+
+**`POST /v1/agent/tasks`** — run an agentic task. The body mirrors
+`AgentTaskRequest` (camelCase); `prompt` and `maxTokens` are required, the rest
+default. Returns `{ "sessionId": <n> }` immediately — the run proceeds on its own
+thread, so follow progress via the `agent://*` events or the trace endpoint.
+
+```sh
+curl -s http://127.0.0.1:8080/v1/agent/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"add a hello() function to util.ts","maxTokens":2048}'
+# → {"sessionId":1}
+
+# optional knobs (same shape the UI sends):
+#   "maxSteps":6, "planMode":true, "decompose":true, "verify":true,
+#   "stopWords":[…], "tokenBudget":20000, "agentMode":"…", "workflow":"…"
+```
+
+**`GET /v1/agent/sessions/{id}/trace`** — the recorded per-step run trace for a
+session, as `{ "sessionId": <n>, "trace": [RunTraceEvent…] }`. The store is
+bounded (last 50 sessions, 500 steps each) and is populated by the orchestrator
+for every step regardless of whether a UI is attached.
+
+```sh
+curl -s http://127.0.0.1:8080/v1/agent/sessions/1/trace
+```
+
+Every step's `RunTraceEvent` carries: `stepIndex`, `group`
+(`Plan` / `Execute` / `Subtask i/n · …`), `tools`, `durationMs`, `tokensIn`,
+`tokensOut`, `outcome`, `timestampMs`.

@@ -13,6 +13,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 
+use crate::commands::index::SearchIndex;
+
 /// Debounce interval: collapse rapid filesystem events into one frontend refresh.
 const DEBOUNCE_MS: u64 = 300;
 
@@ -48,6 +50,7 @@ impl WatcherState {
 pub fn start_file_watcher(
     app: AppHandle,
     state: tauri::State<'_, WatcherState>,
+    index: tauri::State<'_, Arc<SearchIndex>>,
     path: String,
 ) -> Result<(), String> {
     let root = PathBuf::from(&path);
@@ -105,6 +108,7 @@ pub fn start_file_watcher(
     let app_handle = app.clone();
     let cancel_clone = cancel;
     let watched_clone = Arc::clone(&state.watched_path);
+    let index_clone = Arc::clone(&*index);
 
     std::thread::Builder::new()
         .name("file-watcher".into())
@@ -122,17 +126,13 @@ pub fn start_file_watcher(
                 }
 
                 match rx.recv_timeout(debounce) {
-                    Ok(Ok(event)) => {
-                        match event.kind {
-                            EventKind::Create(_)
-                            | EventKind::Modify(_)
-                            | EventKind::Remove(_) => {
-                                pending_paths.extend(event.paths);
-                                pending_kind = Some(event.kind);
-                            }
-                            _ => {}
+                    Ok(Ok(event)) => match event.kind {
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                            pending_paths.extend(event.paths);
+                            pending_kind = Some(event.kind);
                         }
-                    }
+                        _ => {}
+                    },
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => {
                         // Flush pending events.
@@ -147,13 +147,23 @@ pub fn start_file_watcher(
                             let root_ref = root_lock.as_ref();
                             let relative: Vec<String> = pending_paths
                                 .iter()
-                                .filter_map(|p| {
-                                    root_ref.and_then(|r| p.strip_prefix(r).ok())
-                                })
+                                .filter_map(|p| root_ref.and_then(|r| p.strip_prefix(r).ok()))
                                 .filter(|rel| {
+                                    // Never surface the app's own metadata dir
+                                    // (`.ai`) or VCS internals — they churn
+                                    // constantly and are not workspace content.
+                                    if let Some(std::path::Component::Normal(first)) =
+                                        rel.components().next()
+                                    {
+                                        let name = first.to_string_lossy();
+                                        if name == ".ai" || name == ".git" {
+                                            return false;
+                                        }
+                                    }
                                     // Filter paths matched by .gitignore.
                                     if let Some(ref gi) = gi {
-                                        !gi.matched_path_or_any_parents(rel, rel.is_dir()).is_ignore()
+                                        !gi.matched_path_or_any_parents(rel, rel.is_dir())
+                                            .is_ignore()
                                     } else {
                                         true
                                     }
@@ -163,6 +173,9 @@ pub fn start_file_watcher(
                             pending_paths.clear();
 
                             if !relative.is_empty() {
+                                if let Some(root) = root_ref {
+                                    index_clone.update_paths(root, &relative);
+                                }
                                 let _ = app_handle.emit(
                                     "workspace://file-changed",
                                     WorkspaceChangedEvent {

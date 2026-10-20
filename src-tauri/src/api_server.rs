@@ -5,6 +5,13 @@
 //! * `POST /v1/chat/completions` — OpenAI chat messages → completion, with
 //!   optional SSE streaming (`stream: true`) and chat-template rendering
 //! * `POST /v1/completions` — raw prompt passthrough (also supports SSE)
+//! * `POST /v1/responses` — OpenAI Responses API translation shim (also SSE),
+//!   so Responses-only clients such as Codex CLI can talk to a local model
+//! * `POST /v1/agent/tasks` — run an agentic task (mirrors `agent_run_task`);
+//!   returns `{ "sessionId": <n> }` immediately. Subscribe to the `agent://*`
+//!   events (or poll `/v1/agent/sessions/{id}/trace`) for progress.
+//! * `GET  /v1/agent/sessions/{id}/trace` — the recorded per-step run trace
+//!   for a session as a JSON array.
 //!
 //! The chat route renders `messages` through the model's own chat template
 //! (exactly like the agent loop), so Ollama/LM Studio clients get the same
@@ -19,9 +26,13 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::interrupt::InterruptState;
+use crate::agent::orchestrator::AgentTaskRequest;
 use crate::engine::TextGenerator;
+use crate::{ContextState, InferenceState, ProviderRegistryState};
 
 /// Shared engine handle the server reads from; kept in sync by main.rs every
 /// time a model is loaded, reconfigured or unloaded.
@@ -62,7 +73,10 @@ impl Drop for ApiServerHandle {
 }
 
 /// Bind + spawn the accept loop on a background thread. Returns immediately.
-pub fn start(engine: SharedEngine, port: u16) -> Result<ApiServerHandle, String> {
+///
+/// `app` is kept so the `POST /v1/agent/tasks` route can build the managed
+/// agent `State` handles; every other route only needs the engine pool.
+pub fn start(engine: SharedEngine, port: u16, app: AppHandle) -> Result<ApiServerHandle, String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| format!("Cannot bind 127.0.0.1:{port}: {e}"))?;
@@ -83,9 +97,10 @@ pub fn start(engine: SharedEngine, port: u16) -> Result<ApiServerHandle, String>
             let Ok(mut stream) = stream else { continue };
             let engine = engine.clone();
             let shutdown = shutdown_clone.clone();
+            let app = app.clone();
             // One short-lived thread per connection keeps handlers simple.
             std::thread::spawn(move || {
-                let _ = handle_connection(&mut stream, &engine, &shutdown);
+                let _ = handle_connection(&mut stream, &engine, &shutdown, &app);
             });
         }
     });
@@ -101,6 +116,7 @@ fn handle_connection(
     stream: &mut std::net::TcpStream,
     engine: &SharedEngine,
     shutdown: &std::sync::atomic::AtomicBool,
+    app: &AppHandle,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -110,6 +126,13 @@ fn handle_connection(
     let (method, path) = request;
     if method == "GET" && path == "/v1/models" {
         return write_json(stream, 200, &models_payload(engine));
+    }
+    // GET routes carry no body — answer them before `read_body` (which would
+    // otherwise block until the read timeout waiting for a Content-Length).
+    if method == "GET" {
+        if let Some(session_id) = parse_trace_path(&path) {
+            return agent_trace(stream, app, session_id);
+        }
     }
 
     let body = read_body(stream)?;
@@ -123,8 +146,12 @@ fn handle_connection(
     }
 
     match (method.as_str(), path.as_str()) {
+        ("POST", "/v1/agent/tasks") => agent_task(stream, app, &payload),
         ("POST", "/v1/chat/completions") => {
-            let wants_stream = payload.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+            let wants_stream = payload
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
             if wants_stream {
                 chat_stream(stream, engine, &payload)
             } else {
@@ -132,11 +159,26 @@ fn handle_connection(
             }
         }
         ("POST", "/v1/completions") => {
-            let wants_stream = payload.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+            let wants_stream = payload
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
             if wants_stream {
                 complete_stream(stream, engine, &payload)
             } else {
                 complete(stream, engine, &payload)
+            }
+        }
+        ("POST", "/v1/responses") => {
+            let translated = responses_to_chat(&payload)?;
+            let wants_stream = payload
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            if wants_stream {
+                responses_stream(stream, engine, &payload, &translated)
+            } else {
+                responses_complete(stream, engine, &payload, &translated)
             }
         }
         _ => write_json(
@@ -159,6 +201,72 @@ fn models_payload(engine: &SharedEngine) -> Value {
         "object": "list",
         "data": data.unwrap_or_default(),
     })
+}
+
+/// Parse a `/v1/agent/sessions/{id}/trace` path into its numeric session id.
+fn parse_trace_path(path: &str) -> Option<u64> {
+    path.strip_prefix("/v1/agent/sessions/")?
+        .strip_suffix("/trace")?
+        .parse::<u64>()
+        .ok()
+}
+
+/// `POST /v1/agent/tasks` — run an agentic task by delegating to the same core
+/// as the `agent_run_task` command. Returns the session id immediately; the run
+/// proceeds on its own thread and can be followed via the `agent://*` events or
+/// `/v1/agent/sessions/{id}/trace`.
+fn agent_task(
+    stream: &mut std::net::TcpStream,
+    app: &AppHandle,
+    payload: &Value,
+) -> Result<(), String> {
+    let request: AgentTaskRequest = match serde_json::from_value(payload.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &json!({ "error": { "message": format!("invalid task body: {e}") } }),
+            )
+        }
+    };
+    let app = app.clone();
+    let result = tauri::async_runtime::block_on(async move {
+        let state = app.state::<InferenceState>();
+        let providers = app.state::<ProviderRegistryState>();
+        let interrupt = app.state::<InterruptState>();
+        let context = app.state::<ContextState>();
+        let tool_state = app.state::<Arc<crate::agent::ToolState>>();
+        crate::commands::agent::run_agent_task_inner(
+            app.clone(),
+            &state,
+            &providers,
+            &interrupt,
+            &context,
+            &tool_state,
+            request,
+        )
+        .await
+    });
+    match result {
+        Ok(session_id) => write_json(stream, 200, &json!({ "sessionId": session_id })),
+        Err(e) => write_json(stream, 500, &json!({ "error": { "message": e } })),
+    }
+}
+
+/// `GET /v1/agent/sessions/{id}/trace` — the recorded per-step run trace.
+fn agent_trace(
+    stream: &mut std::net::TcpStream,
+    app: &AppHandle,
+    session_id: u64,
+) -> Result<(), String> {
+    let tool_state = app.state::<Arc<crate::agent::ToolState>>();
+    let trace = tool_state.traces_for(session_id);
+    write_json(
+        stream,
+        200,
+        &json!({ "sessionId": session_id, "trace": trace }),
+    )
 }
 
 /// Convert OpenAI chat `messages` into engine turns. Handles both plain-text
@@ -309,13 +417,21 @@ fn chat_complete(
     payload: &Value,
 ) -> Result<(), String> {
     let Some(pool) = engine.get() else {
-        return write_json(stream, 503, &json!({ "error": { "message": "No model loaded" } }));
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
     };
     let model = pool.info().name;
     let request = chat_request(payload)?;
     let request = resolve_prompt(&pool, request, chat_prompt(payload));
     let outcome = generate_nonstreaming(&pool, request)?;
-    write_json(stream, 200, &chat_response(&model, &outcome.full_text, &outcome.done))
+    write_json(
+        stream,
+        200,
+        &chat_response(&model, &outcome.full_text, &outcome.done),
+    )
 }
 
 /// Non-streaming `POST /v1/completions`.
@@ -325,7 +441,11 @@ fn complete(
     payload: &Value,
 ) -> Result<(), String> {
     let Some(pool) = engine.get() else {
-        return write_json(stream, 503, &json!({ "error": { "message": "No model loaded" } }));
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
     };
     let model = pool.info().name;
     let request = completions_request(payload)?;
@@ -351,7 +471,8 @@ fn generate_nonstreaming(
 ) -> Result<crate::engine::GenerationOutcome, String> {
     let interrupt = CancellationToken::new();
     // Session id 0: API completions must not render into any UI chat stream.
-    pool.handle(0).generate(&request, 0, &interrupt, &dummy_sender())
+    pool.handle(0)
+        .generate(&request, 0, &interrupt, &dummy_sender())
 }
 
 /// Streaming `POST /v1/chat/completions` (SSE). Chunk shape matches the
@@ -362,7 +483,11 @@ fn chat_stream(
     payload: &Value,
 ) -> Result<(), String> {
     let Some(pool) = engine.get() else {
-        return write_json(stream, 503, &json!({ "error": { "message": "No model loaded" } }));
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
     };
     let model = pool.info().name;
     let request = chat_request(payload)?;
@@ -422,7 +547,11 @@ fn complete_stream(
     payload: &Value,
 ) -> Result<(), String> {
     let Some(pool) = engine.get() else {
-        return write_json(stream, 503, &json!({ "error": { "message": "No model loaded" } }));
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
     };
     let model = pool.info().name;
     let request = completions_request(payload)?;
@@ -486,23 +615,367 @@ fn stream_request(
         .recv_timeout(std::time::Duration::from_secs(5))
         .ok()
         .and_then(|r| r.ok());
-    let done = outcome
-        .as_ref()
-        .map(|o| o.done.clone())
-        .unwrap_or_else(|| crate::engine::InferenceDone {
+    let done =
+        outcome
+            .as_ref()
+            .map(|o| o.done.clone())
+            .unwrap_or_else(|| crate::engine::InferenceDone {
+                total_tokens: 0,
+                generated_chars: full_text.chars().count() as u64,
+                tokens_per_sec: 0.0,
+                elapsed_ms: 0,
+                stop_reason: "stop".into(),
+                outcome: "completed".into(),
+                input_tokens: 0,
+                output_tokens: full_text.chars().count() as u64,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            });
+    write_sse(stream, &finish_chunk(full_text, &done))?;
+    write_sse_done(stream)
+}
+
+// --- /v1/responses (OpenAI Responses API) -------------------------------------
+//
+// Codex CLI and other Responses-only clients post to `/v1/responses` and never
+// touch `/v1/chat/completions`. Local llama.cpp models only speak the chat
+// shape, so this is a translation layer: request -> chat payload, chat reply ->
+// Responses envelope. Standard field names are preserved; only the envelope
+// differs.
+
+/// Translate a Responses API request body into the equivalent chat payload.
+///
+/// Accepts `input` as a plain string, a single message object, or the array
+/// form. Content may be a string or the `[{type, text}]` block array
+/// (`input_text` / `output_text` / `text`).
+fn responses_to_chat(payload: &Value) -> Result<Value, String> {
+    let mut messages: Vec<Value> = Vec::new();
+
+    if let Some(instructions) = payload.get("instructions").and_then(|v| v.as_str()) {
+        if !instructions.trim().is_empty() {
+            messages.push(json!({ "role": "system", "content": instructions }));
+        }
+    }
+
+    let text_of = |content: &Value| -> String {
+        match content {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b.get("type").and_then(|t| t.as_str()),
+                        Some("input_text") | Some("output_text") | Some("text")
+                    )
+                })
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    };
+
+    match payload.get("input") {
+        Some(Value::String(s)) => {
+            if !s.trim().is_empty() {
+                messages.push(json!({ "role": "user", "content": s }));
+            }
+        }
+        Some(Value::Object(obj)) => {
+            let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = obj.get("content").map(text_of).unwrap_or_default();
+            if !content.trim().is_empty() {
+                messages.push(json!({ "role": role, "content": content }));
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                // Skip function-call / function-call-output items: the local
+                // model has no tool channel, so replaying them as text would
+                // inject protocol noise into the prompt.
+                match obj.get("type").and_then(|t| t.as_str()) {
+                    Some("function_call") | Some("function_call_output") | Some("reasoning") => {
+                        continue
+                    }
+                    _ => {}
+                }
+                let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let content = obj.get("content").map(text_of).unwrap_or_default();
+                if !content.trim().is_empty() {
+                    messages.push(json!({ "role": role, "content": content }));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if messages.is_empty() {
+        return Err("responses requires a non-empty `input`".into());
+    }
+
+    let mut chat = json!({ "messages": messages });
+    if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
+        chat["model"] = json!(model);
+    }
+    // `max_output_tokens` is the Responses spelling of `max_tokens`.
+    for src in ["max_output_tokens", "max_tokens"] {
+        if let Some(v) = payload.get(src).and_then(|v| v.as_u64()) {
+            chat["max_tokens"] = json!(v);
+            break;
+        }
+    }
+    if let Some(stop) = payload.get("stop") {
+        chat["stop"] = stop.clone();
+    }
+    Ok(chat)
+}
+
+/// Build the non-streaming Responses envelope around the generated text.
+fn responses_body(model: &str, text: &str, outcome: &crate::engine::InferenceDone) -> Value {
+    json!({
+        "id": format!("resp_{}", uuid_short()),
+        "object": "response",
+        "created_at": now_secs(),
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "id": format!("msg_{}", uuid_short()),
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }],
+        }],
+        "usage": {
+            "input_tokens": outcome.input_tokens,
+            "output_tokens": outcome.output_tokens,
+            "total_tokens": outcome.total_tokens,
+        },
+    })
+}
+
+fn responses_complete(
+    stream: &mut std::net::TcpStream,
+    engine: &SharedEngine,
+    original: &Value,
+    chat: &Value,
+) -> Result<(), String> {
+    let Some(pool) = engine.get() else {
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
+    };
+    let model = original
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| pool.info().name);
+    let request = chat_request(chat)?;
+    let request = resolve_prompt(&pool, request, chat_prompt(chat));
+    let outcome = generate_nonstreaming(&pool, request)?;
+    write_json(
+        stream,
+        200,
+        &responses_body(&model, &outcome.full_text, &outcome.done),
+    )
+}
+
+/// Streaming `/v1/responses`: SSE `response.*` events over the chat pipeline.
+fn responses_stream(
+    stream: &mut std::net::TcpStream,
+    engine: &SharedEngine,
+    original: &Value,
+    chat: &Value,
+) -> Result<(), String> {
+    let Some(pool) = engine.get() else {
+        return write_json(
+            stream,
+            503,
+            &json!({ "error": { "message": "No model loaded" } }),
+        );
+    };
+    let model = original
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| pool.info().name);
+    let resp_id = format!("resp_{}", uuid_short());
+    let msg_id = format!("msg_{}", uuid_short());
+    let item_id = msg_id.clone();
+    let request = chat_request(chat)?;
+    let request = resolve_prompt(&pool, request, chat_prompt(chat));
+
+    let interrupt = CancellationToken::new();
+    let (events, outcomes) = pool.handle(0).stream(request, 0, interrupt)?;
+    write_sse_headers(stream)?;
+
+    let mut seq: u32 = 0;
+    let mut created_body = responses_body(
+        &model,
+        "",
+        &crate::engine::InferenceDone {
             total_tokens: 0,
-            generated_chars: full_text.chars().count() as u64,
+            generated_chars: 0,
             tokens_per_sec: 0.0,
             elapsed_ms: 0,
             stop_reason: "stop".into(),
-            outcome: "completed".into(),
+            outcome: "in_progress".into(),
             input_tokens: 0,
-            output_tokens: full_text.chars().count() as u64,
+            output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
-        });
-    write_sse(stream, &finish_chunk(full_text, &done))?;
+        },
+    );
+    created_body["id"] = json!(resp_id);
+    created_body["status"] = json!("in_progress");
+    created_body["output"] = json!([]);
+    let mut in_progress = created_body.clone();
+    in_progress["status"] = json!("in_progress");
+
+    write_sse(
+        stream,
+        &json!({ "type": "response.created", "response": created_body.clone(), "sequence_number": seq }),
+    )?;
+    seq += 1;
+    write_sse(
+        stream,
+        &json!({ "type": "response.in_progress", "response": created_body.clone(), "sequence_number": seq }),
+    )?;
+    seq += 1;
+
+    let mut full_text = String::new();
+    write_sse(
+        stream,
+        &json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+            "sequence_number": seq,
+        }),
+    )?;
+    seq += 1;
+    write_sse(
+        stream,
+        &json!({
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "item_id": item_id,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "" },
+            "sequence_number": seq,
+        }),
+    )?;
+    seq += 1;
+
+    loop {
+        match events.recv() {
+            Ok(crate::engine::WorkerEvent::Token { delta, .. }) => {
+                full_text.push_str(&delta);
+                write_sse(
+                    stream,
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": delta,
+                        "sequence_number": seq,
+                    }),
+                )?;
+                seq += 1;
+            }
+            Ok(crate::engine::WorkerEvent::Done { .. }) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let outcome = outcomes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+        .and_then(|r| r.ok());
+    let done =
+        outcome
+            .as_ref()
+            .map(|o| o.done.clone())
+            .unwrap_or_else(|| crate::engine::InferenceDone {
+                total_tokens: 0,
+                generated_chars: full_text.chars().count() as u64,
+                tokens_per_sec: 0.0,
+                elapsed_ms: 0,
+                stop_reason: "stop".into(),
+                outcome: "completed".into(),
+                input_tokens: 0,
+                output_tokens: full_text.chars().count() as u64,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            });
+
+    write_sse(
+        stream,
+        &json!({
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": full_text,
+            "sequence_number": seq,
+        }),
+    )?;
+    seq += 1;
+    write_sse(
+        stream,
+        &json!({
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "item_id": item_id,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": full_text },
+            "sequence_number": seq,
+        }),
+    )?;
+    seq += 1;
+    write_sse(
+        stream,
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": full_text, "annotations": [] }],
+            },
+            "sequence_number": seq,
+        }),
+    )?;
+    seq += 1;
+
+    let mut body = responses_body(&model, &full_text, &done);
+    body["id"] = json!(resp_id);
+    body["output"][0]["id"] = json!(item_id);
+    write_sse(
+        stream,
+        &json!({ "type": "response.completed", "response": body, "sequence_number": seq }),
+    )?;
     write_sse_done(stream)
 }
 
@@ -635,6 +1108,7 @@ fn write_json(stream: &mut std::net::TcpStream, status: u16, body: &Value) -> Re
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -675,6 +1149,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_trace_path_accepts_only_session_traces() {
+        assert_eq!(parse_trace_path("/v1/agent/sessions/42/trace"), Some(42));
+        assert_eq!(parse_trace_path("/v1/agent/sessions/0/trace"), Some(0));
+        assert_eq!(parse_trace_path("/v1/agent/sessions/42"), None);
+        assert_eq!(parse_trace_path("/v1/agent/sessions/abc/trace"), None);
+        assert_eq!(parse_trace_path("/v1/models"), None);
+    }
+
+    #[test]
     fn chat_turns_flattens_string_and_blocks() {
         let p = payload(json!([
             { "role": "system", "content": "be terse" },
@@ -690,9 +1173,24 @@ mod tests {
         ]));
         let turns = chat_turns(&p);
         assert_eq!(turns.len(), 3, "empty content is dropped");
-        assert_eq!(turns[0], ChatTurn { role: "system".into(), content: "be terse".into() });
-        assert_eq!(turns[1], ChatTurn { role: "user".into(), content: "hi".into() });
-        assert_eq!(turns[2].content, "describe this", "array blocks joined by newline");
+        assert_eq!(
+            turns[0],
+            ChatTurn {
+                role: "system".into(),
+                content: "be terse".into()
+            }
+        );
+        assert_eq!(
+            turns[1],
+            ChatTurn {
+                role: "user".into(),
+                content: "hi".into()
+            }
+        );
+        assert_eq!(
+            turns[2].content, "describe this",
+            "array blocks joined by newline"
+        );
         assert_eq!(turns[2].role, "user");
     }
 
@@ -707,9 +1205,15 @@ mod tests {
         let msgs = req.messages.as_ref().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(req.max_tokens, 4096, "max_completion_tokens read");
-        assert_eq!(req.stop_words.as_deref(), Some(&["<|end|>".to_string(), "###".to_string()][..]));
+        assert_eq!(
+            req.stop_words.as_deref(),
+            Some(&["<|end|>".to_string(), "###".to_string()][..])
+        );
 
-        assert!(chat_request(&payload(json!([]))).is_err(), "empty messages rejected");
+        assert!(
+            chat_request(&payload(json!([]))).is_err(),
+            "empty messages rejected"
+        );
     }
 
     #[test]
@@ -736,6 +1240,99 @@ mod tests {
         assert!(flat.contains("rules"));
         assert!(flat.contains("User: hi"));
         assert!(flat.contains("Assistant: yo"));
-        assert!(flat.trim_end().ends_with("Assistant:"), "leaves assistant tag open");
+        assert!(
+            flat.trim_end().ends_with("Assistant:"),
+            "leaves assistant tag open"
+        );
+    }
+
+    #[test]
+    fn responses_input_accepts_string_object_and_blocks() {
+        let from_string = responses_to_chat(&json!({ "input": "hello" })).unwrap();
+        assert_eq!(chat_turns(&from_string)[0].content, "hello");
+
+        let from_object = responses_to_chat(&json!({
+            "input": { "role": "user", "content": [{ "type": "input_text", "text": "blocky" }] }
+        }))
+        .unwrap();
+        assert_eq!(chat_turns(&from_object)[0].content, "blocky");
+
+        let from_array = responses_to_chat(&json!({
+            "instructions": "be terse",
+            "input": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "yo" },
+                { "role": "user", "content": [{ "type": "input_text", "text": "again" }] }
+            ]
+        }))
+        .unwrap();
+        let turns = chat_turns(&from_array);
+        assert_eq!(turns.len(), 4, "3 input turns + leading instructions turn");
+        assert_eq!(turns[0].role, "system");
+        assert_eq!(turns[1].role, "user");
+        assert_eq!(turns[2].role, "assistant");
+        assert_eq!(turns[3].content, "again");
+
+        assert!(
+            responses_to_chat(&json!({ "input": "  " })).is_err(),
+            "blank input rejected"
+        );
+    }
+
+    #[test]
+    fn responses_skips_tool_protocol_items() {
+        // The local model has no tool channel, so function-call plumbing must
+        // not be replayed as conversation text.
+        let chat = responses_to_chat(&json!({
+            "input": [
+                { "type": "function_call", "name": "ls", "arguments": "{}" },
+                { "type": "reasoning", "summary": [] },
+                { "role": "user", "content": "real question" }
+            ]
+        }))
+        .unwrap();
+        let turns = chat_turns(&chat);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "real question");
+    }
+
+    #[test]
+    fn responses_maps_token_and_model_fields() {
+        let chat = responses_to_chat(&json!({
+            "model": "local-gguf",
+            "input": "hi",
+            "max_output_tokens": 512
+        }))
+        .unwrap();
+        assert_eq!(chat["model"], json!("local-gguf"));
+        let req: InferenceRequest = chat_request(&chat).unwrap();
+        assert_eq!(req.max_tokens, 512);
+    }
+
+    #[test]
+    fn responses_body_uses_responses_envelope() {
+        let done = crate::engine::InferenceDone {
+            total_tokens: 30,
+            generated_chars: 5,
+            tokens_per_sec: 10.0,
+            elapsed_ms: 1,
+            stop_reason: "stop".into(),
+            outcome: "completed".into(),
+            input_tokens: 20,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let body = responses_body("m", "hello", &done);
+        assert_eq!(body["object"], json!("response"));
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(
+            body["output"][0]["content"][0]["type"],
+            json!("output_text")
+        );
+        assert_eq!(body["output"][0]["content"][0]["text"], json!("hello"));
+        assert_eq!(body["usage"]["input_tokens"], json!(20));
+        assert_eq!(body["usage"]["output_tokens"], json!(10));
     }
 }

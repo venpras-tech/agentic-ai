@@ -13,19 +13,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::background::start_background_task;
 use crate::agent::core::tool_schemas;
+use crate::agent::edits::{
+    apply_edits, list_checkpoints, list_pending_edits, reject_edits, resolve_conflict_edits,
+    restore_checkpoints,
+};
 use crate::agent::interrupt::{AbortPayload, InterruptState};
 use crate::agent::orchestrator::{run_agent_loop_pool, AgentTaskRequest};
-use crate::agent::policy::{snapshot, PolicySnapshot};
+use crate::agent::policy::{save_policy_with_matrix, snapshot, PolicyRule, PolicySnapshot};
 use crate::agent::skills::{KnowledgeReport, KnowledgeState};
 use crate::agent::subagent::{builtin_modes, register_workflow_tools, Mode};
 use crate::agent::tools::{dispatch, git_checkpoint, git_checkpoints, git_revert, transcribe_file};
 use crate::agent::workflows::{load_workflows, Workflow};
 use crate::agent::{
-    now_ms, BackgroundTaskEvent, BackgroundTaskInfo, EventSink, PathGrant, PermissionDecision,
-    ToolCall, ToolResult, ToolState, ToolContext,
+    now_ms, BackgroundTaskEvent, BackgroundTaskInfo, EventSink, FileCheckpoint, FileEdit,
+    PathGrant, PendingEditGroup, PermissionDecision, ToolCall, ToolContext, ToolResult, ToolState,
 };
 use crate::engine::{
-    ChatTurn, EnginePool, InferenceDone, InferenceRequest, RuntimeRouter, TextGenerator, WorkerEvent,
+    ChatTurn, EnginePool, InferenceRequest, RuntimeRouter, TextGenerator, WorkerEvent,
 };
 use crate::remote::{ProviderKind, ProviderRole, RemoteGenerator};
 use crate::{
@@ -91,9 +95,8 @@ async fn active_pool(
         .await
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
-    let factory = || {
-        RemoteGenerator::new(config.clone()).map(|g| Box::new(g) as Box<dyn TextGenerator>)
-    };
+    let factory =
+        || RemoteGenerator::new(config.clone()).map(|g| Box::new(g) as Box<dyn TextGenerator>);
     let pool = EnginePool::spawn_with(factory, event_tx, 4usize)
         .map_err(|e| format!("Failed to start remote provider '{}': {e}", provider.id))?;
     let info = pool.info();
@@ -136,10 +139,9 @@ pub async fn agent_attach_file(
     state: State<'_, Arc<ToolState>>,
     path: String,
 ) -> Result<AttachedFileInfo, String> {
-    let text =
-        tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| format!("Failed to read: {e}"))?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Failed to read: {e}"))?;
     let file = { state.rag.lock().unwrap().attach(&path, &text)? };
     Ok(AttachedFileInfo {
         path,
@@ -222,6 +224,11 @@ struct StartedEvent {
 /// circuit-breaker token is armed per run so an old cancellation can never leak
 /// into this one.
 ///
+/// Also serves as the Ask-mode chat-complete path (single turn, zero tool
+/// loop): the frontend calls it directly when "Ask uses chat completion" is
+/// enabled. Resolves the engine through [`active_pool`], so a registered
+/// remote Editor provider works without a local model.
+///
 /// The conversation snapshot from the [`crate::ContextState`] manager (which the
 /// frontend populates before invoking — the user turn is already the last
 /// entry) is attached as structured messages so the engine can render it
@@ -231,11 +238,12 @@ struct StartedEvent {
 pub async fn stream_inference(
     app: AppHandle,
     state: State<'_, InferenceState>,
+    providers: State<'_, ProviderRegistryState>,
     interrupt_state: State<'_, InterruptState>,
     context_state: State<'_, ContextState>,
     request: InferenceRequest,
 ) -> Result<u64, String> {
-    let pool = state.pool.lock().await.clone().ok_or("No model loaded")?;
+    let pool = active_pool(&app, &state, &providers).await?;
 
     // Attach the conversation (system prompt + pinned buffers + history).
     let mut messages = {
@@ -339,7 +347,32 @@ pub async fn agent_run_task(
     tool_state: State<'_, Arc<ToolState>>,
     request: AgentTaskRequest,
 ) -> Result<u64, String> {
-    let pool = active_pool(&app, &state, &providers).await?;
+    run_agent_task_inner(
+        app,
+        &state,
+        &providers,
+        &interrupt_state,
+        &context_state,
+        &tool_state,
+        request,
+    )
+    .await
+}
+
+/// Shared core of [`agent_run_task`], also driving `POST /v1/agent/tasks` on the
+/// loopback HTTP server (P3.2). The HTTP route builds the same managed `State`
+/// handles from its `AppHandle` via `Manager::state`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent_task_inner(
+    app: AppHandle,
+    state: &State<'_, InferenceState>,
+    providers: &State<'_, ProviderRegistryState>,
+    interrupt_state: &State<'_, InterruptState>,
+    context_state: &State<'_, ContextState>,
+    tool_state: &State<'_, Arc<ToolState>>,
+    request: AgentTaskRequest,
+) -> Result<u64, String> {
+    let pool = active_pool(&app, state, providers).await?;
     {
         let mut ctx = context_state.inner.lock().await;
         let snapshot = ctx.messages();
@@ -352,11 +385,41 @@ pub async fn agent_run_task(
             ctx.set_system_prompt(crate::agent::prompt::DEFAULT_AGENT_SYSTEM.to_string());
         }
     }
+    let session_id = interrupt_state.next_session();
+    // P3.1 session_start hooks: run once per task before the loop starts. Any
+    // stdout is pinned into the context as a "hooks" buffer so the model sees
+    // it (build_prompt renders it under "## Session hook output").
+    {
+        let workspaces = tool_state.workspace.lock().await.clone();
+        if let Some(ws) = workspaces.first() {
+            let cfg = crate::agent::hooks::load(ws);
+            if !cfg.session_start.is_empty() {
+                let payload = crate::agent::hooks::payload("session_start", ws, None, session_id);
+                if let Some(out) =
+                    crate::agent::hooks::run_session_start(ws, &cfg.session_start, &payload).await
+                {
+                    context_state
+                        .inner
+                        .lock()
+                        .await
+                        .upsert_pinned("hooks", out.clone());
+                    let _ = app.emit(
+                        "agent://hook",
+                        serde_json::json!({
+                            "event": "session_start",
+                            "status": "ok",
+                            "detail": out,
+                            "sessionId": session_id,
+                        }),
+                    );
+                }
+            }
+        }
+    }
     // Snapshot the role→provider registry so the worker thread can route
     // plan/memory phases to a different provider at runtime (P0 hand-off).
     let role_registry = providers.0.lock().await.clone();
 
-    let session_id = interrupt_state.next_session();
     let interrupt = interrupt_state.arm();
     let _ = app.emit("inference-started", StartedEvent { session_id });
     crate::logging::info(
@@ -370,50 +433,15 @@ pub async fn agent_run_task(
             request.decompose,
             request.verify,
             if crate::logging::prompt_preview_enabled() {
-                format!(" · prompt: {}", crate::logging::preview(&request.prompt, 80))
+                format!(
+                    " · prompt: {}",
+                    crate::logging::preview(&request.prompt, 80)
+                )
             } else {
                 String::new()
             }
         ),
     );
-
-    // Greeting short-circuit: skip the model/tool round-trip for trivial
-    // small talk, answering with a canned reply (see `agent/smalltalk.rs`).
-    if crate::agent::smalltalk::is_smalltalk(&request.prompt) {
-        let reply = crate::agent::smalltalk::reply_for(&request.prompt);
-        let tx = state
-            .worker_tx
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_else(|| spawn_emitter(app.clone()));
-        let _ = tx.send(crate::engine::WorkerEvent::Token {
-            session_id,
-            delta: reply.clone(),
-        });
-        let _ = tx.send(crate::engine::WorkerEvent::Done {
-            session_id,
-            done: InferenceDone {
-                total_tokens: 0,
-                generated_chars: reply.chars().count() as u64,
-                tokens_per_sec: 0.0,
-                elapsed_ms: 0,
-                stop_reason: "completed".to_string(),
-                outcome: "completed".to_string(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        });
-        crate::logging::info(
-            Some(session_id),
-            "llm.smalltalk",
-            "short-circuited greeting; no model round-trip",
-        );
-        return Ok(session_id);
-    }
 
     let tx = state
         .worker_tx
@@ -422,7 +450,7 @@ pub async fn agent_run_task(
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
 
-    let tool_state_arc = Arc::clone(&tool_state);
+    let tool_state_arc = Arc::clone(tool_state);
 
     let context_snapshot = context_state.inner.lock().await.messages();
     // Share the ContextManager's registered HF tokenizer (if any) so the
@@ -524,8 +552,13 @@ pub async fn autocomplete_generate(
     let interrupt = CancellationToken::new();
     let mut router = RuntimeRouter::new(&pool, role_registry, tx.clone());
     let mut gen = router.resolve(ProviderRole::Autocomplete)?;
-    // Session id 0 keeps the completion off the chat stream.
-    let outcome = gen.generate(&gen_request, 0, &interrupt, &tx)?;
+    // Session id 0 keeps the completion off the chat stream. `generate` is
+    // CPU-bound (llama.cpp) so run it on the blocking pool instead of stalling
+    // the async runtime that drives the rest of the app.
+    let outcome =
+        tokio::task::spawn_blocking(move || gen.generate(&gen_request, 0, &interrupt, &tx))
+            .await
+            .map_err(|e| format!("autocomplete task failed: {e}"))??;
     Ok(outcome.full_text.trim().to_string())
 }
 
@@ -590,6 +623,10 @@ pub async fn abort_background_task(
         .background_tasks
         .abort(&task_id)
         .ok_or_else(|| format!("Unknown background task: {task_id}"))?;
+    tool_state
+        .background_output
+        .record(info.session_id, "aborted");
+    tool_state.background_output.flush(info.session_id);
 
     // Emit lifecycle event so the frontend cleans up.
     let _ = app.emit(
@@ -604,6 +641,17 @@ pub async fn abort_background_task(
     );
 
     Ok(())
+}
+
+/// Tail the captured output ring buffer of a background task. Works for
+/// finished tasks too — the buffer outlives the registry entry.
+#[tauri::command]
+pub async fn background_task_output(
+    tool_state: State<'_, Arc<ToolState>>,
+    task_id: String,
+    tail_lines: Option<usize>,
+) -> Result<Vec<String>, String> {
+    Ok(tool_state.background_output.tail(&task_id, tail_lines))
 }
 
 /// Acknowledgement for a queued steer: the id that will come back on the
@@ -725,9 +773,7 @@ pub async fn agent_reset_mcp(state: State<'_, Arc<ToolState>>) -> Result<(), Str
 /// (`.ai/modes/*.md`). The registry is refreshed on every call so editing a
 /// mode file takes effect without restarting the app.
 #[tauri::command]
-pub async fn agent_modes(
-    state: State<'_, Arc<ToolState>>,
-) -> Result<Vec<Mode>, String> {
+pub async fn agent_modes(state: State<'_, Arc<ToolState>>) -> Result<Vec<Mode>, String> {
     let workspace = state.primary_workspace().await.unwrap_or_default();
     let mut modes = builtin_modes();
     modes.extend(sync_modes(&workspace));
@@ -737,9 +783,7 @@ pub async fn agent_modes(
 /// List the user-defined workflows available in the active workspace
 /// (`.ai/workflows/*.md`) as a `/command` picker catalog.
 #[tauri::command]
-pub async fn agent_workflows(
-    state: State<'_, Arc<ToolState>>,
-) -> Result<Vec<Workflow>, String> {
+pub async fn agent_workflows(state: State<'_, Arc<ToolState>>) -> Result<Vec<Workflow>, String> {
     let workspace = state.primary_workspace().await.unwrap_or_default();
     Ok(load_workflows(&workspace))
 }
@@ -747,7 +791,10 @@ pub async fn agent_workflows(
 /// Activate a workflow's tool allow-list for the current run scope so
 /// `allowedTools:` enforcement applies to the invoking session.
 #[tauri::command]
-pub async fn workflow_enforce_tools(name: String, allowed_tools: Vec<String>) -> Result<(), String> {
+pub async fn workflow_enforce_tools(
+    name: String,
+    allowed_tools: Vec<String>,
+) -> Result<(), String> {
     register_workflow_tools(&name, allowed_tools);
     Ok(())
 }
@@ -760,7 +807,9 @@ pub async fn knowledge_scan(
     context_state: State<'_, ContextState>,
     knowledge_state: State<'_, Arc<KnowledgeState>>,
 ) -> Result<KnowledgeReport, String> {
-    let ws = state.primary_workspace().await
+    let ws = state
+        .primary_workspace()
+        .await
         .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     knowledge_state.scan(&ws, &config_dir)?;
@@ -788,6 +837,7 @@ pub async fn skill_set_active(
     knowledge_state.set_active(&name, active)?;
     sync_knowledge(&context_state, &knowledge_state).await;
     let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
+    let _ = app.emit("agent://skills-changed", ());
     Ok(knowledge_report(&knowledge_state))
 }
 
@@ -803,13 +853,16 @@ pub async fn skill_install(
     source: String,
     global: bool,
 ) -> Result<KnowledgeReport, String> {
-    let ws = state.primary_workspace().await
+    let ws = state
+        .primary_workspace()
+        .await
         .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     KnowledgeState::install(&ws, &config_dir, Path::new(&source), global)?;
     knowledge_state.scan(&ws, &config_dir)?;
     sync_knowledge(&context_state, &knowledge_state).await;
     let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
+    let _ = app.emit("agent://skills-changed", ());
     Ok(knowledge_report(&knowledge_state))
 }
 
@@ -842,7 +895,9 @@ pub async fn skill_import_dialog(
         return Ok(None);
     };
     let source = entry.to_string_lossy().into_owned();
-    let ws = state.primary_workspace().await
+    let ws = state
+        .primary_workspace()
+        .await
         .ok_or("No workspace set - open a project first")?;
     let config_dir = app_config_dir(&app);
     KnowledgeState::install(&ws, &config_dir, Path::new(&source), global)?;
@@ -850,6 +905,7 @@ pub async fn skill_import_dialog(
     sync_knowledge(&context_state, &knowledge_state).await;
     let report = knowledge_report(&knowledge_state);
     let _ = app.emit("agent-knowledge", &report);
+    let _ = app.emit("agent://skills-changed", ());
     Ok(Some(report))
 }
 
@@ -866,7 +922,9 @@ pub async fn skill_install_sample(
     content: String,
     global: bool,
 ) -> Result<KnowledgeReport, String> {
-    let ws = state.primary_workspace().await
+    let ws = state
+        .primary_workspace()
+        .await
         .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     knowledge_state.install_sample(&ws, &config_dir, &name, &content, global)?;
@@ -874,6 +932,7 @@ pub async fn skill_install_sample(
     sync_knowledge(&context_state, &knowledge_state).await;
     let report = knowledge_report(&knowledge_state);
     let _ = app.emit("agent-knowledge", &report);
+    let _ = app.emit("agent://skills-changed", ());
     Ok(report)
 }
 
@@ -886,13 +945,16 @@ pub async fn skill_uninstall(
     knowledge_state: State<'_, Arc<KnowledgeState>>,
     name: String,
 ) -> Result<KnowledgeReport, String> {
-    let ws = state.primary_workspace().await
+    let ws = state
+        .primary_workspace()
+        .await
         .ok_or("No workspace set - open a workspace first")?;
     let config_dir = app_config_dir(&app);
     knowledge_state.uninstall(&name)?;
     knowledge_state.scan(&ws, &config_dir)?;
     sync_knowledge(&context_state, &knowledge_state).await;
     let _ = app.emit("agent-knowledge", knowledge_report(&knowledge_state));
+    let _ = app.emit("agent://skills-changed", ());
     Ok(knowledge_report(&knowledge_state))
 }
 
@@ -1016,6 +1078,29 @@ pub async fn agent_policy_snapshot(
 pub async fn agent_set_yolo(state: State<'_, Arc<ToolState>>, on: bool) -> Result<(), String> {
     state.yolo.store(on, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Persist the workspace policy from the policy editor. The injected
+/// `__red_zone__` rule is dropped before writing (it is UI-read-only and is
+/// re-injected on every load; `save_policy` would reject it outright).
+#[tauri::command]
+pub async fn agent_policy_save(
+    state: State<'_, Arc<ToolState>>,
+    default: String,
+    rules: Vec<PolicyRule>,
+    auto_approve: Option<std::collections::BTreeMap<String, bool>>,
+) -> Result<(), String> {
+    let ws = state.primary_workspace().await;
+    let editable: Vec<PolicyRule> = rules
+        .into_iter()
+        .filter(|r| r.tool != "__red_zone__")
+        .collect();
+    save_policy_with_matrix(
+        ws.as_deref(),
+        &default,
+        &editable,
+        &auto_approve.unwrap_or_default(),
+    )
 }
 
 /// Grant a per-session `{path, mode}` allowance for a path OUTSIDE the
@@ -1238,4 +1323,129 @@ pub async fn agent_git_revert_cmd(
     commit: Option<String>,
 ) -> Result<ToolResult, String> {
     git_revert(&state, &interrupt_state.current(), commit.as_deref()).await
+}
+
+// ---------------------------------------------------------------------------
+// Proposed-edit review (Cursor/Claude-style chat + apply pipeline)
+// ---------------------------------------------------------------------------
+
+/// Every proposed-edit batch currently waiting on the user's review, for the
+/// review pane (the "Review changes" panel).
+#[tauri::command]
+pub async fn agent_list_pending_edits(
+    state: State<'_, Arc<ToolState>>,
+) -> Result<Vec<PendingEditGroup>, String> {
+    let mut groups: Vec<PendingEditGroup> = list_pending_edits(&state).into_values().collect();
+    groups.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(groups)
+}
+
+/// Apply an approved edit batch (or only the selected edits within it):
+/// conflict-check each file against its proposed snapshot, take a pre-apply
+/// checkpoint, write, then unblock the proposing tool. Returns final statuses.
+#[tauri::command]
+pub async fn agent_apply_edits(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    group_id: String,
+    edit_ids: Option<Vec<String>>,
+) -> Result<Vec<FileEdit>, String> {
+    let ctx = tool_ctx(&app);
+    apply_edits(&ctx, &state, &group_id, &edit_ids.unwrap_or_default()).await
+}
+
+/// Reject an edit batch (or selected edits) and unblock the proposing tool so
+/// it can self-correct.
+#[tauri::command]
+pub async fn agent_reject_edits(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    group_id: String,
+    edit_ids: Option<Vec<String>>,
+    reason: Option<String>,
+) -> Result<Vec<FileEdit>, String> {
+    let ctx = tool_ctx(&app);
+    reject_edits(
+        &state,
+        &ctx,
+        &group_id,
+        &edit_ids.unwrap_or_default(),
+        reason,
+    )
+    .await
+}
+
+/// Resolve conflict-status edits in one group: `overwrite=true` force-writes
+/// the proposed content (checkpointed like a normal apply); `overwrite=false`
+/// ("reload from disk") keeps the on-disk file and rejects the proposal so the
+/// model re-proposes against the current content.
+#[tauri::command]
+pub async fn agent_resolve_edit_conflict(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    group_id: String,
+    overwrite: bool,
+    edit_ids: Option<Vec<String>>,
+) -> Result<Vec<FileEdit>, String> {
+    let ctx = tool_ctx(&app);
+    resolve_conflict_edits(
+        &ctx,
+        &state,
+        &group_id,
+        overwrite,
+        &edit_ids.unwrap_or_default(),
+    )
+    .await
+}
+
+/// Run the post-edit verify harness on demand (`.ai/verify.json` or a
+/// per-language default) for the given files, emitting `agent://verify-result`.
+#[tauri::command]
+pub async fn agent_run_verify(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    files: Option<Vec<String>>,
+) -> Result<crate::agent::verify::VerifyRun, String> {
+    let workspace = state
+        .primary_workspace()
+        .await
+        .ok_or_else(|| "No workspace set".to_string())?;
+    let files = files.unwrap_or_default();
+    let run = crate::agent::verify::run(&workspace, &files, Some(&state.lsp))
+        .await
+        .ok_or_else(|| {
+            "Nothing to verify (no .ai/verify.json and no matching default check)".to_string()
+        })?;
+    let _ = app.emit(
+        "agent://verify-result",
+        crate::agent::VerifyResultEvent {
+            session_id: state.session_id.load(std::sync::atomic::Ordering::SeqCst),
+            ok: run.ok,
+            command: run.command.clone(),
+            exit_code: run.exit_code,
+            output: run.report.clone(),
+            timestamp_ms: crate::agent::now_ms(),
+        },
+    );
+    Ok(run)
+}
+
+/// Pre-apply file snapshots taken during the session (`checkpoint_restore` can
+/// roll a file back), newest first.
+#[tauri::command]
+pub async fn agent_checkpoint_list(
+    state: State<'_, Arc<ToolState>>,
+) -> Result<Vec<FileCheckpoint>, String> {
+    Ok(list_checkpoints(&state))
+}
+
+/// Restore one or more files from their pre-apply snapshots (per file or batch).
+#[tauri::command]
+pub async fn agent_checkpoint_restore(
+    app: AppHandle,
+    state: State<'_, Arc<ToolState>>,
+    ids: Option<Vec<String>>,
+) -> Result<usize, String> {
+    let ctx = tool_ctx(&app);
+    restore_checkpoints(&ctx, &state, &ids.unwrap_or_default()).await
 }

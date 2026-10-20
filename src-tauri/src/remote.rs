@@ -497,6 +497,109 @@ fn user_content_value(request: &InferenceRequest, anthropic: bool) -> Value {
     Value::Array(blocks)
 }
 
+/// One in-flight `tool_calls` entry, reassembled from streamed argument
+/// fragments. OpenAI sends the `function.arguments` JSON split across deltas,
+/// keyed by the entry's `index`.
+#[derive(Debug, Default, Clone)]
+struct PartialToolCall {
+    name: String,
+    arguments: String,
+}
+
+/// Upper bound on concurrently tracked tool-call slots. Providers stream a
+/// handful of parallel calls at most; anything beyond this index is treated as
+/// a malformed frame rather than a reason to allocate.
+const MAX_TOOL_CALL_SLOTS: usize = 32;
+
+/// Collects native `tool_calls` deltas from a chat-completions stream and
+/// re-renders them as `<execute_tool>{json}</execute_tool>` blocks.
+///
+/// The agent loop only knows how to read the `<execute_tool>` markdown form
+/// (that is what the local llama.cpp models emit), so a remote provider that
+/// answers with structured tool calls is translated into that same shape. One
+/// code path then dispatches both local and remote tool use.
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    entries: Vec<PartialToolCall>,
+}
+
+impl ToolCallAccumulator {
+    /// Absorb one SSE frame's `choices[0].delta.tool_calls` fragment list.
+    /// Entries absent from a frame are left untouched (partial updates).
+    fn absorb(&mut self, frame: &Value) {
+        let Some(list) = frame["choices"][0]["delta"]["tool_calls"].as_array() else {
+            return;
+        };
+        for item in list {
+            // `index` is provider-controlled. Cap it so a malformed or hostile
+            // stream cannot ask for a huge sparse vector and allocate for it.
+            let index = (item["index"].as_u64().unwrap_or(0) as usize).min(MAX_TOOL_CALL_SLOTS - 1);
+            while self.entries.len() <= index {
+                self.entries.push(PartialToolCall::default());
+            }
+            let entry = &mut self.entries[index];
+            if let Some(name) = item["function"]["name"].as_str() {
+                if !name.is_empty() {
+                    entry.name.push_str(name);
+                }
+            }
+            if let Some(args) = item["function"]["arguments"].as_str() {
+                entry.arguments.push_str(args);
+            }
+        }
+    }
+
+    /// Append the completed calls to `out` as `<execute_tool>` blocks. Entries
+    /// with an unusable name or unparseable arguments are dropped rather than
+    /// injected as malformed tool calls.
+    fn flush_into(&self, out: &mut String) {
+        for entry in &self.entries {
+            let name = entry.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let args = entry.arguments.trim();
+            let params: Value = if args.is_empty() {
+                Value::Object(Default::default())
+            } else {
+                match serde_json::from_str(args) {
+                    Ok(v @ Value::Object(_)) => v,
+                    _ => {
+                        crate::logging::warn(
+                            None,
+                            "remote.tool_call",
+                            &format!("discarding tool call `{name}` with unparseable arguments"),
+                        );
+                        continue;
+                    }
+                }
+            };
+            // `ToolCall` is `#[serde(tag = "type")]`, so the function name has
+            // to land in the `type` field for the existing parser to dispatch it.
+            let mut payload = match params {
+                Value::Object(map) => map,
+                _ => Default::default(),
+            };
+            if let Some(existing) = payload.get("type").and_then(|t| t.as_str()) {
+                if existing != name {
+                    crate::logging::warn(
+                        None,
+                        "remote.tool_call",
+                        &format!(
+                            "ignoring tool call `{name}` that also set a conflicting type tag"
+                        ),
+                    );
+                    continue;
+                }
+            }
+            payload.insert("type".to_string(), json!(name));
+            out.push_str("\n<execute_tool>\n");
+            out.push_str(&json!(Value::Object(payload)).to_string());
+            out.push_str("\n</execute_tool>\n");
+        }
+    }
+}
+
 pub struct RemoteGenerator {
     client: Client,
     base_url: String,
@@ -550,6 +653,13 @@ impl TextGenerator for RemoteGenerator {
         self.info.clone()
     }
 
+    fn supports_native_tools(&self) -> bool {
+        // Only the OpenAI chat-completions wire format carries a `tools` field.
+        // The Anthropic Messages API would need its own `tools`/`tool_use`
+        // translation, so it stays on the `<execute_tool>` markdown path.
+        self.provider.style() == GenerationStyle::ChatCompletions
+    }
+
     fn generate(
         &mut self,
         request: &InferenceRequest,
@@ -558,6 +668,12 @@ impl TextGenerator for RemoteGenerator {
         tx: &Sender<WorkerEvent>,
     ) -> Result<GenerationOutcome, String> {
         let started = Instant::now();
+        // Remote backends count tokens server-side, so no local prompt length
+        // is known; 0 tells the listener the number is unavailable.
+        let _ = tx.send(WorkerEvent::Started {
+            session_id,
+            prompt_tokens: 0,
+        });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -622,6 +738,7 @@ impl RemoteGenerator {
             "messages": [{ "role": "user", "content": user_content }],
             "stream": true,
             "max_tokens": request.max_tokens,
+            "stream_options": { "include_usage": true },
         });
         let stop = request.stop_words.clone().unwrap_or_default();
         let stop: Vec<Value> = stop
@@ -631,6 +748,14 @@ impl RemoteGenerator {
             .collect();
         if !stop.is_empty() {
             body["stop"] = Value::Array(stop);
+        }
+        // Native tool calling. The agent loop advertises its catalog here; a
+        // provider that answers with structured `tool_calls` instead of an
+        // `<execute_tool>` markdown block gets them folded back into the text
+        // below, so the orchestrator's parser sees one shape either way.
+        if let Some(tools) = request.tools.as_ref().filter(|t| !t.is_empty()) {
+            body["tools"] = Value::Array(tools.clone());
+            body["tool_choice"] = json!("auto");
         }
 
         let resp = send_with_retry(
@@ -650,6 +775,10 @@ impl RemoteGenerator {
         };
         let mut stream = resp.bytes_stream();
         let mut stop_reason = "stop".to_string();
+        // SSE frames can be split across network chunks, so a partial trailing
+        // line is carried over instead of being parsed as its own frame.
+        let mut pending_line = String::new();
+        let mut tool_calls = ToolCallAccumulator::default();
 
         loop {
             if interrupt.is_cancelled() {
@@ -676,23 +805,40 @@ impl RemoteGenerator {
                 break; // stream closed by server
             };
             let bytes = bytes.map_err(|e| format!("Remote stream error: {e}"))?;
-            let text = String::from_utf8_lossy(&bytes);
+            pending_line.push_str(&String::from_utf8_lossy(&bytes));
 
-            for raw in text.lines() {
+            // Only whole lines are frames; the remainder waits for more bytes.
+            let (frames, rest) = match pending_line.find('\n') {
+                Some(pos) => (
+                    pending_line[..pos].to_string(),
+                    pending_line[pos + 1..].to_string(),
+                ),
+                None => (String::new(), std::mem::take(&mut pending_line)),
+            };
+            pending_line = rest;
+
+            for raw in frames.lines() {
                 let line = raw.trim();
                 if !line.starts_with("data:") {
                     continue;
                 }
                 let data = line["data:".len()..].trim();
                 if data == "[DONE]" {
+                    tool_calls.flush_into(&mut full);
+                    usage.output_tokens = usage.output_tokens.max(counted_output);
                     return Ok((full, usage, stop_reason));
                 }
-                let v: Value =
-                    serde_json::from_str(data).map_err(|e| format!("Bad SSE payload: {e}"))?;
+                // A frame may still be malformed (truncated, or a provider that
+                // emits bare JSON). Skip it rather than failing the whole turn.
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
 
-                if v.get("usage").is_some() {
+                if v.get("usage").and_then(|u| u.as_object()).is_some() {
                     usage = usage_from_chat(&v, est_input, counted_output);
                 }
+                tool_calls.absorb(&v);
+
                 let delta = v["choices"][0]["delta"]["content"]
                     .as_str()
                     .or_else(|| v["choices"][0]["text"].as_str())
@@ -711,6 +857,39 @@ impl RemoteGenerator {
             }
         }
 
+        // The provider may have closed the socket without a `[DONE]` sentinel.
+        // Drain any buffered partial line that may contain the final frame(s).
+        if !pending_line.is_empty() {
+            for raw in pending_line.lines() {
+                let line = raw.trim();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line["data:".len()..].trim();
+                if data == "[DONE]" {
+                    break;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if v.get("usage").and_then(|u| u.as_object()).is_some() {
+                    usage = usage_from_chat(&v, est_input, counted_output);
+                }
+                tool_calls.absorb(&v);
+                let delta = v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .or_else(|| v["choices"][0]["text"].as_str())
+                    .or_else(|| v["content_block_delta"]["delta"]["text"].as_str())
+                    .unwrap_or("");
+                if !delta.is_empty() {
+                    // Do not double-count output tokens (counted_output already
+                    // reflects previously emitted deltas); only flush into full
+                    // if the text wasn't just echoed.
+                    full.push_str(delta);
+                }
+            }
+        }
+        tool_calls.flush_into(&mut full);
         usage.output_tokens = usage.output_tokens.max(counted_output);
         Ok((full, usage, stop_reason))
     }
@@ -1089,23 +1268,15 @@ impl ProviderRegistry {
     /// Create a registry from a single local + optional remote, matching the
     /// current single-provider behaviour exactly.
     #[allow(dead_code)]
-    pub fn with_defaults(
-        local_model: &str,
-        remote: Option<RemoteModelConfig>,
-    ) -> Self {
+    pub fn with_defaults(local_model: &str, remote: Option<RemoteModelConfig>) -> Self {
         let mut reg = Self::new();
         let mut local = ProviderConfig::local(local_model);
         local.roles = vec![ProviderRole::Planner, ProviderRole::Editor];
         reg.add_provider(local);
         if let Some(rc) = remote {
             let kind = ProviderKind::from_str(&rc.provider);
-            let remote_cfg = ProviderConfig::remote(
-                kind,
-                kind.label(),
-                &rc.base_url,
-                &rc.api_key,
-                &rc.model,
-            );
+            let remote_cfg =
+                ProviderConfig::remote(kind, kind.label(), &rc.base_url, &rc.api_key, &rc.model);
             reg.add_provider(remote_cfg);
         }
         reg
@@ -1190,6 +1361,101 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+    use crate::agent::core::parse_tool_calls;
+
+    fn frame(index: u64, name: &str, args: &str) -> Value {
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": format!("call_{index}"),
+                        "type": "function",
+                        "function": { "name": name, "arguments": args }
+                    }]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn accumulates_split_argument_fragments() {
+        let mut acc = ToolCallAccumulator::default();
+        // A streamed tool call arrives as: name first, then the argument JSON
+        // in several pieces.
+        acc.absorb(&frame(0, "read_file_range", ""));
+        acc.absorb(&frame(0, "", "{\"path\":"));
+        acc.absorb(&frame(0, "", "\"src/main.rs\","));
+        acc.absorb(&frame(0, "", "\"startLine\":1,\"endLine\":20}"));
+
+        let mut text = String::new();
+        acc.flush_into(&mut text);
+        let calls = parse_tool_calls(&text, &mut |w| panic!("parse warning: {w}"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name(), "read_file_range");
+    }
+
+    #[test]
+    fn renders_parallel_calls_indexed_separately() {
+        let mut acc = ToolCallAccumulator::default();
+        // Two calls interleaved on the wire, addressed by index.
+        acc.absorb(&frame(
+            0,
+            "read_file_range",
+            "{\"path\":\"a.rs\",\"startLine\":1,\"endLine\":5}",
+        ));
+        acc.absorb(&frame(
+            1,
+            "glob_search_codebase",
+            "{\"pattern\":\"**/*.ts\"}",
+        ));
+        acc.absorb(&frame(0, "", ""));
+
+        let mut text = String::new();
+        acc.flush_into(&mut text);
+        let calls = parse_tool_calls(&text, &mut |w| panic!("parse warning: {w}"));
+        assert_eq!(calls.len(), 2);
+        let names: Vec<&str> = calls.iter().map(|c| c.name()).collect();
+        assert!(names.contains(&"read_file_range"));
+        assert!(names.contains(&"glob_search_codebase"));
+    }
+
+    #[test]
+    fn no_arguments_object_is_treated_as_empty() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb(&frame(0, "view_repo_map", ""));
+        let mut text = String::new();
+        acc.flush_into(&mut text);
+        let calls = parse_tool_calls(&text, &mut |w| panic!("parse warning: {w}"));
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn drops_unparseable_and_nameless_entries() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb(&frame(0, "read_file_range", "{not json"));
+        acc.absorb(&frame(1, "", "{\"path\":\"a.rs\"}"));
+        let mut text = String::new();
+        acc.flush_into(&mut text);
+        assert!(
+            text.is_empty(),
+            "a bad or nameless tool call must not be injected: {text}"
+        );
+    }
+
+    #[test]
+    fn ignores_frames_without_tool_calls() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb(&json!({ "choices": [{ "delta": { "content": "hi" } }] }));
+        let mut text = String::new();
+        acc.flush_into(&mut text);
+        assert!(text.is_empty());
     }
 }
 

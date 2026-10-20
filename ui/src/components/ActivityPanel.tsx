@@ -9,10 +9,17 @@ interface ActivityPanelProps {
   logs: ActivityLogEntry[];
   collapsed: boolean;
   onToggle: () => void;
+  /** Case-insensitive substring filter over `text` (set by "View log"). */
+  filter?: string;
+  onClearFilter?: () => void;
 }
 
-function ActivityPanel({ logs, collapsed, onToggle }: ActivityPanelProps) {
+function ActivityPanel({ logs, collapsed, onToggle, filter, onClearFilter }: ActivityPanelProps) {
   const latestStatus = logs.filter((l) => l.type === "status").slice(-1)[0];
+  const needle = filter?.trim().toLowerCase() ?? "";
+  const visible = needle
+    ? logs.filter((l) => l.text.toLowerCase().includes(needle))
+    : logs;
 
   return (
     <div className={`activity-wrap ${collapsed ? "collapsed" : ""}`}>
@@ -20,6 +27,21 @@ function ActivityPanel({ logs, collapsed, onToggle }: ActivityPanelProps) {
         <span className="activity-title">Backend activity</span>
         {latestStatus && (
           <span className="activity-status-live">{latestStatus.text}</span>
+        )}
+        {needle && (
+          <span className="activity-filter-chip" title="Filtered activity">
+            filter: {filter}
+            {onClearFilter && (
+              <button
+                type="button"
+                className="activity-filter-clear"
+                onClick={onClearFilter}
+                title="Clear filter"
+              >
+                ×
+              </button>
+            )}
+          </span>
         )}
         <button
           type="button"
@@ -32,7 +54,13 @@ function ActivityPanel({ logs, collapsed, onToggle }: ActivityPanelProps) {
         </button>
       </div>
       <div className="activity">
-        {logs.map((log, index) => (
+        {visible.length === 0 && needle && (
+          <div className="activity-item activity-status">
+            <span className="activity-label">Status</span>
+            <span className="activity-body">No activity matches “{filter}”.</span>
+          </div>
+        )}
+        {visible.map((log, index) => (
           <div key={index} className={`activity-item activity-${log.type}`}>
             <span className="activity-label">
               {log.type === "tool" ? "Tool" :

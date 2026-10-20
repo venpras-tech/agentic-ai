@@ -20,9 +20,9 @@
 
 use std::time::Instant;
 
+use super::ToolContext;
 use crossbeam_channel::Sender;
 use serde::Deserialize;
-use super::ToolContext;
 use tokio_util::sync::CancellationToken;
 
 use super::context::ContextMessage;
@@ -30,10 +30,11 @@ use super::plan::{self, PlanState, PlanStatus};
 use super::subagent::{self, SubagentProfile};
 use super::{
     core::{extract_hitl_gate, parse_tool_calls, HITL_DIRECTIVE},
-    now_ms, tools, AgentToolEvent, ContextTrimmedEvent, PlanStepEvent, ToolCall, ToolResult,
-    ToolState,
+    now_ms, tools, AgentToolEvent, ContextTrimmedEvent, PlanStepEvent, RunTraceEvent, ToolCall,
+    ToolResult, ToolState,
 };
 use crate::agent::SteerAppliedEvent;
+use crate::agent::SubagentRunEvent;
 use crate::engine::{
     ChatTurn, EnginePool, GenerationOutcome, InferenceDone, InferenceRequest, ModelInfo,
     PoolGenerator, ProviderRole, RuntimeRouter, StepStat, SubtaskStat, TextGenerator, WorkerEvent,
@@ -87,6 +88,22 @@ const SUMMARY_BLOCK_MAX_MSGS: usize = 6;
 /// Max chars of source text fed to the summarizer (protect the token budget).
 const SUMMARY_BLOCK_MAX_CHARS: usize = 12_000;
 
+/// Belt-and-braces hard gate for Ask mode: reject any tool outside the policy's
+/// read-only default-allow set, independent of the mode allow-list machinery.
+/// Even if `subagent::tool_allowed` regressed, Ask can never dispatch a
+/// mutating tool. Note: this additionally denies `calculate` (ReadOnly
+/// delegation but not default-allow) — it would require HITL approval anyway.
+fn ask_mode_tool_verdict(mode: Option<&str>, tool: &str) -> Option<String> {
+    let ask = matches!(mode, Some(m) if m.trim().eq_ignore_ascii_case("ask"));
+    if !ask || crate::agent::policy::default_allow(tool) {
+        return None;
+    }
+    Some(format!(
+        "Tool `{tool}` is not read-only; Ask mode forbids mutations. \
+         Switch to Agent mode to use it."
+    ))
+}
+
 /// Detect common model refusal patterns. Returns `true` when the response text
 /// contains a refusal even if tool calls are also present.
 fn is_refusal(text: &str) -> bool {
@@ -126,23 +143,67 @@ fn is_refusal(text: &str) -> bool {
 
 /// Heuristic: does this user message look like a coding task that should use
 /// tools? Returns `true` for messages that contain coding-related keywords or
-/// patterns, `false` for pure greetings / small talk.
+/// patterns, `false` for conversational messages.
 fn is_coding_task(message: &str) -> bool {
-    if super::smalltalk::is_ambiguous_short_probe(message) {
-        return false;
-    }
     let lower = message.to_lowercase();
     // Direct coding keywords — must be present for the task to qualify.
     let keywords = [
-        "create", "build", "add", "fix", "refactor", "implement", "set up",
-        "scaffold", "install", "configure", "write", "update", "modify",
-        "delete", "remove", "move", "rename", "copy", "debug",
-        "deploy", "migrate", "upgrade", "setup", "generate",
-        "project", "app", "application", "component", "function", "class",
-        "module", "file", "folder", "directory", "code", "script",
-        "bug", "error", "issue", "fail", "broken", "crash",
-        "react", "vue", "angular", "node", "python", "rust", "typescript",
-        "javascript", "html", "css", "sql", "api", "rest", "graphql",
+        "create",
+        "build",
+        "add",
+        "fix",
+        "refactor",
+        "implement",
+        "set up",
+        "scaffold",
+        "install",
+        "configure",
+        "write",
+        "update",
+        "modify",
+        "delete",
+        "remove",
+        "move",
+        "rename",
+        "copy",
+        "debug",
+        "deploy",
+        "migrate",
+        "upgrade",
+        "setup",
+        "generate",
+        "project",
+        "app",
+        "application",
+        "component",
+        "function",
+        "class",
+        "module",
+        "file",
+        "folder",
+        "directory",
+        "code",
+        "script",
+        "bug",
+        "error",
+        "issue",
+        "fail",
+        "broken",
+        "crash",
+        "react",
+        "vue",
+        "angular",
+        "node",
+        "python",
+        "rust",
+        "typescript",
+        "javascript",
+        "html",
+        "css",
+        "sql",
+        "api",
+        "rest",
+        "graphql",
     ];
     for kw in &keywords {
         if word_contains(lower.as_str(), kw) {
@@ -339,13 +400,6 @@ struct SubResult {
     chars: u64,
 }
 
-/// Whether an agent-mode run should short-circuit to a canned greeting reply
-/// instead of burning a model round-trip. Plan and decompose phases always run
-/// for real; only ordinary (flat) agent turns on trivial small talk qualify.
-fn should_shortcut_smalltalk(request: &AgentTaskRequest) -> bool {
-    !request.plan_mode && !request.decompose && super::smalltalk::is_smalltalk(&request.prompt)
-}
-
 /// Pool version of the agent loop: the caller holds an [`EnginePool`]
 /// (several worker threads, each owning its own generator) instead of one
 /// `&mut dyn TextGenerator`. Sequential phases use a handle to worker 0; a
@@ -429,53 +483,6 @@ pub fn run_agent_loop_pool(
     }
 
     let started = Instant::now();
-
-    // Greeting short-circuit: skip the model/tool round-trip for trivial small
-    // talk in agent mode, answering with a canned reply (mirrors the plain-chat
-    // path in `stream_inference`). Planner/decompose modes always run for real.
-    if should_shortcut_smalltalk(request) {
-        let reply = super::smalltalk::reply_for(&request.prompt);
-        let _ = tx.send(WorkerEvent::Token {
-            session_id,
-            delta: reply.clone(),
-        });
-        let _ = tx.send(WorkerEvent::Done {
-            session_id,
-            done: InferenceDone {
-                total_tokens: 0,
-                generated_chars: reply.chars().count() as u64,
-                tokens_per_sec: 0.0,
-                elapsed_ms: 0,
-                stop_reason: "completed".to_string(),
-                outcome: "completed".to_string(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        });
-        crate::logging::info(
-            Some(session_id),
-            "llm.smalltalk",
-            "agent-mode greeting short-circuited; no model round-trip",
-        );
-        return Ok(AgentOutcome {
-            done: InferenceDone {
-                total_tokens: 0,
-                generated_chars: reply.chars().count() as u64,
-                tokens_per_sec: 0.0,
-                elapsed_ms: 0,
-                stop_reason: "completed".to_string(),
-                outcome: "completed".to_string(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        });
-    }
 
     let mut total_tokens = 0u64;
     let mut input_tokens = 0u64;
@@ -989,6 +996,35 @@ fn finish_outcome(
 /// delegation (plan-item loops run focused on one worker). `is_child` marks a
 /// loop already running INSIDE a subagent — children are not nudged about the
 /// parent's todo list.
+fn emit_run_trace(
+    app: &ToolContext,
+    tool_state: &ToolState,
+    session_id: u64,
+    step_index: usize,
+    group: String,
+    tools: Vec<String>,
+    duration_ms: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    outcome: &str,
+) {
+    let event = RunTraceEvent {
+        session_id,
+        step_index,
+        group,
+        tools,
+        duration_ms,
+        tokens_in,
+        tokens_out,
+        outcome: outcome.to_string(),
+        timestamp_ms: now_ms(),
+    };
+    // Record into the bounded per-session store (P3.2) before emitting so the
+    // HTTP trace endpoint can serve a run even with no UI attached.
+    tool_state.record_trace(event.clone());
+    let _ = app.emit("agent://run-trace", event);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_focused_steps(
     gen: &mut dyn TextGenerator,
@@ -1032,11 +1068,35 @@ pub(crate) fn run_focused_steps(
     // tail and re-append the original request *after* the steer.
     let mut steer_tail: Option<String> = None;
 
+    // Completed-step telemetry for `agent://run-trace`, deferred until the next
+    // loop iteration (or loop exit) so the wall-clock duration covers the whole
+    // step including tool dispatch.
+    let mut last_step_trace: Option<(usize, String, Vec<String>, u64, u64, Instant, &'static str)> =
+        None;
+
     'steps: for step in 0..max_steps {
         if interrupt.is_cancelled() {
             final_reason = "cancelled".to_string();
             break;
         }
+
+        if let Some((trace_step, trace_group, trace_tools, tin, tout, started, outcome)) =
+            last_step_trace.take()
+        {
+            emit_run_trace(
+                app,
+                tool_state,
+                session_id,
+                trace_step,
+                trace_group,
+                trace_tools,
+                started.elapsed().as_millis() as u64,
+                tin,
+                tout,
+                outcome,
+            );
+        }
+        let step_started = Instant::now();
 
         // Reset per-step auto-checkpoint flag so the first file edit
         // in this step creates a checkpoint automatically.
@@ -1107,7 +1167,6 @@ pub(crate) fn run_focused_steps(
         if dropped > 0 {
             let half = messages.len() / 2;
             if dropped > half {
-        
                 let _ = app.emit(
                     "agent://context-trimmed",
                     ContextTrimmedEvent {
@@ -1134,6 +1193,16 @@ pub(crate) fn run_focused_steps(
             max_tokens: request.max_tokens.max(1),
             stop_words: request.stop_words.clone(),
             cached_prefix_tokens: prev_prompt_tokens,
+            // Native tool catalog for providers with a real tool channel. The
+            // local llama.cpp generator ignores it (it reads `<execute_tool>`
+            // markdown), and remote generators fold any returned `tool_calls`
+            // back into that same shape, so one dispatch path serves both.
+            tools: native_tool_catalog(
+                &*gen,
+                is_child,
+                request.agent_mode.as_deref(),
+                request.workflow.as_deref(),
+            ),
             ..Default::default()
         };
 
@@ -1169,6 +1238,23 @@ pub(crate) fn run_focused_steps(
                 tool_calls: step_tool_count,
             },
         });
+
+        let step_calls: Vec<String> = {
+            let text = outcome.full_text.clone();
+            parse_tool_calls(&text, &mut |_| {})
+                .into_iter()
+                .map(|c| c.name().to_string())
+                .collect()
+        };
+        last_step_trace = Some((
+            step + 1,
+            group.to_string(),
+            step_calls,
+            outcome.done.input_tokens,
+            outcome.done.total_tokens,
+            step_started,
+            "completed",
+        ));
 
         let text = outcome.full_text.trim().to_string();
         if text.is_empty() {
@@ -1216,21 +1302,14 @@ pub(crate) fn run_focused_steps(
         if let Some(reason) = extract_hitl_gate(&text) {
             let call_refs: Vec<&ToolCall> = calls.iter().collect();
             let approved = rt.block_on(tools::hitl_gate(
-                tool_state,
-                app,
-                session_id,
-                &reason,
-                &call_refs,
+                tool_state, app, session_id, &reason, &call_refs,
             ))?;
             if !approved {
                 let actions: Vec<String> = calls.iter().map(|c| c.summary()).collect();
                 let listed = if actions.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        " (blocked actions: {})",
-                        actions.join("; ")
-                    )
+                    format!(" (blocked actions: {})", actions.join("; "))
                 };
                 messages.push(ContextMessage {
                     role: "tool".into(),
@@ -1251,10 +1330,8 @@ pub(crate) fn run_focused_steps(
         if !calls.is_empty() && is_refusal(&text) {
             // Model refused but still emitted tool calls — keep the tool calls,
             // strip the refusal text from the assistant message.
-            let refusal_stripped: Vec<&str> = text
-                .lines()
-                .filter(|line| !is_refusal(line))
-                .collect();
+            let refusal_stripped: Vec<&str> =
+                text.lines().filter(|line| !is_refusal(line)).collect();
             let cleaned = refusal_stripped.join("\n");
             let mut assistant_msg = if cleaned.trim().is_empty() {
                 // All lines were refusals — just use the tool call portion
@@ -1270,7 +1347,9 @@ pub(crate) fn run_focused_steps(
                 content: assistant_msg,
                 pinned: false,
             });
-        } else if calls.is_empty() && is_refusal(&text) && step == 0
+        } else if calls.is_empty()
+            && is_refusal(&text)
+            && step == 0
             && tool_use_enforcements < MAX_TOOL_USE_ENFORCEMENT
         {
             // Model refused with no tool calls on first step — re-prompt
@@ -1486,6 +1565,15 @@ pub(crate) fn run_focused_steps(
             let denied: Vec<Option<ToolResult>> = calls
                 .iter()
                 .map(|call| {
+                    if let Some(reason) =
+                        ask_mode_tool_verdict(request.agent_mode.as_deref(), call.name())
+                    {
+                        return Some(ToolResult::err(
+                            call.name(),
+                            "ask-mode restriction".into(),
+                            reason,
+                        ));
+                    }
                     if let Some(mode) = request.agent_mode.as_ref() {
                         if !subagent::tool_allowed(mode, call.name()) {
                             return Some(ToolResult::err(
@@ -1501,8 +1589,7 @@ pub(crate) fn run_focused_steps(
                         }
                     }
                     if let Some(wf) = request.workflow.as_ref() {
-                        if let Some(reason) =
-                            subagent::workflow_child_tool_verdict(wf, call.name())
+                        if let Some(reason) = subagent::workflow_child_tool_verdict(wf, call.name())
                         {
                             return Some(ToolResult::err(
                                 call.name(),
@@ -1520,8 +1607,10 @@ pub(crate) fn run_focused_steps(
                 let chunk = &calls[start..(start + batch).min(calls.len())];
                 let chunk_results: Vec<Result<ToolResult, String>> = if any_denied {
                     rt.block_on(async {
-                        let mut out =
-                            vec![Ok(ToolResult::err("", String::new(), String::new())); chunk.len()];
+                        let mut out = vec![
+                            Ok(ToolResult::err("", String::new(), String::new()));
+                            chunk.len()
+                        ];
                         let mut futs: Vec<_> = Vec::new();
                         let mut slots: Vec<usize> = Vec::new();
                         for (j, call) in chunk.iter().enumerate() {
@@ -1529,7 +1618,12 @@ pub(crate) fn run_focused_steps(
                                 Some(d) => out[j] = Ok(d.clone()),
                                 None => {
                                     slots.push(j);
-                                    futs.push(tools::dispatch(app, tool_state, call, interrupt.clone()));
+                                    futs.push(tools::dispatch(
+                                        app,
+                                        tool_state,
+                                        call,
+                                        interrupt.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -1588,6 +1682,9 @@ pub(crate) fn run_focused_steps(
         // self-heal / stuck budget; any success resets the streak.
         if failed_in_step == calls.len() {
             consecutive_failed_steps += 1;
+            if let Some(trace) = last_step_trace.as_mut() {
+                trace.6 = "failed";
+            }
             if consecutive_failed_steps >= MAX_CONSECUTIVE_FAILED_STEPS {
                 final_reason = "stuck".to_string();
                 break;
@@ -1611,14 +1708,28 @@ pub(crate) fn run_focused_steps(
                 .first()
                 .cloned()
                 .unwrap_or_default();
-            match run_background_verify(rt, &workspace, &edited_files) {
-                Some(report) => messages.push(ContextMessage {
-                    role: "system".into(),
-                    content: format!(
-                        "VERIFY results (background lint/typecheck after your edits):\n{report}"
-                    ),
-                    pinned: false,
-                }),
+            match run_background_verify(rt, &workspace, &edited_files, Some(&tool_state.lsp)) {
+                Some(result) => {
+                    let _ = app.emit(
+                        "agent://verify-result",
+                        crate::agent::VerifyResultEvent {
+                            session_id,
+                            ok: result.ok,
+                            command: result.command.clone(),
+                            exit_code: result.exit_code,
+                            output: result.report.clone(),
+                            timestamp_ms: now_ms(),
+                        },
+                    );
+                    messages.push(ContextMessage {
+                        role: "system".into(),
+                        content: format!(
+                            "VERIFY results (background lint/typecheck after your edits):\n{}",
+                            result.report
+                        ),
+                        pinned: false,
+                    })
+                }
                 None => messages.push(ContextMessage {
                     role: "system".into(),
                     content: "You just modified files. Run the relevant tests / typecheck \
@@ -1638,6 +1749,28 @@ pub(crate) fn run_focused_steps(
                 pinned: false,
             });
         }
+    }
+
+    if let Some((trace_step, trace_group, trace_tools, tin, tout, started, outcome)) =
+        last_step_trace.take()
+    {
+        let outcome = if final_reason == "cancelled" {
+            "cancelled"
+        } else {
+            outcome
+        };
+        emit_run_trace(
+            app,
+            tool_state,
+            session_id,
+            trace_step,
+            trace_group,
+            trace_tools,
+            started.elapsed().as_millis() as u64,
+            tin,
+            tout,
+            outcome,
+        );
     }
 
     Ok(FocusOutcome {
@@ -1706,7 +1839,6 @@ fn emit_tool_event(
     duration_ms: Option<u64>,
     detail: Option<String>,
 ) {
-    
     let _ = app.emit(
         "agent://tool-event",
         AgentToolEvent {
@@ -1716,6 +1848,7 @@ fn emit_tool_event(
             summary: summary.to_string(),
             started_at,
             duration_ms,
+            exit_code: None,
             detail,
             session_id: state.session_id.load(std::sync::atomic::Ordering::SeqCst),
         },
@@ -1798,6 +1931,10 @@ fn run_subagents(
 
     // ---- running cards + chips for everything that will attempt to start.
     for (i, call) in task_calls.iter().enumerate() {
+        let profile_name = match &jobs[i] {
+            Job::Ready { profile, .. } => profile.name.as_ref(),
+            Job::Failed(_) => "unknown",
+        };
         emit_tool_event(
             app,
             tool_state,
@@ -1807,6 +1944,19 @@ fn run_subagents(
             started_at,
             None,
             None,
+        );
+        app.emit(
+            "agent://subagent-run",
+            SubagentRunEvent {
+                parent_session_id: session_id,
+                child_session_id: None,
+                profile: profile_name.to_string(),
+                status: "started".into(),
+                summary: Some(short_label(&call.summary(), SUBAGENT_TITLE_CHARS)),
+                started_at,
+                duration_ms: None,
+                leased_workers: tool_state.leased_workers.lock().unwrap().len().into(),
+            },
         );
     }
 
@@ -1980,6 +2130,23 @@ fn run_subagents(
             Some(result.duration_ms),
             result.error.clone(),
         );
+        let profile_name = match &jobs[i] {
+            Job::Ready { profile, .. } => profile.name.as_ref(),
+            Job::Failed(_) => "unknown",
+        };
+        app.emit(
+            "agent://subagent-run",
+            SubagentRunEvent {
+                parent_session_id: session_id,
+                child_session_id: None,
+                profile: profile_name.to_string(),
+                status: if ok { "completed" } else { "error" }.into(),
+                summary: Some(short_label(&result.summary, SUBAGENT_TITLE_CHARS)),
+                started_at,
+                duration_ms: Some(result.duration_ms),
+                leased_workers: tool_state.leased_workers.lock().unwrap().len().into(),
+            },
+        );
         tools::audit(
             tool_state,
             primary_ws,
@@ -2053,6 +2220,16 @@ impl TextGenerator for SubGen {
         }
     }
 
+    /// Must delegate: without this the default `false` would suppress the
+    /// native tool catalog for a `Remote` child even though its underlying
+    /// provider has a real tool channel.
+    fn supports_native_tools(&self) -> bool {
+        match self {
+            SubGen::Pool(g) => g.supports_native_tools(),
+            SubGen::Remote(g) => g.supports_native_tools(),
+        }
+    }
+
     fn generate(
         &mut self,
         request: &InferenceRequest,
@@ -2065,6 +2242,35 @@ impl TextGenerator for SubGen {
             SubGen::Remote(g) => g.generate(request, session_id, interrupt, tx),
         }
     }
+}
+
+/// The native `tools` payload to send, or `None` for local generators.
+///
+/// Only backends with a real tool channel get a catalog — the local path
+/// already has its tools inlined in the system prompt and parses
+/// `<execute_tool>` markdown, so nothing about it changes. The allow-list comes
+/// from the same predicate the dispatch gate uses (the child's profile when
+/// running as a subagent, otherwise the active mode + workflow), so a remote
+/// model is never offered a tool its own dispatch would deny.
+fn native_tool_catalog(
+    gen: &dyn TextGenerator,
+    is_child: bool,
+    mode: Option<&str>,
+    workflow: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    if !gen.supports_native_tools() {
+        return None;
+    }
+    let names = if is_child {
+        match subagent::current_profile() {
+            Some(profile) => subagent::child_allowed_tools(&profile),
+            None => subagent::parent_allowed_tools(mode, workflow),
+        }
+    } else {
+        subagent::parent_allowed_tools(mode, workflow)
+    };
+    let tools = crate::agent::registry::openai_tool_schemas(&names);
+    (!tools.is_empty()).then_some(tools)
 }
 
 /// Build a specialised generator for a `modelOverride` when it names a
@@ -2087,7 +2293,10 @@ fn subgen_for_override(
             crate::logging::info(
                 None,
                 "subagent.multimodel",
-                &format!("modelOverride `{name}` routed to remote provider `{}`.", provider.id),
+                &format!(
+                    "modelOverride `{name}` routed to remote provider `{}`.",
+                    provider.id
+                ),
             );
             Ok(Some(SubGen::Remote(Box::new(gen))))
         }
@@ -2152,7 +2361,10 @@ fn drive_subagent(
         Some(ref m) => format!("\nNote: the parent requested this subagent run on model `{m}`."),
         None => match subagent::current_mode_model_override() {
             Some(ref m) => {
-                format!("\nNote: the `{}` mode requires running on model `{m}`.", profile.name)
+                format!(
+                    "\nNote: the `{}` mode requires running on model `{m}`.",
+                    profile.name
+                )
             }
             None => String::new(),
         },
@@ -2550,7 +2762,6 @@ fn emit_plan_step(
     status: &str,
     error: Option<&str>,
 ) {
-    
     let _ = app.emit(
         "agent://plan-step",
         PlanStepEvent {
@@ -2579,28 +2790,27 @@ fn plan_subtasks(
     working_budget: usize,
     tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<Option<Vec<Subtask>>, String> {
-// Stage-3 compaction before the stage-2 eviction pass below.
-        if summarize_old_block(gen, interrupt, tx, session_id, messages) {
-            crate::logging::info(
-                Some(session_id),
-                "llm.summarize",
-                "pre-decompose history compacted",
-            );
-        }
-        let dropped = trim_working_history(messages, working_budget, &tokenizer);
-        if dropped > messages.len() / 2 {
-    
-            let _ = app.emit(
-                "agent://context-trimmed",
-                ContextTrimmedEvent {
-                    session_id,
-                    dropped,
-                    remaining: messages.len(),
-                },
-            );
-        }
-        let mut prompt = build_prompt(messages, &request.prompt);
-        const DECOMPOSE_INSTRUCTION: &str =
+    // Stage-3 compaction before the stage-2 eviction pass below.
+    if summarize_old_block(gen, interrupt, tx, session_id, messages) {
+        crate::logging::info(
+            Some(session_id),
+            "llm.summarize",
+            "pre-decompose history compacted",
+        );
+    }
+    let dropped = trim_working_history(messages, working_budget, &tokenizer);
+    if dropped > messages.len() / 2 {
+        let _ = app.emit(
+            "agent://context-trimmed",
+            ContextTrimmedEvent {
+                session_id,
+                dropped,
+                remaining: messages.len(),
+            },
+        );
+    }
+    let mut prompt = build_prompt(messages, &request.prompt);
+    const DECOMPOSE_INSTRUCTION: &str =
         "## Decomposition\nBreak the user's request into a JSON array of independent \
          subtasks, exactly this shape:\n[{\"title\": \"short title\", \"instruction\": \
          \"single self-contained directive\"}]\nEach instruction must be small enough to \
@@ -2650,28 +2860,27 @@ fn run_summary(
     working_budget: usize,
     tokenizer: Option<tokenizers::Tokenizer>,
 ) -> Result<FocusOutcome, String> {
-// Stage-3 compaction before the stage-2 eviction pass below.
-        if summarize_old_block(gen, interrupt, tx, session_id, messages) {
-            crate::logging::info(
-                Some(session_id),
-                "llm.summarize",
-                "pre-summary history compacted",
-            );
-        }
-        let dropped = trim_working_history(messages, working_budget, &tokenizer);
-        if dropped > messages.len() / 2 {
-    
-            let _ = app.emit(
-                "agent://context-trimmed",
-                ContextTrimmedEvent {
-                    session_id,
-                    dropped,
-                    remaining: messages.len(),
-                },
-            );
-        }
-        let mut prompt = build_prompt(messages, &request.prompt);
-        const SUMMARY_INSTRUCTION: &str =
+    // Stage-3 compaction before the stage-2 eviction pass below.
+    if summarize_old_block(gen, interrupt, tx, session_id, messages) {
+        crate::logging::info(
+            Some(session_id),
+            "llm.summarize",
+            "pre-summary history compacted",
+        );
+    }
+    let dropped = trim_working_history(messages, working_budget, &tokenizer);
+    if dropped > messages.len() / 2 {
+        let _ = app.emit(
+            "agent://context-trimmed",
+            ContextTrimmedEvent {
+                session_id,
+                dropped,
+                remaining: messages.len(),
+            },
+        );
+    }
+    let mut prompt = build_prompt(messages, &request.prompt);
+    const SUMMARY_INSTRUCTION: &str =
         "## Final summary\nWrite a concise plain-text final report of everything \
          accomplished in this task: files created or edited (with paths), commands run, \
          and verification results. Do NOT call any tools; output plain text only.";
@@ -2798,7 +3007,8 @@ fn maybe_extract_memory(
                 "memory.extract",
                 &format!("extraction generation failed: {e}"),
             );
-        }) else {
+        })
+    else {
         return;
     };
     let text = outcome.full_text.trim();
@@ -2916,7 +3126,10 @@ fn trim_working_history(
     compress_large_messages(messages, super::context::COMPACT_DEFAULT_MAX_CHARS);
     let initial = messages.len();
     while messages.len() > 1 {
-        let total: usize = messages.iter().map(|m| tok_count(tokenizer, &m.content)).sum();
+        let total: usize = messages
+            .iter()
+            .map(|m| tok_count(tokenizer, &m.content))
+            .sum();
         if total <= budget {
             break;
         }
@@ -2984,7 +3197,8 @@ fn summarize_old_block(
     session_id: u64,
     messages: &mut Vec<ContextMessage>,
 ) -> bool {
-    let Some((start, len, src)) = oldest_unpinned_block(messages, SUMMARY_BLOCK_MAX_MSGS, SUMMARY_BLOCK_MAX_CHARS)
+    let Some((start, len, src)) =
+        oldest_unpinned_block(messages, SUMMARY_BLOCK_MAX_MSGS, SUMMARY_BLOCK_MAX_CHARS)
     else {
         return false;
     };
@@ -3022,9 +3236,7 @@ fn summarize_old_block(
     if summary.chars().count() < 32 {
         return false;
     }
-    let content = format!(
-        "## Summarized history ({len} earlier messages)\n{summary}",
-    );
+    let content = format!("## Summarized history ({len} earlier messages)\n{summary}",);
     messages.splice(
         start..start + len,
         std::iter::once(ContextMessage {
@@ -3078,6 +3290,7 @@ fn build_prompt(messages: &[ContextMessage], user_prompt: &str) -> String {
             "system" => ("## System instructions", &m.content),
             "context" => ("## Active file contents", &m.content),
             "rules" => ("## Project rules", &m.content),
+            "hooks" => ("## Session hook output", &m.content),
             "skill" => ("## Skill instructions", &m.content),
             "plan" => ("## Approved plan", &m.content),
             "user" => ("## User", &m.content),
@@ -3142,90 +3355,64 @@ fn run_background_verify(
     rt: &tokio::runtime::Runtime,
     workspace: &std::path::Path,
     edited_files: &[String],
-) -> Option<String> {
-    let (program, args) = verify_command(workspace, edited_files)?;
-    Some(rt.block_on(run_verify_capture(program, args, workspace)))
-}
-
-/// Decide the verify program + args for the edited files, or `None` when the
-/// workspace lacks the corresponding manifest / toolchain marker.
-fn verify_command(
-    workspace: &std::path::Path,
-    edited_files: &[String],
-) -> Option<(&'static str, Vec<String>)> {
-    let has_rs = edited_files.iter().any(|p| p.ends_with(".rs"));
-    let has_ts = edited_files.iter().any(|p| {
-        p.ends_with(".ts") || p.ends_with(".tsx") || p.ends_with(".js") || p.ends_with(".jsx")
-    });
-    let has_py = edited_files.iter().any(|p| p.ends_with(".py"));
-
-    if has_rs && workspace.join("Cargo.toml").is_file() {
-        Some(("cargo", vec!["check".into()]))
-    } else if has_ts && workspace.join("tsconfig.json").is_file() {
-        Some(("npx", vec!["tsc".into(), "--noEmit".into()]))
-    } else if has_py {
-        let mut args = vec!["-m".into(), "py_compile".into()];
-        args.extend(edited_files.iter().cloned());
-        Some(("python", args))
-    } else {
-        None
-    }
-}
-
-/// Run `program args` in `workspace` with a short timeout and capture output,
-/// returning a flat text report. Every failure mode (spawn error, timeout,
-/// non-zero exit) is represented as text — this never propagates an error.
-async fn run_verify_capture(
-    program: &str,
-    args: Vec<String>,
-    workspace: &std::path::Path,
-) -> String {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(&args)
-        .current_dir(workspace)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let timeout = std::time::Duration::from_secs(60);
-    let output = match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            return format!("could not start `{program}` (is it installed?): {e}");
-        }
-        Err(_) => return format!("`{program}` timed out after {timeout:?}"),
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let success = output.status.success();
-    let mut report = format!(
-        "ran `{program} {}` (exit {})",
-        args.join(" "),
-        output.status.code().unwrap_or(-1)
-    );
-    if !stdout.is_empty() {
-        report.push_str("\n--- stdout ---\n");
-        report.push_str(&truncate(&stdout, TOOL_FEEDBACK_LIMIT));
-    }
-    if !stderr.is_empty() {
-        report.push_str("\n--- stderr ---\n");
-        report.push_str(&truncate(&stderr, TOOL_FEEDBACK_LIMIT));
-    }
-    report.push_str(if success {
-        "\n(no errors detected)"
-    } else {
-        "\n(verify found errors/warnings — see above)"
-    });
-    report
+    lsp: Option<&std::sync::Arc<crate::lsp::LspManager>>,
+) -> Option<crate::agent::verify::VerifyRun> {
+    rt.block_on(crate::agent::verify::run(workspace, edited_files, lsp))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_mode_hard_gate_denies_mutation_tools() {
+        // Ask mode: anything outside the read-only default-allow set is denied.
+        for t in [
+            "write_file",
+            "execute_terminal_command",
+            "apply_diff",
+            "download_file",
+            "calculate",
+        ] {
+            assert!(
+                ask_mode_tool_verdict(Some("ask"), t).is_some(),
+                "{t} must be denied in ask"
+            );
+        }
+        // Read-only tools pass.
+        for t in [
+            "read_file_range",
+            "git_diff",
+            "glob_search_codebase",
+            "list_dir",
+            "run_tests",
+        ] {
+            assert!(
+                ask_mode_tool_verdict(Some("ask"), t).is_none(),
+                "{t} must be allowed in ask"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_mode_hard_gate_only_applies_to_ask() {
+        for mode in [
+            None,
+            Some("agent"),
+            Some("edit"),
+            Some("plan"),
+            Some("explore"),
+        ] {
+            for t in ["write_file", "execute_terminal_command"] {
+                assert!(
+                    ask_mode_tool_verdict(mode, t).is_none(),
+                    "{t} must pass for mode {mode:?}"
+                );
+            }
+        }
+        // Case/whitespace-insensitive.
+        assert!(ask_mode_tool_verdict(Some("  Ask "), "write_file").is_some());
+    }
 
     #[test]
     fn fanout_caps_parallel_batches_and_falls_back_sequential_over_budget() {
@@ -3338,7 +3525,9 @@ mod tests {
         // untouched.
         let n = compress_large_messages(&mut msgs, 1000);
         assert_eq!(n, 1, "exactly one oversized message compressed");
-        assert!(msgs[0].content.contains("[Content compressed: 2000 → 1000 chars"));
+        assert!(msgs[0]
+            .content
+            .contains("[Content compressed: 2000 → 1000 chars"));
         assert!(msgs[0].content.starts_with("AAA") && msgs[0].content.ends_with("AAA"));
         assert_eq!(msgs[1].content, "S".repeat(2000), "system prompt untouched");
         assert_eq!(msgs[2].content, "short");
@@ -3483,44 +3672,16 @@ mod tests {
         ];
         let interrupt = tokio_util::sync::CancellationToken::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs);        assert!(ok, "summary generation returns true");
+        let ok = summarize_old_block(&mut FakeGen, &interrupt, &tx, 1, &mut msgs);
+        assert!(ok, "summary generation returns true");
         // The two oldest unpinned turns collapse into one pinned system summary.
         assert_eq!(msgs.len(), 3);
         assert!(msgs[1].pinned);
-        assert!(msgs[1].content.contains("Summarized history (2 earlier messages)"));
+        assert!(msgs[1]
+            .content
+            .contains("Summarized history (2 earlier messages)"));
         assert!(msgs[1].content.contains("src/lib/ipc.ts"));
         assert_eq!(msgs[2].content, "latest");
-    }
-
-    #[test]
-    fn smalltalk_shortcut_guards_modes_and_greetings() {
-        let base = || AgentTaskRequest {
-            prompt: "hi".into(),
-            max_tokens: 2048,
-            max_steps: None,
-            stop_words: None,
-            plan_mode: false,
-            verify: false,
-            decompose: false,
-            token_budget: None,
-            agent_mode: None,
-            workflow: None,
-            images: None,
-            ..Default::default()
-        };
-        assert!(should_shortcut_smalltalk(&base()), "greeting qualifies");
-
-        let mut plan = base();
-        plan.plan_mode = true;
-        assert!(!should_shortcut_smalltalk(&plan), "plan mode runs for real");
-
-        let mut dec = base();
-        dec.decompose = true;
-        assert!(!should_shortcut_smalltalk(&dec), "decompose runs for real");
-
-        let mut task = base();
-        task.prompt = "refactor the auth module".into();
-        assert!(!should_shortcut_smalltalk(&task), "real task reaches the model");
     }
 
     #[test]
