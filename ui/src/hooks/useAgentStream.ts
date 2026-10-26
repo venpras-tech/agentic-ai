@@ -22,6 +22,13 @@ import {
   type ExecutionGraphAction,
 } from "../lib/execGraph";
 import type { LiveToolState } from "../components/MessageList";
+import {
+  formatToolCallTag,
+  stripChatTags,
+  stripExecuteToolTags,
+  upsertToolCallInContent,
+} from "../lib/chatParse";
+import { clearStreamTargetTurnId } from "../lib/streamTarget";
 
 /** A blocking `ask_question` from the agent. */
 export interface QuestionRequest {
@@ -82,12 +89,112 @@ let activeTurnId = "";
  */
 let activeChatId: string | null = null;
 
+/**
+ * Backend session id of the run the UI is currently rendering. Every engine
+ * event carries the id of the run that produced it, but the subscription is
+ * process-wide: a run left over from a previous chat (or a detached run) keeps
+ * emitting after the transcript has been cleared. Without this filter a stale
+ * `inference-done` would flip the *new* bubble to finished and a stale
+ * `inference-token` would write the old reply into the new chat. `0` means "no
+ * run owned by this view" — events are still applied so an externally started
+ * run (e.g. the HTTP API) remains visible.
+ */
+let activeSessionId = 0;
+
+/**
+ * Set while a send is between "I am about to start a run" and "the invoke
+ * returned the run's session id". Engine events emitted synchronously during
+ * the invoke (the backend emits `inference-started` before returning) arrive
+ * before the caller knows the id, so the first such event adopts the run for
+ * this view instead of being dropped as a foreign session.
+ */
+let sessionClaimPending = false;
+
+/**
+ * Set once this view has explicitly taken ownership of a run (a send or a
+ * topic-changing navigation). While set and no run is claimed, foreign events
+ * are rejected: after "New chat" the previous run may still be flushing its
+ * final `inference-done`, and accepting it would mark the fresh transcript
+ * finished. A view that never took ownership accepts events from runs started
+ * elsewhere (e.g. the HTTP API).
+ */
+let sessionOwned = false;
+
 export function setActiveTurnId(turnId: string): void {
   activeTurnId = turnId;
 }
 
 export function setActiveChatId(chatId: string | null): void {
   activeChatId = chatId;
+}
+
+/**
+ * Declare that this view is about to start a run, so events arriving before the
+ * invoke resolves are attributed to it. Must be paired with
+ * [`setActiveSessionId`] once the session id is known.
+ */
+export function claimNextSession(): void {
+  sessionClaimPending = true;
+  sessionOwned = true;
+}
+
+/**
+ * Claim the engine events of `sessionId` for the current view. Called as soon
+ * as a send returns its session id (and reset to `0` when the transcript is
+ * replaced), so events from any other run are ignored.
+ */
+export function setActiveSessionId(sessionId: number): void {
+  activeSessionId = sessionId;
+  sessionClaimPending = false;
+  sessionOwned = true;
+}
+
+/** Release the current view's ownership of engine events (new chat, reload).
+ *  Foreign events stay rejected until the next claim adopts a run. */
+export function clearActiveSession(): void {
+  activeSessionId = 0;
+  sessionClaimPending = false;
+  sessionOwned = true;
+}
+
+/** Does an engine event belong to the run this view is rendering? A pending
+ *  claim adopts the first arriving event; once a run is claimed only that run
+ *  is accepted. A view that owns a transcript but has not yet claimed a run
+ *  rejects foreign events, so a stale run cannot write into a fresh chat. */
+export function isActiveSession(sessionId: unknown): boolean {
+  const id = Number(sessionId);
+  if (sessionClaimPending) {
+    // Adopt this run: the first event after a claim is the run we started.
+    activeSessionId = id;
+    sessionClaimPending = false;
+    return true;
+  }
+  if (!activeSessionId) return !sessionOwned;
+  return id === activeSessionId;
+}
+
+/** Release ownership entirely (used by tests and a hard reset). */
+export function resetActiveSession(): void {
+  activeSessionId = 0;
+  sessionClaimPending = false;
+  sessionOwned = false;
+}
+
+/**
+ * In-flight abort started by "New chat" / a cancel click. `abort_agent_execution`
+ * triggers the shared circuit breaker asynchronously, so arming a new run before
+ * it lands can cancel that *new* run instead of the old one. A send awaits this
+ * promise first, guaranteeing the abort targets the previous run.
+ */
+let pendingAbort: Promise<unknown> = Promise.resolve();
+
+export function trackAbort(promise: Promise<unknown>): void {
+  pendingAbort = promise.catch(() => {});
+}
+
+/** Resolve once any abort already in flight has reached the backend. */
+export function awaitPendingAbort(): Promise<void> {
+  return pendingAbort.then(() => undefined);
 }
 
 /** Re-dispatch an applied/updated edit batch as a DOM event so panes outside
@@ -169,6 +276,7 @@ export function useAgentStream() {
   const [stage, setStage] = useState<AgentStageState>(IDLE_STAGE);
   const [execGraph, dispatchExecGraph] = useReducer(execGraphReducer, emptyExecutionGraph);
   const runTraceRef = useRef<RunTrace[]>([]);
+  const streamingBufferRef = useRef("");
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const projectRef = useRef(projectPath);
@@ -236,14 +344,20 @@ export function useAgentStream() {
         onToken: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           const delta =
             (data as { delta?: string }).delta ?? (data as { content?: string }).content;
-          if (delta) h.updateLastMessage({ content: (c) => (c || "") + delta });
+          if (delta) {
+            streamingBufferRef.current += delta;
+            h.updateLastMessage({ content: (c) => (c || "") + delta });
+          }
           h.pushStage({ type: "token" });
         },
-        onStarted: () => {
+        onStarted: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
+          streamingBufferRef.current = "";
           h.setProcessing(true);
           h.setLiveTools({});
           h.dispatchGraph({ type: "reset" });
@@ -253,12 +367,14 @@ export function useAgentStream() {
         onPromptEval: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           const tokens = Number((data as { promptTokens?: number }).promptTokens) || 0;
           h.pushStage({ type: "prompt", tokens });
         },
         onDone: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           h.setProcessing(false);
           h.pushStage({ type: "done" });
           const d = data as {
@@ -274,17 +390,43 @@ export function useAgentStream() {
           const done = d.done || {};
           h.updateLastMessage({ streaming: false, done });
           const last = messagesRef.current[messagesRef.current.length - 1];
-          if (last?.role === "assistant" && (last.content || "").trim()) {
-            void api.contextPushTurn("assistant", last.content).catch(() => {});
+          let assistantText = (
+            streamingBufferRef.current ||
+            last?.content ||
+            ""
+          ).trim();
+          streamingBufferRef.current = "";
+          let persistContent = assistantText;
+          if (last?.role === "assistant") {
+            const snapshot = (
+              messagesRef.current[messagesRef.current.length - 1]?.content ||
+              assistantText
+            ).trim();
+            const forContext = stripChatTags(snapshot).trim();
+            const forDisplay = stripExecuteToolTags(snapshot).trim();
+            if (forDisplay) {
+              assistantText = forContext;
+              persistContent = forDisplay;
+              if (forDisplay !== snapshot) {
+                h.updateLastMessage({ content: forDisplay });
+              }
+            } else if ((done.outputTokens ?? 0) > 0) {
+              persistContent =
+                "The model finished but returned no visible text. Try Ask mode, a larger model, or an external agent backend.";
+              assistantText = persistContent;
+              h.updateLastMessage({ content: persistContent });
+            }
+          }
+          clearStreamTargetTurnId();
+          if (last?.role === "assistant" && persistContent) {
+            void api.contextPushTurn("assistant", assistantText).catch(() => {});
             void appendTurn(
               projectRef.current,
               {
                 role: "assistant",
-                content: last.content,
+                content: persistContent,
                 ts: Date.now(),
                 done: done as Record<string, unknown>,
-                // Distinct from the user's turn id: `session_append` dedupes by
-                // turnId, so reusing it would drop the reply as a replay.
                 turnId: activeTurnId ? assistantTurnId(activeTurnId) : undefined,
               },
               activeChatId,
@@ -305,8 +447,11 @@ export function useAgentStream() {
         onError: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           h.setProcessing(false);
           h.pushStage({ type: "error" });
+          streamingBufferRef.current = "";
+          clearStreamTargetTurnId();
           const msg = (data as { message?: string }).message || "Agent error";
           h.addActivity(msg, "error");
           h.updateLastMessage({
@@ -314,9 +459,10 @@ export function useAgentStream() {
             content: (c) => `${c ? `${c}\n` : ""}\`\`\`error\n${msg}\n\`\`\``,
           });
         },
-        onAborted: () => {
+        onAborted: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           h.setProcessing(false);
           h.pushStage({ type: "done" });
           h.updateLastMessage({ streaming: false });
@@ -325,6 +471,7 @@ export function useAgentStream() {
         onToolOutput: (data) => {
           const h = handlersRef.current;
           if (!h) return;
+          if (!isActiveSession((data as { sessionId?: number }).sessionId)) return;
           const d = data as { id?: string; output?: string };
           if (d.id) {
             const id = d.id;
@@ -342,9 +489,12 @@ export function useAgentStream() {
             tool?: string;
             status?: string;
             summary?: string;
+            detail?: string;
             durationMs?: number;
             exitCode?: number;
+            sessionId?: number;
           };
+          if (!isActiveSession(d.sessionId)) return;
           const label = d.tool ? d.tool : "tool";
           h.pushStage({ type: "tool", tool: d.tool, status: d.status });
           if (d.id) {
@@ -352,28 +502,53 @@ export function useAgentStream() {
             const tool = d.tool ?? "tool";
             const status = d.status ?? "running";
             const summary = d.summary ?? "";
+            const detail = d.detail ?? undefined;
+            const next: LiveToolState = {
+              id,
+              tool,
+              status,
+              summary,
+              detail,
+              durationMs: d.durationMs,
+              exitCode: d.exitCode,
+            };
             h.setLiveTools((prev) => ({
               ...prev,
               [id]: {
-                id,
-                tool,
-                status,
-                summary,
-                output: prev[id]?.output,
+                ...prev[id],
+                ...next,
+                output: detail || prev[id]?.output,
                 durationMs: d.durationMs ?? prev[id]?.durationMs,
                 exitCode: d.exitCode ?? prev[id]?.exitCode,
               },
             }));
+            if (status === "done" || status === "error") {
+              const tag = formatToolCallTag({
+                id,
+                tool,
+                status,
+                summary,
+                detail,
+                output: detail,
+                durationMs: d.durationMs ?? undefined,
+                exitCode: d.exitCode ?? undefined,
+              });
+              h.updateLastMessage({
+                content: (c) => upsertToolCallInContent(c || "", tag, id),
+              });
+            }
             const graphStatus =
               status === "done" ? "done" : status === "error" ? "error" : "running";
-            h.dispatchGraph({ type: "tool", id, name: tool, status: graphStatus, summary });
+            const graphSummary =
+              status === "error" ? detail || summary : summary;
+            h.dispatchGraph({ type: "tool", id, name: tool, status: graphStatus, summary: graphSummary });
           }
           if (d.status === "running") {
             h.addActivity(`${label} starting…`, "tool");
           } else if (d.status === "done") {
             h.addActivity(`${label} complete`, "tool");
           } else if (d.status === "error") {
-            h.addActivity(`${label} failed: ${d.summary || ""}`, "error");
+            h.addActivity(`${label} failed: ${d.detail || d.summary || ""}`, "error");
           }
         },
         onFileChanged: (data) => {
@@ -385,7 +560,8 @@ export function useAgentStream() {
         onHitlGate: (data) => {
           const h = handlersRef.current;
           if (!h) return;
-          const d = data as { requestId?: string; reason?: string };
+          const d = data as { requestId?: string; reason?: string; sessionId?: number };
+          if (!isActiveSession(d.sessionId)) return;
           if (d.requestId) {
             const reason = d.reason || "Approval required for the next action";
             h.setHitlGate((prev) =>
@@ -401,9 +577,12 @@ export function useAgentStream() {
           if (!h) return;
           const d = data as {
             step?: { step?: number; group?: string; tokens?: number; elapsedMs?: number; toolCalls?: number };
+            sessionId?: number;
           };
+          if (!isActiveSession(d.sessionId)) return;
           const s = d.step;
           if (!s) return;
+          if ((s.toolCalls ?? 0) === 0) return;
           h.pushStage({ type: "step" });
           h.dispatchGraph({ type: "step", group: s.group ?? "" });
           const label = s.group ? `${s.group} — step ${s.step ?? "?"}` : `Step ${s.step ?? "?"}`;

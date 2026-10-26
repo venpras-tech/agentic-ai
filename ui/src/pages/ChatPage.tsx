@@ -1,17 +1,15 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { useChat, useModel, useContextPane } from "../context/AppContext";
+import { useChat, useModel } from "../context/AppContext";
 import AgentChatSurface from "../components/AgentChatSurface";
+import AgentBackendPicker from "../components/AgentBackendPicker";
 import { useAgentStreamContext } from "../context/AgentStreamContext";
 import { exportConversation, ExportError, type ExportFormat } from "../lib/exportChat";
-import { workspaceSuggestions } from "../lib/emptyState";
 import "./ChatPage.css";
 
 function ChatPage() {
   const { messages } = useChat();
   const { modelName, modelProvider, modelLoading, modelLoadProgress, modelLoadStage } = useModel();
   const { liveTools } = useAgentStreamContext();
-  const { activeFile } = useContextPane();
-  const welcomeSuggestions = useMemo(() => workspaceSuggestions(activeFile), [activeFile]);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("pdf");
   const [exportToast, setExportToast] = useState<{ text: string; error?: boolean } | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -33,10 +31,6 @@ function ChatPage() {
       notify(err instanceof ExportError ? err.message : `Export failed: ${String(err)}`, true);
     }
   }, [messages, exportFormat, notify]);
-
-  const applySuggestion = (prompt: string) => {
-    window.dispatchEvent(new CustomEvent("vencoder-prefill-composer", { detail: prompt }));
-  };
 
   const hasModel = modelLoading || Boolean(modelName);
   const showBar = hasModel || messages.length > 0;
@@ -75,6 +69,7 @@ function ChatPage() {
       ) : (
         <span className="chat-model-banner-text" />
       )}
+      <AgentBackendPicker compact />
       {messages.length > 0 && (
         <div className="chat-export-controls">
           {exportToast && (
@@ -118,29 +113,13 @@ function ChatPage() {
         scrollClassName="messages-container"
         emptyState={
           <div className="chat-welcome">
-            <h2 className="chat-welcome-title">What can I build?</h2>
-            <p className="chat-welcome-text">
-              {modelName
-                ? `${modelName} is ready to write, debug, refactor, or explain your code.`
-                : "Load a model to get started"}
+            <h1 className="chat-welcome-brand">Vencoder</h1>
+            <p className="chat-welcome-tagline">
+              Your personal AI assistant. What do we do today?
             </p>
-            <div className="chat-welcome-suggestions">
-              {welcomeSuggestions.map(({ label, prompt }) => (
-                <button
-                  key={prompt}
-                  type="button"
-                  className="chat-suggestion"
-                  onClick={() => applySuggestion(prompt)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="chat-welcome-hints">
-              <kbd className="chat-kbd">Enter</kbd> send ·{" "}
-              <kbd className="chat-kbd">Shift+Enter</kbd> newline ·{" "}
-              <kbd className="chat-kbd">/</kbd> commands
-            </div>
+            {!modelName && !modelLoading && (
+              <p className="chat-welcome-hint">Connect a model under Agents to get started.</p>
+            )}
           </div>
         }
       >

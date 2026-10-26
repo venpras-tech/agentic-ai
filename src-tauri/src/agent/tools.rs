@@ -759,14 +759,8 @@ async fn run_tool(
 /// Resolve a tool-supplied path relative to the workspace root. Absolute
 /// paths pass through unchanged (the policy layer already vetted them).
 fn resolve(root: Option<&Path>, raw: &str) -> PathBuf {
-    let p = PathBuf::from(raw);
-    if p.is_absolute() {
-        return p;
-    }
-    match root {
-        Some(r) => r.join(p),
-        None => p,
-    }
+    let workspaces: Vec<PathBuf> = root.map(|r| vec![r.to_path_buf()]).unwrap_or_default();
+    super::paths::resolve_tool_path(&workspaces, raw)
 }
 
 fn display(path: &str) -> String {

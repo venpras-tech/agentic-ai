@@ -1,5 +1,13 @@
-import { describe, it, expect } from "vitest";
-import { appendRunTrace, mergeEditBatch } from "./useAgentStream";
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  appendRunTrace,
+  mergeEditBatch,
+  claimNextSession,
+  clearActiveSession,
+  isActiveSession,
+  resetActiveSession,
+  setActiveSessionId,
+} from "./useAgentStream";
 import type { EditBatchEvent, EditStatus, FileEdit, PendingEditGroup, RunTrace } from "../lib/ipc";
 
 const edit = (id: string, status: EditStatus = "pending", path = `src/${id}.ts`): FileEdit =>
@@ -105,5 +113,49 @@ describe("mergeEditBatch", () => {
     );
     expect(next).toHaveLength(1);
     expect(next[0].edits.map((e) => e.status)).toEqual(["conflict", "failed"]);
+  });
+});
+
+describe("isActiveSession", () => {
+  beforeEach(() => {
+    resetActiveSession();
+  });
+
+  it("accepts events while the view owns nothing (external runs stay visible)", () => {
+    expect(isActiveSession(7)).toBe(true);
+    expect(isActiveSession(undefined)).toBe(true);
+  });
+
+  it("accepts only the claimed run once a session id is pinned", () => {
+    setActiveSessionId(42);
+    expect(isActiveSession(42)).toBe(true);
+    expect(isActiveSession(43)).toBe(false);
+  });
+
+  it("adopts the first event after a claim, then rejects other runs", () => {
+    claimNextSession();
+    // The backend emits `inference-started` before the invoke resolves, so the
+    // first event adopts the run this view just started.
+    expect(isActiveSession(9)).toBe(true);
+    expect(isActiveSession(9)).toBe(true);
+    // A leftover run from the previous chat must not bleed into this one.
+    expect(isActiveSession(3)).toBe(false);
+  });
+
+  it("rejects foreign runs after the transcript is replaced", () => {
+    setActiveSessionId(5);
+    clearActiveSession();
+    // "New chat" releases the pin but keeps ownership: a stale run still
+    // flushing its final events must not write into the fresh transcript.
+    expect(isActiveSession(5)).toBe(false);
+    expect(isActiveSession(8)).toBe(false);
+  });
+
+  it("re-adopts after a fresh claim once the view stops owning a run", () => {
+    setActiveSessionId(5);
+    clearActiveSession();
+    claimNextSession();
+    expect(isActiveSession(11)).toBe(true);
+    expect(isActiveSession(5)).toBe(false);
   });
 });

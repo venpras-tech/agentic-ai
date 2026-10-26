@@ -4,8 +4,17 @@ import { api } from "../lib/ipc";
 import { isAgentCapableLocalModel, prepareAgentTurn } from "../lib/agentPrepare";
 import { buildAgentRequest } from "../lib/agentRequest";
 import { appendTurn, assistantTurnId, newChatId, newTurnId, resolveChatId } from "../lib/sessionLog";
-import { setActiveChatId, setActiveTurnId } from "./useAgentStream";
+import {
+  claimNextSession,
+  setActiveChatId,
+  setActiveSessionId,
+  setActiveTurnId,
+  awaitPendingAbort,
+  clearActiveSession,
+} from "./useAgentStream";
+import { setStreamTargetTurnId, clearStreamTargetTurnId } from "../lib/streamTarget";
 import type { PendingPlan } from "./usePlanExecution";
+import type { ModelInfo } from "../context/types";
 
 export interface SendPromptOptions {
   /** User bubble already shown (e.g. queued while the agent was busy). */
@@ -69,6 +78,9 @@ export function useComposerSend(options: UseComposerSendOptions) {
     modelLoading,
     modelRestoreState,
     modelMeta,
+    setModelMeta,
+    modelLoadParams,
+    recentProjects,
     promptModelSelection,
     rememberLastModel,
     addActivity,
@@ -91,7 +103,24 @@ export function useComposerSend(options: UseComposerSendOptions) {
         return;
       }
       let effectiveModel = { name: modelName, provider: modelProvider };
+      let resolvedNParams = modelMeta?.nParams;
       if (!modelName || modelRestoreState === "failed") {
+        const status = await api.modelStatus().catch(() => null);
+        if (status && typeof status === "object" && "name" in status) {
+          const loadedName = String((status as { name?: string }).name ?? "").trim();
+          if (loadedName) {
+            if ("nCtxTrain" in status) {
+              setModelMeta(status as unknown as ModelInfo);
+            }
+            if ("nParams" in status && typeof (status as { nParams?: number }).nParams === "number") {
+              resolvedNParams = (status as { nParams: number }).nParams;
+            }
+            setModelInfo(loadedName, modelProvider || "Local");
+            effectiveModel = { name: loadedName, provider: modelProvider || "Local" };
+          }
+        }
+      }
+      if (!effectiveModel.name || modelRestoreState === "failed") {
         const routed = (await api.providersRoute("editor").catch(() => null)) as
           | Record<string, unknown>
           | null;
@@ -100,24 +129,40 @@ export function useComposerSend(options: UseComposerSendOptions) {
         const model = routed ? String(routed.model ?? "") : "";
         const baseUrl = routed ? String(routed.baseUrl ?? "") : "";
         const apiKey = routed ? String(routed.apiKey ?? "") : "";
-        if (routed && kind && kind !== "local" && model) {
-          // External provider registered in Settings → Providers: activate it
-          // now so the request actually goes out to that provider.
+        if (routed && kind && model) {
           try {
-            await api.configureRemoteModel({ provider: kind, baseUrl, apiKey, model });
-            const label = display || kind;
-            setModelInfo(model, label);
-            rememberLastModel({
-              kind: "remote",
-              name: model,
-              provider: kind,
-              providerLabel: label,
-              baseUrl,
-            });
-            effectiveModel = { name: model, provider: label };
+            if (kind === "local") {
+              const info = (await api.loadModelFromPath(model, modelLoadParams())) as
+                | { name?: string }
+                | Record<string, unknown>
+                | undefined;
+              const label = String(info?.name ?? model.split(/[/\\]/).pop() ?? "Local model");
+              setModelInfo(label, "Local");
+              const fresh = await api.modelStatus().catch(() => null);
+              if (fresh && typeof fresh === "object" && "nCtxTrain" in fresh) {
+                setModelMeta(fresh as unknown as ModelInfo);
+                if ("nParams" in fresh && typeof (fresh as { nParams?: number }).nParams === "number") {
+                  resolvedNParams = (fresh as { nParams: number }).nParams;
+                }
+              }
+              rememberLastModel({ kind: "local", name: label, path: model });
+              effectiveModel = { name: label, provider: "Local" };
+            } else {
+              await api.configureRemoteModel({ provider: kind, baseUrl, apiKey, model });
+              const label = display || kind;
+              setModelInfo(model, label);
+              rememberLastModel({
+                kind: "remote",
+                name: model,
+                provider: kind,
+                providerLabel: label,
+                baseUrl,
+              });
+              effectiveModel = { name: model, provider: label };
+            }
           } catch (err2) {
             addActivity(
-              `Could not reach the registered provider: ${String(err2 instanceof Error ? err2.message : err2)}`,
+              `Could not activate the editor provider: ${String(err2 instanceof Error ? err2.message : err2)}`,
               "error",
             );
             promptModelSelection();
@@ -125,29 +170,24 @@ export function useComposerSend(options: UseComposerSendOptions) {
           }
         } else {
           promptModelSelection();
-          addActivity("No model loaded — pick a model in the Models page first.", "error");
+          addActivity(
+            "No model ready — connect a backend under Agents or load a local model, then send again.",
+            "error",
+          );
           return;
         }
       }
 
-      // Hard block Agent mode on a too-small local model: these models loop or
-      // hallucinate tool calls, so refuse the send instead of warning. Ask and
-      // Plan modes (which use no or restricted tools) stay available.
-      const nParams = modelMeta?.nParams;
+      const nParams = resolvedNParams;
       const smallModel = Boolean(nParams && !isAgentCapableLocalModel(nParams));
+      let uiMode = currentMode;
       if (currentMode === "agent" && smallModel) {
+        uiMode = "ask";
         addActivity(
-          "Agent mode is disabled for this ~" +
-            `${((nParams ?? 0) / 1e9).toFixed(1)}B model — switch to Ask or Plan mode, ` +
-            "or load a 3B+ instruct model or a remote provider.",
-          "error",
+          `Small local model (~${((nParams ?? 0) / 1e9).toFixed(1)}B) — running this turn in Ask mode. ` +
+            "Use a 3B+ model or a remote provider for full Agent tools.",
+          "status",
         );
-        return;
-      }
-
-      const fromHome = location.pathname === "/";
-      if (fromHome) {
-        navigate("/chat");
       }
 
       setComposerDraft("");
@@ -173,23 +213,29 @@ export function useComposerSend(options: UseComposerSendOptions) {
       setProcessing(true);
       clearActivity();
 
+      const assistantId = assistantTurnId(turnId);
+      setStreamTargetTurnId(assistantId);
       addMessage({
         role: "assistant",
         content: "",
         streaming: true,
         model: effectiveModel,
-        turnId: assistantTurnId(turnId),
+        turnId: assistantId,
       });
 
       try {
+        await awaitPendingAbort();
+        clearActiveSession();
+
         const prepared = await prepareAgentTurn({
-          uiMode: currentMode,
+          uiMode,
           userText: t,
           projectPath,
           contextPaths,
           contextState,
           activeFile,
           nParams,
+          recentProjectPaths: recentProjects,
           pickWorkspace: () => api.pickWorkspaceFolder(),
         });
         refreshContextUsage();
@@ -199,7 +245,7 @@ export function useComposerSend(options: UseComposerSendOptions) {
         }
         const request = buildAgentRequest({
           prompt: t,
-          uiMode: currentMode,
+          uiMode,
           settings,
           maxSteps,
           verify,
@@ -240,17 +286,34 @@ export function useComposerSend(options: UseComposerSendOptions) {
         // conversation still reaches the model). Custom modes/workflows imply
         // the tool loop, so they keep agent_run_task.
         const useChatComplete =
-          currentMode === "ask" && preferChatComplete && !customMode && !activeWorkflow;
-        if (useChatComplete) {
-          await api.streamInference({
-            prompt: t,
-            maxTokens: request.maxTokens,
-            stopWords: request.stopWords ?? [],
-            images: prepared.images,
-          });
-        } else {
-          await api.agentRunTask(request);
+          !customMode &&
+          !activeWorkflow &&
+          uiMode === "ask" &&
+          (preferChatComplete || smallModel);
+        // Claim the events of the run we are about to start before the invoke,
+        // so the backend's synchronous `inference-started` (emitted before the
+        // command returns) is attributed to this transcript rather than dropped
+        // as a foreign session. The returned id then pins the claim.
+        // A prior "New chat" abort must reach the backend before we arm this
+        // run, or its trigger could cancel the run we are starting.
+        claimNextSession();
+        let sessionId: number;
+        try {
+          sessionId = useChatComplete
+            ? await api.streamInference({
+                prompt: t,
+                maxTokens: request.maxTokens,
+                stopWords: request.stopWords ?? [],
+                images: prepared.images,
+              })
+            : await api.agentRunTask(request);
+        } catch (invokeErr) {
+          // The run never started, so release the claim: leaving it pending
+          // would let the next stray engine event adopt the wrong session.
+          clearActiveSession();
+          throw invokeErr;
         }
+        setActiveSessionId(sessionId);
         void appendTurn(
           workspace,
           { role: "user", content: t, ts: Date.now(), turnId },
@@ -263,6 +326,7 @@ export function useComposerSend(options: UseComposerSendOptions) {
         updateLastMessage({ content: (c) => (c || "") + `\n[Error: ${msg}]` });
         setProcessing(false);
         updateLastMessage({ streaming: false });
+        clearStreamTargetTurnId();
       }
     },
     [
@@ -288,6 +352,9 @@ export function useComposerSend(options: UseComposerSendOptions) {
       modelLoading,
       modelRestoreState,
       modelMeta,
+      setModelMeta,
+      modelLoadParams,
+      recentProjects,
       promptModelSelection,
       rememberLastModel,
       addActivity,

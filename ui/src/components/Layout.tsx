@@ -13,13 +13,14 @@ import NeedsModelDialog from "./NeedsModelDialog";
 import { useModel } from "../context/AppContext";
 import { AgentStreamProvider } from "../context/AgentStreamContext";
 import type { OpenEditorTarget } from "../lib/ipc";
+import { isChatRoute } from "../lib/chatRoute";
 import "../styles/layout.css";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
   const { modelPromptVisible, dismissModelPrompt, modelRestoreError, lastModel } = useModel();
-  const showChatBar = location.pathname === "/chat";
+  const showChatBar = isChatRoute(location.pathname);
 
   useEffect(() => {
     const onOpenInEditor = (e: Event) => {
@@ -63,7 +64,7 @@ function Layout({ children }: { children: React.ReactNode }) {
         modelLabel={lastModel?.name}
         onProceed={() => {
           dismissModelPrompt();
-          navigate("/models");
+          navigate("/agents");
         }}
         onDismiss={dismissModelPrompt}
       />

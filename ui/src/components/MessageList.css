@@ -7,7 +7,7 @@
 }
 
 .agent-chat-messages {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -15,17 +15,27 @@
   position: relative;
 }
 
-.agent-chat-messages-inner {
-  flex: 1;
+.agent-chat-messages-viewport {
+  flex: 1 1 0;
   min-height: 0;
-  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.agent-chat-messages-inner {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
 }
 
 .messages-list {
   position: relative;
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
-  height: 100%;
+  width: 100%;
   display: flex;
   flex-direction: column;
 }

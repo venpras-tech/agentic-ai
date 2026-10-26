@@ -263,6 +263,11 @@ pub async fn configure_remote_model(
         .lock()
         .await
         .set_limit(info.context_size as usize);
+    // Remote backends have no llama.cpp context; clear the local load config so
+    // the inspector shows "n/a" instead of a stale local config, and record the
+    // worker count the pool was built with.
+    *state.load_config.lock().await = None;
+    *state.worker_count.lock().await = Some(workers);
     // Remember the backend we just activated so a restart can reconnect without
     // re-prompting for the key (the key stays out of localStorage / settings.json).
     persist_remote_config(&app, &effective_config).await;
@@ -386,6 +391,8 @@ pub async fn unload_model(
     drop(pool_guard);
     api_state.engine.set(None);
     *state.loaded_path.lock().await = None;
+    *state.load_config.lock().await = None;
+    *state.worker_count.lock().await = None;
     crate::logging::info(None, "model", "model unloaded");
     Ok(())
 }
@@ -397,6 +404,60 @@ pub async fn model_status(state: State<'_, InferenceState>) -> Result<Option<Mod
     Ok(info_guard.clone())
 }
 
+/// Snapshot of the engine internals for the Settings → llama.cpp page.
+///
+/// Reports two layers so the page can show "what is loaded" next to "what is
+/// built": the bundled llama.cpp build capabilities (from
+/// [`crate::engine::llama_build_info`]) and the exact load parameters of the
+/// current pool. `load_config` is the fully-resolved [`ModelInitParams`]
+/// recorded at load time, so it reflects the values llama.cpp is actually
+/// running with rather than the editable form state. `remote` is set when the
+/// active backend is a remote provider (no llama.cpp context exists).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlamaRuntimeInfo {
+    /// Bundled llama.cpp build capabilities.
+    pub build: crate::engine::LlamaBuildInfo,
+    /// Model metadata, or `None` when nothing is loaded.
+    pub model: Option<ModelInfo>,
+    /// Resolved load parameters of the current local pool, or `None` for a
+    /// remote backend / no model.
+    pub load_config: Option<ModelInitParams>,
+    /// Number of worker contexts (parallel slots) in the current pool.
+    pub worker_count: Option<usize>,
+    /// Absolute path of the loaded local GGUF, if any.
+    pub loaded_path: Option<String>,
+    /// True when the active backend is a remote provider rather than llama.cpp.
+    pub remote: bool,
+    /// KV-cache quantization the loaded context was built with (`None` = auto).
+    pub cache_type_k: Option<String>,
+    pub cache_type_v: Option<String>,
+}
+
+/// Inspect the llama.cpp runtime: build capabilities + the loaded pool's exact
+/// load parameters. Read-only; see `load_model_from_path` to apply changes.
+#[tauri::command]
+pub async fn llama_runtime_info(
+    state: State<'_, InferenceState>,
+) -> Result<LlamaRuntimeInfo, String> {
+    let build = crate::engine::llama_build_info();
+    let model = state.info.lock().await.clone();
+    let load_config = state.load_config.lock().await.clone();
+    let worker_count = *state.worker_count.lock().await;
+    let loaded_path = state.loaded_path.lock().await.clone();
+    let remote = model.is_some() && load_config.is_none();
+    Ok(LlamaRuntimeInfo {
+        build,
+        model,
+        cache_type_k: load_config.as_ref().and_then(|c| c.cache_type_k.clone()),
+        cache_type_v: load_config.as_ref().and_then(|c| c.cache_type_v.clone()),
+        load_config,
+        worker_count,
+        loaded_path,
+        remote,
+    })
+}
+
 /// Absolute GGUF path currently loaded, for display next to Load/Unload.
 #[tauri::command]
 pub async fn loaded_model_path(state: State<'_, InferenceState>) -> Result<Option<String>, String> {
@@ -404,16 +465,167 @@ pub async fn loaded_model_path(state: State<'_, InferenceState>) -> Result<Optio
 }
 
 // ---------------------------------------------------------------------------
+// Hugging Face auth/token
+// ---------------------------------------------------------------------------
+
+fn hf_token_path(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join("hf-token.txt")
+}
+
+fn load_hf_token_from_file(app: &AppHandle) -> Option<String> {
+    std::fs::read_to_string(hf_token_path(app))
+        .ok()
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })
+}
+
+fn load_hf_token_from_active_remote(app: &AppHandle) -> Option<String> {
+    let path = app_data_dir(app).join("active-remote.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let api_key = cfg.get("apiKey").and_then(|v| v.as_str()).or_else(|| cfg.get("api_key").and_then(|v| v.as_str()))?;
+    let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).or_else(|| cfg.get("base_url").and_then(|v| v.as_str())).unwrap_or("");
+    let key = api_key.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    if key.starts_with("hf_") || base_url.contains("huggingface.co") {
+        return Some(key);
+    }
+    None
+}
+
+pub(crate) fn load_hf_token(app: &AppHandle) -> Option<String> {
+    load_hf_token_from_file(app).or_else(|| load_hf_token_from_active_remote(app))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HfTokenStatus {
+    pub has_token: bool,
+    pub source: Option<String>,
+}
+
+#[tauri::command]
+pub async fn hf_token_status(app: AppHandle) -> Result<HfTokenStatus, String> {
+    if load_hf_token_from_file(&app).is_some() {
+        return Ok(HfTokenStatus { has_token: true, source: Some("saved".into()) });
+    }
+    if load_hf_token_from_active_remote(&app).is_some() {
+        return Ok(HfTokenStatus { has_token: true, source: Some("provider".into()) });
+    }
+    Ok(HfTokenStatus { has_token: false, source: None })
+}
+
+#[tauri::command]
+pub async fn hf_token_save(app: AppHandle, token: String) -> Result<HfTokenStatus, String> {
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Token cannot be empty.".into());
+    }
+    let path = hf_token_path(&app);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+    std::fs::write(&path, trimmed).map_err(|e| format!("Failed to save token: {e}"))?;
+    Ok(HfTokenStatus { has_token: true, source: Some("saved".into()) })
+}
+
+#[tauri::command]
+pub async fn hf_token_clear(app: AppHandle) -> Result<HfTokenStatus, String> {
+    let _ = std::fs::remove_file(hf_token_path(&app));
+    if load_hf_token_from_active_remote(&app).is_some() {
+        return Ok(HfTokenStatus { has_token: true, source: Some("provider".into()) });
+    }
+    Ok(HfTokenStatus { has_token: false, source: None })
+}
+
+// ---------------------------------------------------------------------------
 // Hugging Face hub
 // ---------------------------------------------------------------------------
 
-/// Search the hub for GGUF repos (public models, no auth).
+/// Search the hub for GGUF repos.
 #[tauri::command]
 pub async fn hf_search(
+    app: AppHandle,
     query: String,
     limit: Option<usize>,
+    offset: Option<usize>,
+    sort: Option<String>,
 ) -> Result<Vec<crate::hub::HfModel>, String> {
-    crate::hub::search(&query, limit.unwrap_or(20)).await
+    let token = load_hf_token(&app);
+    crate::hub::search(
+        &query,
+        limit.unwrap_or(40),
+        offset.unwrap_or(0),
+        sort.as_deref().unwrap_or("relevance"),
+        token.as_deref(),
+    )
+    .await
+}
+
+/// Fetch repo metadata (agent tool `hf_model_info`).
+#[tauri::command]
+pub async fn hf_model_info(app: AppHandle, repo_id: String) -> Result<serde_json::Value, String> {
+    let token = load_hf_token(&app);
+    crate::hub::model_info(&repo_id, token.as_deref()).await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksumResult {
+    pub verified: bool,
+    pub expected: Option<String>,
+    pub actual: String,
+    pub message: String,
+}
+
+/// Verify LFS SHA256 of a downloaded model file against the repo tree.
+#[tauri::command]
+pub async fn hf_verify_model(
+    app: AppHandle,
+    repo_id: String,
+    file_name: String,
+    revision: Option<String>,
+) -> Result<ChecksumResult, String> {
+    let token = load_hf_token(&app);
+    let rev = revision.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "main".to_string());
+    let models_dir = models_dir(&app);
+    let entries = crate::hub::list_downloaded(&models_dir);
+    let entry = entries
+        .iter()
+        .find(|m| m.repo_id == repo_id && (m.file_name == file_name || crate::hub::shard_group(&file_name).contains(&m.file_name)))
+        .ok_or_else(|| format!("`{file_name}` is not downloaded in the models directory"))?;
+    let path = std::path::PathBuf::from(&entry.path);
+    if !path.is_file() {
+        return Err(format!("File missing: {}", path.display()));
+    }
+    let actual = crate::hub::file_sha256(&path).await?;
+    let expected = crate::hub::expected_sha256(&repo_id, &file_name, &rev, token.as_deref()).await;
+    match expected {
+        None => Ok(ChecksumResult {
+            verified: false,
+            expected: None,
+            actual,
+            message: "No LFS checksum published for this file in the repo tree.".into(),
+        }),
+        Some(exp) => {
+            let ok = exp.eq_ignore_ascii_case(&actual);
+            let actual_display = actual.clone();
+            Ok(ChecksumResult {
+                verified: ok,
+                expected: Some(exp.clone()),
+                actual,
+                message: if ok {
+                    "SHA256 matches the repository LFS checksum.".into()
+                } else {
+                    format!("SHA256 mismatch: expected {exp}, got {actual_display}")
+                },
+            })
+        }
+    }
 }
 
 /// Start streaming a GGUF from the hub into `{app_data}/models/…`. Progress
@@ -427,6 +639,7 @@ pub async fn hf_download_model(
     hub_state: State<'_, HubState>,
     repo_id: String,
     file_name: String,
+    revision: Option<String>,
 ) -> Result<(), String> {
     let key = format!("{repo_id}::{file_name}");
     {
@@ -437,7 +650,7 @@ pub async fn hf_download_model(
                 return Ok(());
             }
         }
-        active.insert(key.clone(), DownloadControl::new());
+        active.insert(key.clone(), DownloadControl::with_revision(revision.clone()));
     }
     let control = hub_state.active.lock().await.get(&key).cloned().unwrap();
     let registry = hub_state.active.clone();
@@ -446,6 +659,7 @@ pub async fn hf_download_model(
     let app_sink = app.clone();
     let repo = repo_id.clone();
     let file = file_name.clone();
+    let token = load_hf_token(&app);
     tokio::spawn(async move {
         loop {
             if control.cancel.is_cancelled() {
@@ -469,36 +683,108 @@ pub async fn hf_download_model(
                     }
                 }
             }
-            let result = crate::hub::download_file(
-                &models_dir,
-                &repo,
-                &file,
-                &control.cancel,
-                &control.paused,
-                |p| {
-                    let _ = app_sink.emit(
-                        "hf-download-progress",
-                        json!({
-                            "repoId": repo,
-                            "file": file,
-                            "receivedBytes": p.received,
-                            "totalBytes": p.total,
-                            "done": p.done,
-                        }),
-                    );
-                },
-            )
-            .await;
+            // A split GGUF is only loadable with *every* shard present, so a
+            // request for any one part fetches the whole set in order. Progress
+            // is reported against the requested filename so the UI row keeps
+            // tracking a single (now aggregate) bar.
+            let parts = crate::hub::shard_group(&file);
+            let multi = parts.len() > 1;
+            let part_total = parts.len();
+            let revision = control.revision().unwrap_or_else(|| "main".to_string());
+            let mut result: Result<(), String> = Ok(());
+            'parts: for (idx, part) in parts.iter().enumerate() {
+                let part_no = idx + 1;
+                loop {
+                    if control.cancel.is_cancelled() {
+                        result = Err("__cancelled__".to_string());
+                        break 'parts;
+                    }
+                    if !control.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    // Paused mid-set: wait, then re-check before starting the
+                    // next shard (matches the outer loop's semantics).
+                    tokio::select! {
+                        _ = control.resume.notified() => {}
+                        _ = control.cancel.clone().cancelled_owned() => {
+                            result = Err("__cancelled__".to_string());
+                            break 'parts;
+                        }
+                    }
+                }
+                let mut part_received: u64 = 0;
+                let mut part_total: Option<u64> = None;
+                let r = crate::hub::download_file(
+                    &models_dir,
+                    &repo,
+                    part,
+                    &revision,
+                    token.as_deref(),
+                    &control.cancel,
+                    &control.paused,
+                    |p| {
+                        part_received = p.received;
+                        part_total = p.total;
+                        let _ = app_sink.emit(
+                            "hf-download-progress",
+                            json!({
+                                "repoId": repo,
+                                "file": file,
+                                "receivedBytes": p.received,
+                                "totalBytes": p.total,
+                                "done": p.done && (part_no as usize) == parts.len(),
+                                "part": part_no,
+                                "parts": parts.len(),
+                            }),
+                        );
+                    },
+                )
+                .await;
+                match r {
+                    Ok(_) => {}
+                    Err(e) => {
+                        result = Err(e);
+                        break 'parts;
+                    }
+                }
+            }
             match result {
                 Ok(_) => {
-                    registry.lock().await.remove(&key);
+                    // Verify checksums when published; surface warnings without
+                    // failing an otherwise complete download.
+                    if let Ok(entries) = crate::hub::fetch_tree_entries(&repo, &revision, token.as_deref()).await {
+                        for part in &parts {
+                            let Some(exp) = entries.iter().find(|e| e.path == *part).and_then(|e| e.sha256.clone()) else { continue; };
+                            let path = crate::hub::dest_path(&models_dir, &repo, part);
+                            if let Ok(actual) = crate::hub::file_sha256(&path).await {
+                                if !exp.eq_ignore_ascii_case(&actual) {
+                                    crate::logging::warn(
+                                        None,
+                                        "hub.sha256",
+                                        &format!("checksum mismatch for `{repo}` `{part}` (expected {exp}, got {actual})"),
+                                    );
+                                    let _ = app_sink.emit(
+                                        "hf-download-progress",
+                                        json!({ "repoId": repo, "file": file, "checksumWarning": format!("SHA256 mismatch for {part}") }),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let _ = app_sink.emit(
                         "hf-download-progress",
                         json!({ "repoId": repo, "file": file, "done": true }),
                     );
+                    if multi {
+                        crate::logging::info(
+                            None,
+                            "hub.shards",
+                            &format!("fetched all {} shards for `{repo}` `{file}`", parts.len()),
+                        );
+                    }
                     // Best-effort companion fetch: pull the repo's `tokenizer.json`
                     // alongside the weights so exact token counting engages on load.
-                    if crate::hub::download_tokenizer(&models_dir, &repo).await {
+                    if crate::hub::download_tokenizer(&models_dir, &repo, token.as_deref()).await {
                         crate::logging::info(
                             None,
                             "hub.tokenizer",
@@ -590,16 +876,17 @@ pub async fn hf_resume_download(
     let mut active = hub_state.active.lock().await;
     let control = match active.get(&key) {
         Some(control) if !control.cancel.is_cancelled() => control.clone(),
-        Some(_control) => {
+        Some(control) => {
+            let revision = control.revision();
             // Cancelled earlier: start a fresh control.
             active.remove(&key).unwrap();
             drop(active);
-            return hf_download_model(app, hub_state, repo_id, file_name).await;
+            return hf_download_model(app, hub_state, repo_id, file_name, revision).await;
         }
         None => {
             // No control at all: start (this resumes any leftover `.part`).
             drop(active);
-            return hf_download_model(app, hub_state, repo_id, file_name).await;
+            return hf_download_model(app, hub_state, repo_id, file_name, None).await;
         }
     };
     control
@@ -613,8 +900,8 @@ pub async fn hf_resume_download(
 ///
 /// The `*.part` file is kept by default so a later resume continues where it
 /// left off. Pass `delete_part: true` ("Cancel & delete file") to remove the
-/// partial file too – the file is only deleted *after* the download task has
-/// exited (it may still hold the handle open for a moment).
+/// partial file too – all shard parts are deleted for split models. The files
+/// are only deleted *after* the download task has exited.
 #[tauri::command]
 pub async fn hf_cancel_download(
     app: AppHandle,
@@ -630,17 +917,25 @@ pub async fn hf_cancel_download(
     if delete_part.unwrap_or(false) {
         let registry = hub_state.active.clone();
         let models_dir = models_dir(&app);
-        let part = crate::hub::dest_path(&models_dir, &repo_id, &file_name).with_extension("part");
+        let repo = repo_id.clone();
+        let file = file_name.clone();
+        let key2 = key.clone();
         tokio::spawn(async move {
             // Wait until the download task removes itself from `active` (it can
-            // still be holding the `.part` handle), then delete the file.
-            for _ in 0..100 {
-                if !registry.lock().await.contains_key(&key) {
+            // still be holding the `.part` handle), then delete the files.
+            for _ in 0..150 {
+                if !registry.lock().await.contains_key(&key2) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            let _ = std::fs::remove_file(&part);
+            for part in crate::hub::shard_group(&file) {
+                let part_path = crate::hub::dest_path(&models_dir, &repo, &part).with_extension("part");
+                let _ = std::fs::remove_file(&part_path);
+                // Also attempt to remove the final file if somehow present
+                let final_path = crate::hub::dest_path(&models_dir, &repo, &part);
+                let _ = std::fs::remove_file(&final_path);
+            }
         });
     }
     Ok(())
@@ -696,7 +991,19 @@ pub async fn auto_load_model(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            if p.extension().and_then(|e| e.to_str()) == Some("gguf") && !name.contains("imatrix") {
+            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                let name_lc = name.to_lowercase();
+                if name_lc.contains("imatrix")
+                    || name_lc.contains("mmproj")
+                    || name_lc.contains("clip")
+                    || name_lc.contains("siglip")
+                    || name_lc.contains("vit")
+                    || name_lc.contains("vision")
+                    || name_lc.contains("projector")
+                    || name_lc.contains("encoder")
+                {
+                    continue;
+                }
                 candidates.push(p);
             }
         }

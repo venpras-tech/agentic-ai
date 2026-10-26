@@ -30,28 +30,26 @@ export async function listWorkspaceFiles(
 ): Promise<string[]> {
   if (!projectPath) return [];
   const out: string[] = [];
-  const walk = async (rel: string | null): Promise<void> => {
+  const walk = async (relative: string): Promise<void> => {
     if (out.length >= limit) return;
     let nodes: Array<{ name: string; path: string; isDir: boolean }> = [];
     try {
-      nodes = await api.listDirectory(projectPath, rel);
+      nodes = await api.listDirectory(projectPath, relative || null);
     } catch {
       return;
     }
     for (const n of nodes) {
       if (out.length >= limit) return;
+      const childRel = relative ? `${relative}/${n.name}` : n.name;
       if (n.isDir) {
         if (SKIP_DIRS.has(n.name)) continue;
-        await walk(n.path);
+        await walk(childRel);
       } else {
-        // `path` is absolute or workspace-joined; normalize to relative.
-        const normalized = n.path.replaceAll("\\", "/");
-        const base = projectPath.replaceAll("\\", "/").replace(/\/?$/, "/");
-        out.push(normalized.startsWith(base) ? normalized.slice(base.length) : normalized);
+        out.push(childRel.replaceAll("\\", "/"));
       }
     }
   };
-  await walk(null);
+  await walk("");
   return out;
 }
 

@@ -34,7 +34,9 @@ export async function hydrateContextFromSession(
   for (const record of records) {
     const content = (record.content ?? "").toString();
     if (!content.trim()) continue;
-    const role = (record.role ?? "assistant").toString() === "user" ? "user" : "assistant";
+    const rawRole = (record.role ?? "assistant").toString();
+    if (rawRole === "error") continue;
+    const role = rawRole === "user" ? "user" : "assistant";
     await api.contextPushTurn(role, content).catch(() => {});
   }
 }

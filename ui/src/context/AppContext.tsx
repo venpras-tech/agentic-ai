@@ -12,6 +12,8 @@ import {
 import { buildSystemPrompt } from "../lib/agentPrepare";
 import { hydrateContextFromSession, recordToMessage } from "../lib/agentHistory";
 import { chatIdForInvoke, newChatId, splitConversationId } from "../lib/sessionLog";
+import { getStreamTargetTurnId } from "../lib/streamTarget";
+import { clearActiveSession, trackAbort } from "../hooks/useAgentStream";
 import {
   defaultContextState,
   type ActiveFileBuffer,
@@ -67,6 +69,8 @@ interface ModelValue {
   modelLoadStage: string;
   apiServerStatus: { running: boolean; port: number | null };
   unloadModel: (() => Promise<void>) | (() => void);
+  /** Unload + reload the active model so new load-time settings take effect. */
+  reloadModel: () => Promise<ModelInfo>;
   llmSettings: LlmSettings;
   loadLlmSettings: () => Promise<void>;
   saveLlmSettings: (patch: Partial<LlmSettings>) => void | Promise<void>;
@@ -320,13 +324,17 @@ const [isProcessing, setIsProcessing] = useState(false);
   });
   const [decompose, setDecomposeState] = useState(false);
   const [preferChatComplete, setPreferChatCompleteState] = useState(
-    () => localStorage.getItem("ai-editor.preferChatComplete") === "true",
+    () => localStorage.getItem("ai-editor.preferChatComplete") !== "false",
   );
   const [hitlGate, setHitlGateState] = useState<{ requestId: string; reason: string } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [activityLog, setActivityLog] = useState<ActivityLogEntry[]>([]);
   const [composerDraft, setComposerDraft] = useState("");
-  const [currentMode, setCurrentMode] = useState("agent");
+  const [currentMode, setCurrentModeState] = useState(() => {
+    const saved = localStorage.getItem("ai-editor.mode");
+    if (saved === "agent" || saved === "ask" || saved === "plan") return saved;
+    return "agent";
+  });
   const [contextPaths, setContextPaths] = useState<string[]>([]);
   const [contextState, setContextStateRaw] = useState<ContextState>(defaultContextState);
   const [activeFile, setActiveFile] = useState<ActiveFileBuffer | null>(null);
@@ -490,10 +498,21 @@ setModelMeta(null);
     setMessages((prev) => {
       if (prev.length === 0) return prev;
       let idx = -1;
-      for (let i = prev.length - 1; i >= 0; i--) {
-        if (prev[i].role === "assistant" && prev[i].streaming) {
-          idx = i;
-          break;
+      const targetTurn = getStreamTargetTurnId();
+      if (targetTurn) {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].turnId === targetTurn) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx < 0) {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].role === "assistant" && prev[i].streaming) {
+            idx = i;
+            break;
+          }
         }
       }
       if (idx < 0) {
@@ -536,7 +555,14 @@ setModelMeta(null);
 
   const clearActivity = useCallback(() => setActivityLog([]), []);
 
-  const setMode = useCallback((m: string) => setCurrentMode(m), []);
+  const setMode = useCallback((m: string) => {
+    setCurrentModeState(m);
+    try {
+      localStorage.setItem("ai-editor.mode", m);
+    } catch {
+      // storage unavailable
+    }
+  }, []);
 
   const setVerify = useCallback((v: boolean) => setVerifyState(v), []);
 
@@ -610,7 +636,13 @@ setModelMeta(null);
     // then mint a fresh chat id so the next turn opens its own named log
     // (`sessions/<key>/<chat>.jsonl`) instead of appending to the shared
     // default chat (`sessions/<key>.jsonl`).
-    void api.abortAgentExecution().catch(() => {});
+    // Remember the abort so the next send can await it: the command triggers
+    // the circuit breaker asynchronously, and arming a new run before it lands
+    // would cancel that new run instead of this one.
+    trackAbort(api.abortAgentExecution().catch(() => {}));
+    // Drop this view's claim on the previous run's events so a token or
+    // `inference-done` still in flight cannot land in the fresh transcript.
+    clearActiveSession();
     setIsProcessing(false);
     setMessages([]);
     setActivityLog([]);
@@ -626,6 +658,10 @@ setModelMeta(null);
     async (conversationId: string) => {
       const { project, chatId } = splitConversationId(conversationId);
       setLoadingConversation(true);
+      // Loading a different chat replaces the transcript, so this view no longer
+      // owns the previous run's stream. Without this a token from the old run
+      // could append to the newly loaded chat.
+      clearActiveSession();
       try {
         // `default` is a UI-only sentinel; the backend addresses the flat
         // log with a null chat id.
@@ -740,6 +776,55 @@ const saveLlmSettings = useCallback((patch: Partial<LlmSettings>) => {
     }
     return out;
   }, [llmSettings, localModelConfigs, activeLocalModelPath]);
+
+  /**
+   * Unload and reload the active model so new load-time settings take effect.
+   *
+   * Model-load parameters (context length, KV-cache quantization, batch size,
+   * threads, …) are read once at load time and cannot be changed in place, so
+   * "apply context increase" means a full reload. Reloads the currently loaded
+   * local GGUF with the freshest `modelLoadParams()`; a remote backend is
+   * simply reconnected. Returns the reloaded `ModelInfo` on success.
+   */
+  const reloadModel = useCallback(async (): Promise<ModelInfo> => {
+    const sel = lastModel;
+    if (!sel) throw new Error("No model is selected to reload.");
+    setModelLoading(true);
+    setModelLoadStage("reload");
+    try {
+      if (sel.kind === "remote") {
+        const saved = await api.remoteConfigLoad();
+        const apiKey = saved ? String(saved.apiKey ?? "") : legacyApiKeyFromStorage();
+        const baseUrl = saved ? String(saved.baseUrl ?? sel.baseUrl) : sel.baseUrl;
+        const provider = saved ? String(saved.provider ?? sel.provider) : sel.provider;
+        const model = saved ? String(saved.model ?? sel.name) : sel.name;
+        if (!apiKey || !baseUrl) throw new Error("No connection details were saved for this model.");
+        await api.configureRemoteModel({ provider, baseUrl, apiKey, model });
+        const fresh = (await api.modelStatus().catch(() => null)) as ModelInfo | null;
+        if (fresh) setModelMeta(fresh);
+        setModelRestoreState("ready");
+        return fresh as ModelInfo;
+      }
+      await api.unloadModel().catch(() => {});
+      setModelMeta(null);
+      const info = (await api.loadModelFromPath(sel.path, modelLoadParams())) as unknown as ModelInfo;
+      setModelMeta(info);
+      setModelName(info?.name || sel.name);
+      setModelProvider("Local");
+      setModelRestoreState("ready");
+      setModelRestoreError("");
+      return info;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setModelRestoreState("failed");
+      setModelRestoreError(msg);
+      addActivity(`Model reload failed: ${msg}`, "error");
+      throw err;
+    } finally {
+      setModelLoading(false);
+      setModelLoadStage("");
+    }
+  }, [lastModel, modelLoadParams, addActivity]);
 
   useEffect(() => { loadLlmSettings(); }, [loadLlmSettings]);
   useEffect(() => { loadLocalModelConfigs(); }, [loadLocalModelConfigs]);
@@ -898,6 +983,7 @@ useEffect(() => {
       modelName, modelProvider, setModelInfo,
       modelMeta, setModelMeta: setModelMetaSafe,
       modelLoading, modelLoadProgress, modelLoadStage, unloadModel,
+      reloadModel,
       apiServerStatus,
       llmSettings, loadLlmSettings, saveLlmSettings, modelLoadParams,
       localModelConfigs, loadLocalModelConfigs, saveLocalModelConfig,
@@ -909,6 +995,7 @@ useEffect(() => {
     [
       modelName, modelProvider, setModelInfo, modelMeta, setModelMetaSafe,
       modelLoading, modelLoadProgress, modelLoadStage, unloadModel,
+      reloadModel,
       apiServerStatus, llmSettings, loadLlmSettings, saveLlmSettings, modelLoadParams,
       localModelConfigs, loadLocalModelConfigs, saveLocalModelConfig,
       activeLocalModelPath, activeModelConfig, rememberLastModel, lastModel,

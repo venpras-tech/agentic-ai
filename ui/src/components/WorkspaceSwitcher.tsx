@@ -45,7 +45,7 @@ function WorkspaceSwitcher() {
   const choose = (p: string) => {
     if (p !== projectPath) setProjectPath(p);
     setOpen(false);
-    navigate("/project");
+    navigate("/workspace");
   };
 
   const browse = async () => {

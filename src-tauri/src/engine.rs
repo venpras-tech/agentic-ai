@@ -213,6 +213,69 @@ pub fn install_native_model_logs() {
     }
 }
 
+/// Compile-time and runtime capabilities of the bundled llama.cpp build.
+///
+/// The pinned bindings ship neither a version constant nor a "system info"
+/// accessor in the crate API, but the raw symbols are available: the
+/// `llama_supports_*` probes and `llama_print_system_info` are read directly.
+/// `system_info` is llama.cpp's own one-line build/backend summary
+/// (e.g. `AVX2 = 1 | AVX = 1 | CUDA = 0 | …`), so the Settings page can show
+/// what the binary will actually run rather than guessing from feature flags.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlamaBuildInfo {
+    /// Pinned `llama-cpp-2` / `llama-cpp-sys-2` crate version the binary links.
+    pub bindings_version: &'static str,
+    /// llama.cpp's own build summary line (may be empty if unavailable).
+    pub system_info: String,
+    /// The runtime reports at least one GPU-capable device.
+    pub supports_gpu_offload: bool,
+    pub supports_mmap: bool,
+    pub supports_mlock: bool,
+    /// Number of backend devices llama.cpp registered (CPU counts as one).
+    pub device_count: usize,
+    /// Maximum GPU devices llama.cpp was compiled to address.
+    pub max_devices: usize,
+    /// Single-token decode scratch buffer size in MiB (`llama_max_nodes`-era
+    /// probe replaced by the documented 128 MiB default when unavailable).
+    pub compute_buffer_mib: f64,
+    /// Whether the *binary* was compiled with a GPU backend enabled.
+    pub gpu_feature_enabled: bool,
+}
+
+/// The crate version the binary was linked against. Kept in one place so the
+/// build info cannot drift from `Cargo.toml` silently.
+pub const LLAMA_BINDINGS_VERSION: &str = "0.1.154";
+
+/// Probe the bundled llama.cpp build. Safe to call at any time; the backend is
+/// initialized lazily by the first model load, but these symbols do not require
+/// it (they read compile-time constants or static registries).
+pub fn llama_build_info() -> LlamaBuildInfo {
+    let system_info = unsafe {
+        let ptr = llama_cpp_sys_2::llama_print_system_info();
+        if ptr.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    };
+    unsafe {
+        LlamaBuildInfo {
+            bindings_version: LLAMA_BINDINGS_VERSION,
+            system_info,
+            supports_gpu_offload: llama_cpp_sys_2::llama_supports_gpu_offload(),
+            supports_mmap: llama_cpp_sys_2::llama_supports_mmap(),
+            supports_mlock: llama_cpp_sys_2::llama_supports_mlock(),
+            device_count: llama_cpp_sys_2::ggml_backend_dev_count(),
+            max_devices: llama_cpp_sys_2::llama_max_devices(),
+            // llama.cpp allocates a fixed 128 MiB graph/compute scratch buffer
+            // per context by default; reported for the KV/memory estimate panel.
+            compute_buffer_mib: 128.0,
+            gpu_feature_enabled: cfg!(any(feature = "gpu-cuda", feature = "gpu-metal")),
+        }
+    }
+}
+
 /// A loaded GGUF model, its context and the owned llama backend.
 ///
 /// # `Send` safety
@@ -244,6 +307,9 @@ pub struct StandaloneEngine {
     /// Optional instruction prepended to the rendered prompt (set from the
     /// "reasoning budget" advanced setting).
     reasoning_budget: Option<String>,
+    /// llama.cpp `n_ubatch` for this context — every `decode` must stay within
+    /// this size (and within `n_batch`, which is always >= `n_ubatch`).
+    decode_batch: u32,
 }
 
 // Safety: all llama.cpp calls are serialized by the owning async mutex and the
@@ -1305,11 +1371,12 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    fn flash_policy(flash: Option<bool>) -> LlamaFlashAttnType {
+    fn flash_policy(flash: Option<bool>, n_gpu_layers: u32) -> LlamaFlashAttnType {
         match flash {
             Some(true) => LLAMA_FLASH_ATTN_TYPE_ENABLED,
             Some(false) => LLAMA_FLASH_ATTN_TYPE_DISABLED,
-            None => LLAMA_FLASH_ATTN_TYPE_AUTO,
+            None if n_gpu_layers > 0 => LLAMA_FLASH_ATTN_TYPE_AUTO,
+            None => LLAMA_FLASH_ATTN_TYPE_DISABLED,
         }
     }
 
@@ -1317,8 +1384,9 @@ impl LoadedModel {
     /// count (used to split compute across pool workers).
     pub fn new_engine_with_threads(&self, threads: i32) -> Result<StandaloneEngine, String> {
         let c = &self.config;
-        let n_batch = c.n_batch.unwrap_or(512);
-        let n_ubatch = c.n_ubatch.unwrap_or(n_batch);
+        let n_batch = c.n_batch.unwrap_or(512).max(1);
+        let n_ubatch = c.n_ubatch.unwrap_or(n_batch).clamp(1, n_batch);
+        let n_gpu_layers = c.n_gpu_layers.unwrap_or(0);
 
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(self.n_ctx))
@@ -1326,7 +1394,7 @@ impl LoadedModel {
             .with_n_threads_batch(threads)
             .with_n_batch(n_batch)
             .with_n_ubatch(n_ubatch)
-            .with_flash_attention_policy(Self::flash_policy(c.flash_attn));
+            .with_flash_attention_policy(Self::flash_policy(c.flash_attn, n_gpu_layers));
         if let Some(unified) = c.unified_kv {
             ctx_params = ctx_params.with_kv_unified(unified);
         }
@@ -1365,6 +1433,7 @@ impl LoadedModel {
             default_seed: c.seed.filter(|s| *s != u32::MAX),
             chat_template_override: c.chat_template.clone().filter(|t| !t.trim().is_empty()),
             reasoning_budget: c.reasoning_budget.clone().filter(|m| !m.trim().is_empty()),
+            decode_batch: n_ubatch,
         })
     }
 }
@@ -1596,15 +1665,14 @@ pub fn run_generation(
 
     let mut sampler = build_sampler(engine.default_seed);
 
-    // The prompt can easily exceed a single LlamaBatch (capacity = n_batch,
-    // 512). Chunk it so every `decode` call stays within the batch capacity;
-    // logits are only requested on the final prompt token so generation starts
-    // from the correct KV position.
-    const PROMPT_BATCH: usize = 512;
-    let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
+    // Chunk long prompts so each `decode` stays within this context's physical
+    // batch (`n_ubatch`). Hard-coding 512 here while the context uses a
+    // smaller batch corrupts ggml's heap on Windows.
+    let prompt_batch = engine.decode_batch.max(1) as usize;
+    let mut batch = LlamaBatch::new(prompt_batch, 1);
     let mut pos = prefix_len;
     while pos < prompt_tokens.len() {
-        let end = (pos + PROMPT_BATCH).min(prompt_tokens.len());
+        let end = (pos + prompt_batch).min(prompt_tokens.len());
         batch.clear();
         for (i, token) in prompt_tokens[pos..end].iter().enumerate() {
             let idx = pos + i;
@@ -1670,10 +1738,35 @@ pub fn run_generation(
             break "eos";
         }
 
-        let piece = engine
+        // A token the model's vocabulary cannot decode (llama.cpp reports
+        // `Unknown Token Type`) must not kill the whole generation: a degraded
+        // or hybrid-architecture GGUF can occasionally sample an undefined vocab
+        // entry. Skip it — still advancing the KV position so the loop cannot
+        // spin — and keep generating, exactly as for an empty piece below.
+        let piece = match engine
             .model
             .token_to_piece(token, &mut decoder, false, None)
-            .map_err(|e| format!("Failed to decode token: {e}"))?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                logging::warn(
+                    Some(session_id),
+                    "model",
+                    &format!("skipping undecodable token: {e}"),
+                );
+                engine.cached_tokens.push(token);
+                batch.clear();
+                batch
+                    .add(token, n_cur, &[0], true)
+                    .map_err(|e| format!("Failed to queue token: {e}"))?;
+                engine
+                    .context
+                    .decode(&mut batch)
+                    .map_err(|e| format!("Token evaluation failed: {e}"))?;
+                n_cur += 1;
+                continue;
+            }
+        };
 
         // Some control/unknown tokens decode to an empty piece; still advance
         // the KV position so the loop cannot spin.
@@ -1840,6 +1933,26 @@ mod tests {
         // Nothing reusable either way.
         assert_eq!(plan_kv_reuse(0, true), KvReusePlan::Clear);
         assert_eq!(plan_kv_reuse(0, false), KvReusePlan::Clear);
+    }
+
+    #[test]
+    fn llama_build_info_reports_a_real_backend_snapshot() {
+        // The probe reads llama.cpp's own compile-time constants; it must
+        // always succeed (no backend init required) and report a plausible
+        // device count and the pinned bindings version.
+        let info = llama_build_info();
+        assert_eq!(info.bindings_version, LLAMA_BINDINGS_VERSION);
+        assert!(!info.bindings_version.is_empty());
+        assert!(
+            info.device_count >= 1,
+            "llama.cpp must register at least a CPU backend"
+        );
+        assert!(info.max_devices >= 1);
+        assert!(info.compute_buffer_mib > 0.0);
+        // The bundled CPU-only build must not claim GPU support.
+        if !cfg!(any(feature = "gpu-cuda", feature = "gpu-metal")) {
+            assert!(!info.gpu_feature_enabled);
+        }
     }
 
     #[test]

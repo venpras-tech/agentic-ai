@@ -13,7 +13,7 @@
  *
  * or, for flat (non-decomposed) runs:
  *   root (task)
- *    └─ phase "Execute"
+ *    └─ phase "Agent" (only when tools run)
  *        └─ tool
  *
  * Nodes are folded entirely from the event stream, so the reducer is pure and

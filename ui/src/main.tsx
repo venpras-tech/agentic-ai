@@ -5,6 +5,7 @@ import App from "./App";
 import { AppProvider } from "./context/AppContext";
 import { isTauriRuntime, tauriInvoke } from "./lib/ipc";
 import "./styles/index.css";
+import "./styles/agent-shell.css";
 
 const rootEl = document.getElementById("root");
 if (rootEl) {

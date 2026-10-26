@@ -61,7 +61,7 @@ function CommandPalette() {
         keywords: "conversation session create",
         run: () => {
           newChatSession();
-          navigate("/chat");
+          navigate("/");
           close();
         },
       },
@@ -115,13 +115,15 @@ function CommandPalette() {
       ...(messages.length > 0
         ? [exportCmd("pdf"), exportCmd("docx"), exportCmd("csv")]
         : []),
-      go("Go to Home", "/", "dashboard start"),
-      go("Go to Chat", "/chat", "agent conversation"),
-      go("Go to Project", "/project", "files explorer index"),
+      go("Go to Chat", "/", "agent conversation home"),
+      go("Go to Workspace", "/workspace", "files explorer editor terminal"),
       go("Go to Editor", "/editor", "code file"),
-      go("Go to Workspace", "/workspace", "terminal editor"),
-      go("Go to Models", "/models", "llm provider load"),
+      go("Go to Agent backends", "/agents", "openai claude ollama provider"),
+      go("Go to Models (alias)", "/models", "llm provider load"),
       go("Go to Model Hub", "/models/hub", "download huggingface gguf"),
+      go("Go to Images", "/images", "generate picture stable diffusion dalle"),
+      go("Go to Video", "/video", "generate clip wan ltx"),
+      go("Go to llama.cpp", "/llama-cpp", "gpu layers context bindings"),
       go("Go to Settings", "/settings", "preferences config"),
       go("Go to Security", "/security", "permissions policy"),
       go("Go to Logs", "/logs", "debug output"),

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, isTauriRuntime } from "../lib/ipc";
-import { PROVIDERS } from "../lib/providers";
+import { PROVIDER_CATALOG, providerUrl } from "../lib/providers";
 import "./ProviderRegistry.css";
 
 type RegistryProvider = {
@@ -27,7 +27,7 @@ type Draft = {
 
 const ROLE_OPTIONS = ["planner", "editor", "autocomplete", "embed"];
 
-const REMOTE_PROVIDERS = PROVIDERS.filter((p) => p.id !== "local");
+const REMOTE_PROVIDERS = PROVIDER_CATALOG.filter((p) => p.id !== "local");
 
 const emptyDraft = (): Draft => ({
   id: "",
@@ -101,7 +101,7 @@ function ProviderRegistry() {
   };
 
   const changeKind = (kind: string) => {
-    const preset = PROVIDERS.find((p) => p.id === kind);
+    const preset = PROVIDER_CATALOG.find((p) => p.id === kind);
     setDraft((d) => ({
       ...d,
       kind,
@@ -179,7 +179,8 @@ function ProviderRegistry() {
       <h3 className="settings-panel-heading">Providers</h3>
       <p className="settings-hint">
         Register provider endpoints and route agent roles (planner, editor, autocomplete, embed)
-        to them. Entries live for the current session and are consulted when a model is loaded.
+        to them. Use <strong>Models</strong> to connect OpenAI, Claude, Ollama, OpenRouter, LiteLLM,
+        and other agent backends — they are synced here automatically when you save.
       </p>
 
       <div className="provider-registry-role-grid">
@@ -276,7 +277,7 @@ function ProviderRegistry() {
               <input
                 id="provider-base-url"
                 className="settings-input"
-                placeholder={PROVIDERS.find((p) => p.id === draft.kind)?.url || "https://api.example.com/v1"}
+                placeholder={providerUrl(draft.kind) || "https://api.example.com/v1"}
                 value={draft.baseUrl}
                 spellCheck={false}
                 onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}

@@ -30,6 +30,35 @@
   font-size: 0.85rem;
 }
 
+.editor-tree-empty {
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.editor-tree-empty p {
+  margin: 0;
+}
+
+.editor-tree-open-folder {
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.editor-tree-open-folder:hover {
+  background: var(--accent-hover);
+}
+
 .editor-tree-row {
   display: flex;
   align-items: center;
@@ -114,6 +143,13 @@
   user-select: none;
 }
 
+.editor-tree-index-status {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
 .editor-tree-search-error {
   margin-top: 6px;
   font-size: 0.75rem;
@@ -159,9 +195,11 @@
 }
 
 .editor-main-panel {
+  flex: 1 1 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   background: var(--bg-primary);
 }
 
@@ -428,10 +466,23 @@
   cursor: default;
 }
 
+.editor-icon-btn.is-on {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
 .editor-code-wrap {
   position: relative;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
+}
+
+.editor-code-wrap.editor-wrap .editor-pre,
+.editor-code-wrap.editor-wrap .editor-textarea {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .editor-layer {

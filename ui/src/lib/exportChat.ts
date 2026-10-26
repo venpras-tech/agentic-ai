@@ -96,7 +96,7 @@ function toBlocks(
 }
 
 function exportTitle(title: string): string {
-  return `AI Editor — ${title} — ${new Date().toLocaleString()}`;
+  return `Vencoder — ${title} — ${new Date().toLocaleString()}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,15 +208,20 @@ export async function toPdf(
 // Entry point
 // ---------------------------------------------------------------------------
 
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunk = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i += chunk) {
+    const slice = bytes.subarray(i, i + chunk);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
 async function saveBlob(blob: Blob, filename: string): Promise<void> {
   if (isTauriRuntime()) {
     const arrayBuf = await blob.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuf);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    const base64 = btoa(binary);
+    const base64 = bytesToBase64(new Uint8Array(arrayBuf));
     await tauriInvoke<string | null>("save_file_as_bytes", {
       content: base64,
       suggestedFilename: filename,

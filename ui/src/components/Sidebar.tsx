@@ -5,27 +5,10 @@ import { api, isTauriRuntime } from "../lib/ipc";
 import WorkspaceSwitcher from "./WorkspaceSwitcher";
 import "./Sidebar.css";
 
-function HomeIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-      <polyline points="9 22 9 12 15 12 15 22" />
-    </svg>
-  );
-}
-
 function ChatIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    </svg>
-  );
-}
-
-function ProjectIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
     </svg>
   );
 }
@@ -100,12 +83,13 @@ function ShieldIcon() {
 }
 
 const navItems = [
-  { path: "/", page: "home", label: "Home", icon: HomeIcon },
-  { path: "/chat", page: "chat", label: "Chat", icon: ChatIcon },
-  { path: "/project", page: "project", label: "Project", icon: ProjectIcon },
+  { path: "/", page: "chat", label: "Chat", icon: ChatIcon },
+  { path: "/workspace", page: "workspace", label: "Workspace", icon: WorkspaceIcon },
   { path: "/editor", page: "editor", label: "Editor", icon: EditorIcon },
-  { path: "/workspace", page: "workspace", label: "Split View", icon: WorkspaceIcon },
-  { path: "/models", page: "models", label: "Models", icon: ModelsIcon },
+  { path: "/agents", page: "agents", label: "Agents", icon: ModelsIcon },
+  { path: "/images", page: "images", label: "Images", icon: ModelsIcon },
+  { path: "/video", page: "video", label: "Video", icon: ModelsIcon },
+  { path: "/llama-cpp", page: "llama-cpp", label: "llama.cpp", icon: SettingsIcon },
   { path: "/settings", page: "settings", label: "Settings", icon: SettingsIcon },
   { path: "/security", page: "security", label: "Security", icon: ShieldIcon },
   { path: "/logs", page: "logs", label: "Logs", icon: LogsIcon },
@@ -184,21 +168,19 @@ function Sidebar() {
 
   const handleNewChat = () => {
     newChatSession();
-    navigate("/chat");
+    navigate("/");
   };
 
-  const homeItem = navItems[0];
-  const chatItem = navItems[1];
-  const restNav = navItems.slice(2);
-  const HomeIconComp = homeItem.icon;
+  const chatItem = navItems[0];
+  const restNav = navItems.slice(1);
   const ChatIconComp = chatItem.icon;
 
   return (
     <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
       <div className="sidebar-header">
         <span className="sidebar-logo">
-          <span className="sidebar-logo-icon">AI</span>
-          AI Editor
+          <span className="sidebar-logo-icon">V</span>
+          Vencoder
         </span>
         <div className="sidebar-header-actions">
           <button
@@ -230,25 +212,13 @@ function Sidebar() {
         </div>
       </div>
       <nav className="side-nav">
-        <button
-          type="button"
-          className={`side-nav-item ${currentPath === homeItem.path ? "active" : ""}`}
-          onClick={() => handleNavClick(homeItem.path)}
-          data-page={homeItem.page}
-          aria-current={currentPath === homeItem.path ? "page" : undefined}
-        >
-          <span className="side-nav-icon">
-            <HomeIconComp />
-          </span>
-          <span className="side-nav-text">{homeItem.label}</span>
-        </button>
         <div className="side-nav-chat-wrap">
           <button
             type="button"
-            className={`side-nav-item ${currentPath === chatItem.path ? "active" : ""}`}
+            className={`side-nav-item ${currentPath === chatItem.path || currentPath === "/chat" ? "active" : ""}`}
             onClick={() => handleNavClick(chatItem.path)}
             data-page={chatItem.page}
-            aria-current={currentPath === chatItem.path ? "page" : undefined}
+            aria-current={currentPath === chatItem.path || currentPath === "/chat" ? "page" : undefined}
           >
             <span className="side-nav-icon">
               <ChatIconComp />
@@ -266,7 +236,9 @@ function Sidebar() {
         </div>
         {restNav.map((item) => {
           const Icon = item.icon;
-          const isActive = currentPath === item.path;
+          const isActive =
+            currentPath === item.path ||
+            (item.path === "/agents" && (currentPath === "/models" || currentPath.startsWith("/models/")));
           return (
             <div key={item.page} className="side-nav-chat-wrap">
               <button
@@ -281,7 +253,7 @@ function Sidebar() {
                 </span>
                 <span className="side-nav-text">{item.label}</span>
               </button>
-              {item.page === "models" ? (
+              {item.page === "agents" ? (
                 <div className="side-nav-sub">
                   <button
                     type="button"

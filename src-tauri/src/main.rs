@@ -41,6 +41,13 @@ pub(crate) struct InferenceState {
     /// Absolute path of the GGUF currently loaded (shown next to the
     /// Load/Unload button); `None` when nothing is loaded.
     pub(crate) loaded_path: Mutex<Option<String>>,
+    /// The fully-resolved [`ModelInitParams`] the current pool was built with
+    /// (defaults ← legacy settings ← per-model config ← explicit load call).
+    /// Powers the llama.cpp internals inspector, which has to report the exact
+    /// values llama.cpp is running with rather than the editable form values.
+    pub(crate) load_config: Mutex<Option<ModelInitParams>>,
+    /// Number of worker contexts in the current pool (`n_workers`).
+    pub(crate) worker_count: Mutex<Option<usize>>,
     pub(crate) worker_tx: Mutex<Option<crossbeam_channel::Sender<WorkerEvent>>>,
 }
 
@@ -50,6 +57,8 @@ impl Default for InferenceState {
             pool: Mutex::new(None),
             info: Mutex::new(None),
             loaded_path: Mutex::new(None),
+            load_config: Mutex::new(None),
+            worker_count: Mutex::new(None),
             worker_tx: Mutex::new(None),
         }
     }
@@ -75,6 +84,8 @@ impl InferenceState {
         *self.pool.blocking_lock() = None;
         *self.info.blocking_lock() = None;
         *self.loaded_path.blocking_lock() = None;
+        *self.load_config.blocking_lock() = None;
+        *self.worker_count.blocking_lock() = None;
     }
 
     /// Synchronous local GGUF load — blocks until the model is loaded.
@@ -93,9 +104,12 @@ impl InferenceState {
         let app_clone = app.clone();
         let pool = build_local_pool(&p, &params, event_tx, &app_clone)?;
         let info = pool.info();
+        let workers = params.n_workers.unwrap_or(1).clamp(1, 32) as usize;
         *self.pool.blocking_lock() = Some(Arc::new(pool));
         *self.info.blocking_lock() = Some(info.clone());
         *self.loaded_path.blocking_lock() = Some(path.to_string());
+        *self.load_config.blocking_lock() = Some(params.clone());
+        *self.worker_count.blocking_lock() = Some(workers);
         Ok(info)
     }
 }
@@ -122,6 +136,8 @@ pub(crate) struct DownloadControl {
     pub(crate) paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Wake token so the download loop can block for resume instead of spinning.
     pub(crate) resume: std::sync::Arc<tokio::sync::Notify>,
+    /// Commit SHA the download is pinned to; `None` means `main`.
+    pub(crate) revision: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl DownloadControl {
@@ -130,7 +146,18 @@ impl DownloadControl {
             cancel: CancellationToken::new(),
             paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resume: std::sync::Arc::new(tokio::sync::Notify::new()),
+            revision: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn with_revision(revision: Option<String>) -> Self {
+        let control = Self::new();
+        *control.revision.lock().unwrap() = revision;
+        control
+    }
+
+    pub(crate) fn revision(&self) -> Option<String> {
+        self.revision.lock().unwrap().clone()
     }
 }
 
@@ -436,6 +463,46 @@ pub(crate) async fn install_local_model(
         .clone()
         .unwrap_or_else(|| spawn_emitter(app.clone()));
 
+    // A split GGUF can only be opened from its first shard, and every sibling
+    // must be present. Catching it here gives an actionable message instead of
+    // llama.cpp's "illegal split file idx" — and, when the siblings exist, we
+    // quietly redirect to the first shard so the load just works.
+    if let Some((part, total)) = crate::hub::parse_shard(&path.to_string_lossy()) {
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let base = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Rebuild the sibling names from the *on-disk* filename (the path is a
+        // real filesystem path, not the HF-relative name `shard_group` expects).
+        let sibling = |k: u32| dir.join(crate::hub::replace_shard_part(&base, k, total));
+        if part > 1 {
+            return Err(format!(
+                "`{base}` is shard {part} of {total} of a split model. A split GGUF must be \
+                 loaded from its first shard (…-00001-of-{total:05}.gguf) with every part in the \
+                 same folder — re-download the model so all {total} shards are fetched."
+            ));
+        }
+        let missing: Vec<String> = (1..=total)
+            .map(sibling)
+            .filter(|p| !p.is_file())
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "this model is split across {total} shards but {} of them {} missing \
+                 (e.g. `{}`). Every shard must be in the same folder — re-download the model.",
+                missing.len(),
+                if missing.len() == 1 { "is" } else { "are" },
+                missing[0]
+            ));
+        }
+    }
+
     let load_started = std::time::Instant::now();
     logging::info(None, "model", &format!("loading {} …", path.display()));
     let app_for_load = app.clone();
@@ -452,8 +519,12 @@ pub(crate) async fn install_local_model(
     // path so it becomes the baseline for future loads of the same model.
     let resolved =
         crate::commands::settings::resolve_and_persist(&app, &path_for_state, &params).await;
+    let workers = resolved.n_workers.unwrap_or(1).clamp(1, 32) as usize;
+    // Keep a copy of the resolved config: the original is moved into the load
+    // task, but the inspector needs it to report what llama.cpp is running.
+    let resolved_for_load = resolved.clone();
     let pool = tokio::task::spawn_blocking(move || {
-        build_local_pool(&path, &resolved, event_tx, &app_for_load)
+        build_local_pool(&path, &resolved_for_load, event_tx, &app_for_load)
     })
     .await
     .map_err(|e| format!("Model load task panicked: {e}"))?
@@ -485,6 +556,10 @@ pub(crate) async fn install_local_model(
     *info_guard = Some(info.clone());
     drop(pool_guard);
     drop(info_guard);
+    // Record the resolved load config + worker count so the llama.cpp
+    // internals inspector reports exactly what the engine is running with.
+    *inference.load_config.lock().await = Some(resolved.clone());
+    *inference.worker_count.lock().await = Some(workers);
 
     // Align the eviction engine's budget with the loaded model's context.
     context_state
@@ -701,11 +776,11 @@ fn show_main_window(app: &AppHandle) {
 fn build_tray(app: &tauri::App) -> Result<(), tauri::Error> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-    let show = MenuItem::with_id(app, "show", "Show AI Editor", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit AI Editor", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show Vencoder", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Vencoder", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let mut builder = TrayIconBuilder::with_id("ai-editor-tray")
-        .tooltip("AI Editor")
+        .tooltip("Vencoder")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, ev| match ev.id.as_ref() {
@@ -821,6 +896,11 @@ pub fn run() {
             commands::model::hf_resume_download,
             commands::model::hf_list_active,
             commands::model::hf_cancel_download,
+            commands::model::hf_model_info,
+            commands::model::hf_verify_model,
+            commands::model::hf_token_status,
+            commands::model::hf_token_save,
+            commands::model::hf_token_clear,
             commands::model::list_downloaded_models,
             commands::model::delete_downloaded_model,
             commands::misc::system_info,
@@ -844,6 +924,13 @@ pub fn run() {
             commands::model::remote_config_load,
             commands::model::unload_model,
             commands::model::model_status,
+            commands::model::llama_runtime_info,
+            commands::llama_settings::llama_bindings_update_check,
+            commands::llama_settings::media_engine_settings_load,
+            commands::llama_settings::media_engine_settings_save,
+            commands::media::media_engine_status,
+            commands::media::media_generate_image,
+            commands::media::media_generate_video,
             commands::agent::stream_inference,
             commands::agent::autocomplete_generate,
             commands::agent::cancel_inference,
@@ -939,7 +1026,7 @@ pub fn run() {
             watcher::file_watcher_active,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building AI Editor")
+        .expect("error while building Vencoder")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 if let Some(mgr) = app_handle.try_state::<std::sync::Arc<lsp::LspManager>>() {

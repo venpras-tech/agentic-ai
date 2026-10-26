@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useShell } from "../../context/AppContext";
 import { api, isTauriRuntime, type IndexSearchHit } from "../../lib/ipc";
 import "./editor.css";
 
@@ -15,6 +16,8 @@ interface FileTreePanelProps {
   refreshSignal?: number;
   /** Open a search hit in-place (the same editor pane) at its line; falls back to `onSelect`. */
   onOpenHit?: (path: string, line: number) => void;
+  onOpenFolder?: () => void;
+  onAddContext?: (relativePath: string) => void;
 }
 
 const ROOT_KEY = "__root__";
@@ -26,7 +29,10 @@ function FileTreePanel({
   onSelect,
   refreshSignal = 0,
   onOpenHit,
+  onOpenFolder,
+  onAddContext,
 }: FileTreePanelProps) {
+  const { indexStatus, indexing, reindex } = useShell();
   const [dirs, setDirs] = useState<Record<string, FsEntry[]>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [query, setQuery] = useState("");
@@ -54,12 +60,23 @@ function FileTreePanel({
   );
 
   useEffect(() => {
-    if (projectPath) {
+    if (!projectPath) {
       setDirs({});
       setExpanded({});
-      void loadDir(ROOT_KEY);
+      return;
     }
-  }, [projectPath, refreshSignal, loadDir]);
+    setDirs({});
+    setExpanded({});
+    void loadDir(ROOT_KEY);
+  }, [projectPath, loadDir]);
+
+  useEffect(() => {
+    if (!projectPath || refreshSignal === 0) return;
+    void loadDir(ROOT_KEY);
+    for (const [path, isOpen] of Object.entries(expanded)) {
+      if (isOpen && path !== ROOT_KEY) void loadDir(path);
+    }
+  }, [refreshSignal, projectPath, expanded, loadDir]);
 
   const runSearch = async () => {
     if (!projectPath || !query.trim()) return;
@@ -89,6 +106,18 @@ function FileTreePanel({
     [dirs, loadDir],
   );
 
+  const relPath = (absPath: string) => {
+    if (!projectPath) return absPath;
+    const base = projectPath.replaceAll("\\", "/").replace(/\/?$/, "/");
+    const norm = absPath.replaceAll("\\", "/");
+    return norm.startsWith(base) ? norm.slice(base.length) : absPath;
+  };
+
+  const rebuildIndex = () => {
+    reindex();
+    if (query.trim()) void runSearch();
+  };
+
   const openHit = (hit: IndexSearchHit) => {
     if (!projectPath) return;
     const base = projectPath.replaceAll("\\", "/").replace(/\/?$/, "/");
@@ -107,7 +136,16 @@ function FileTreePanel({
             className={`editor-tree-row${entry.isDir ? " dir" : ""}${selectedPath === entry.path ? " selected" : ""}`}
             style={{ paddingLeft: 8 + depth * 14 }}
             onClick={() => (entry.isDir ? toggleDir(entry.path) : onSelect(entry.path))}
-            title={entry.path}
+            onContextMenu={(e) => {
+              if (entry.isDir || !onAddContext) return;
+              e.preventDefault();
+              onAddContext(relPath(entry.path));
+            }}
+            title={
+              entry.isDir
+                ? entry.path
+                : `${entry.path}${onAddContext ? " — right-click to add to context" : ""}`
+            }
           >
             <span className="editor-tree-caret">{entry.isDir ? (isOpen ? "▾" : "▸") : ""}</span>
             <span className="editor-tree-icon">{entry.isDir ? "📁" : "📄"}</span>
@@ -155,6 +193,20 @@ function FileTreePanel({
               />
               <span>Sem</span>
             </label>
+            <button
+              type="button"
+              className="editor-tree-search-btn"
+              onClick={() => rebuildIndex()}
+              disabled={!projectPath || indexing}
+              title="Rebuild workspace search index"
+            >
+              {indexing ? "…" : "Index"}
+            </button>
+          </div>
+          <div className="editor-tree-index-status">
+            {indexStatus
+              ? `${indexStatus.indexedFiles.toLocaleString()} files · ${indexStatus.totalChars.toLocaleString()} chars${indexStatus.lastBuilt ? ` · ${new Date(indexStatus.lastBuilt).toLocaleTimeString()}` : ""}`
+              : "Index builds on first search — use Rebuild to refresh."}
           </div>
           {searchError && <div className="editor-tree-search-error">{searchError}</div>}
           {results !== null && (
@@ -184,7 +236,14 @@ function FileTreePanel({
       {results !== null ? null : (
         <div className="editor-tree">
           {!projectPath ? (
-            <div className="editor-tree-loading">No workspace selected</div>
+            <div className="editor-tree-empty">
+              <p>No folder opened</p>
+              {onOpenFolder ? (
+                <button type="button" className="editor-tree-open-folder" onClick={onOpenFolder}>
+                  Open Folder…
+                </button>
+              ) : null}
+            </div>
           ) : (dirs[ROOT_KEY]?.length ?? 0) === 0 ? (
             <div className="editor-tree-loading">Empty workspace</div>
           ) : (

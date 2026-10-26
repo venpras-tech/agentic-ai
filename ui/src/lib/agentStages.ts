@@ -87,6 +87,7 @@ export function reduceAgentStage(
         steps: 0,
       };
     case "token":
+      if (FINISHED.includes(prev.stage)) return prev;
       // Tokens keep streaming for the whole reply: do not restart the timer.
       if (prev.stage === "responding") return prev;
       return {

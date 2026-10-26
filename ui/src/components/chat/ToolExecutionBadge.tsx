@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import "./chat.css";
 
 export type ToolStatus = "pending" | "running" | "success" | "error" | "failed";
@@ -66,7 +66,12 @@ function ToolExecutionBadge({
   args?: string;
 }) {
   const live = (status === "pending" || status === "running" || Boolean(streaming)) && Boolean(output);
-  const [open, setOpen] = useState(live);
+  const isErr = status === "error" || status === "failed";
+  const [open, setOpen] = useState(live || isErr);
+
+  useEffect(() => {
+    if (isErr) setOpen(true);
+  }, [isErr]);
   const [showArgs, setShowArgs] = useState(false);
   const cls = statusClass(status);
   const hasOutput = output.trim().length > 0;

@@ -25,6 +25,7 @@ pub mod hooks;
 pub mod interrupt;
 pub mod mcp;
 pub mod orchestrator;
+pub mod paths;
 pub mod plan;
 pub mod policy;
 pub mod prompt;

@@ -15,13 +15,11 @@ import { useComposerSend } from "../hooks/useComposerSend";
 import { usePlanExecution } from "../hooks/usePlanExecution";
 import { useMessageQueue } from "../hooks/useMessageQueue";
 import { useAgentStreamContext } from "../context/AgentStreamContext";
+import { trackAbort } from "../hooks/useAgentStream";
+import { isChatRoute } from "../lib/chatRoute";
 import "./BottomBar.css";
 
-interface ChatComposerProps {
-  variant?: "bottom" | "home";
-}
-
-function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
+function ChatComposer() {
   const {
     composerDraft,
     setComposerDraft,
@@ -199,9 +197,9 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
 
   const placeholders = useMemo(
     () => ({
-      agent: "Describe a coding task — the agent will edit files and run commands…",
-      ask: "Ask a question or explore the codebase… Enter to send · Shift+Enter new line",
-      plan: "Describe the change for a plan (Shift+Tab)… Enter to send · Shift+Enter new line",
+      agent: "Ask Vencoder to build, fix, or refactor…",
+      ask: "Ask anything about your project…",
+      plan: "Describe what you want planned…",
     }),
     [],
   );
@@ -248,7 +246,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
   }, [composerDraft, setComposerDraft]);
 
   useEffect(() => {
-    if (location.pathname !== "/chat") return;
+    if (!isChatRoute(location.pathname)) return;
     const p = sessionStorage.getItem("homePrompt");
     if (!p) return;
     sessionStorage.removeItem("homePrompt");
@@ -322,7 +320,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
   };
 
   const handleCancel = () => {
-    void api.abortAgentExecution().catch(() => {});
+    trackAbort(api.abortAgentExecution().catch(() => {}));
   };
 
   const steerCurrentRun = () => {
@@ -338,15 +336,15 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     const c = cmd.toLowerCase();
     if (c === "/new" || c === "/n") {
       newChatSession();
-      navigate("/chat");
+      navigate("/");
       return;
     }
-    if (c === "/models" || c === "/m") {
-      navigate("/models");
+    if (c === "/agents" || c === "/models" || c === "/m") {
+      navigate("/agents");
       return;
     }
     if (c === "/index" || c === "/i") {
-      navigate("/project");
+      navigate("/workspace");
       return;
     }
     if (c === "/clear") {
@@ -546,7 +544,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
     }
   };
 
-  const showStatusRow = variant === "bottom" || isProcessing;
+  const showStatusRow = isProcessing;
 
   const smallModelAgent =
     currentMode === "agent" &&
@@ -594,8 +592,8 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
       ) : null}
       <div className="input-row-wrap">
         <form className="input-wrap" onSubmit={(e) => void handleSubmit(e)} aria-busy={isProcessing}>
-          <div className={`chat-input-box ${isProcessing ? "processing" : ""}`}>
-            <div className="chat-input-main">
+          <div className={`composer-card ${isProcessing ? "processing" : ""}`}>
+            <div className="composer-editor">
               {mention && mentionCandidates.length > 0 && (
                 <ul className="mention-menu" role="listbox" aria-label="Context suggestions">
                   {mentionCandidates.map((c, i) => (
@@ -618,6 +616,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                 </ul>
               )}
               <textarea
+                className="composer-textarea"
                 ref={textareaRef}
                 value={composerDraft}
                 onChange={(e) => {
@@ -779,51 +778,16 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                 </button>
               </div>
             )}
-            <div className="chat-input-footer">
-              {contextUsage && (
-                <div
-                  className={`chat-input-context-meter${contextUsage.overflow ? " overflow" : ""}`}
-                  title={[
-                    `Context window ${Math.round(contextUsage.usedPercent)}% — ${contextUsage.totalTokens.toLocaleString()} of ${contextUsage.limit.toLocaleString()} tokens (${contextUsage.messageCount} messages)`,
-                    ...contextBreakdown.map((s) => `${s.label}: ${s.tokens.toLocaleString()}`),
-                  ].join("\n")}
-                  role="img"
-                  aria-label={`Context window ${Math.round(contextUsage.usedPercent)}% used`}
-                >
-                  <span className="chat-input-context-label">ctx</span>
-                  <div className="chat-input-context-track">
-                    {contextBreakdown.length > 0 ? (
-                      contextBreakdown.map((s) => (
-                        <div
-                          key={s.key}
-                          className="chat-input-context-seg"
-                          style={{
-                            width: `${Math.min(100, (s.tokens / contextUsage.limit) * 100)}%`,
-                            background: s.color,
-                          }}
-                        />
-                      ))
-                    ) : (
-                      <div
-                        className="chat-input-context-fill"
-                        style={{ width: `${Math.min(100, contextUsage.usedPercent)}%` }}
-                      />
-                    )}
-                  </div>
-                  <span className="chat-input-context-nums">
-                    {contextUsage.totalTokens.toLocaleString()}/{contextUsage.limit.toLocaleString()}
-                  </span>
-                </div>
-              )}
-              <div className="chat-input-icons">
+            <div className="composer-toolbar">
+              <div className="composer-toolbar-start">
                 <button
                   type="button"
                   className="chat-icon-btn chat-icon-attach"
                   onClick={openContextSelector}
-                  title="Attach files or context to this chat"
+                  title="Attach files or context"
+                  aria-label="Attach"
                 >
                   <span className="chat-icon-btn-label" aria-hidden="true">📎</span>
-                  <span className="chat-icon-btn-text">Attach</span>
                 </button>
                 <button
                   type="button"
@@ -858,12 +822,9 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                   <span className="chat-icon-btn-label" aria-hidden="true">
                     {recording ? "■" : transcribing ? "…" : "🎤"}
                   </span>
-                  <span className="chat-icon-btn-text">
-                    {recording ? "Rec" : transcribing ? "…" : "Voice"}
-                  </span>
                 </button>
                 <select
-                  className={`mode-select mode-select-inline${smallModelAgent ? " mode-select-warn" : ""}`}
+                  className={`composer-mode-select mode-select mode-select-inline${smallModelAgent ? " mode-select-warn" : ""}`}
                   value={currentMode}
                   onChange={(e) => setMode(e.target.value)}
                   title="Agent: implement changes. Ask: explore only. Plan: create Markdown plan"
@@ -939,7 +900,7 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                   type="button"
                   className="chat-icon-btn chat-icon-model"
                   title="Models – choose AI model"
-                  onClick={() => navigate("/models")}
+                  onClick={() => navigate("/agents")}
                 >
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" />
@@ -950,12 +911,46 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                   type="button"
                   className="chat-icon-btn chat-icon-at"
                   onClick={openContextSelector}
-                  title="Context – Add more context"
+                  title="Add context (@)"
+                  aria-label="Add context"
                 >
                   @
                 </button>
               </div>
-              <div className="chat-input-actions">
+              <div className="composer-toolbar-end">
+                {contextUsage && (
+                  <div
+                    className={`composer-ctx-meter${contextUsage.overflow ? " overflow" : ""}`}
+                    title={[
+                      `Context window ${Math.round(contextUsage.usedPercent)}% — ${contextUsage.totalTokens.toLocaleString()} of ${contextUsage.limit.toLocaleString()} tokens (${contextUsage.messageCount} messages)`,
+                      ...contextBreakdown.map((s) => `${s.label}: ${s.tokens.toLocaleString()}`),
+                    ].join("\n")}
+                    role="img"
+                    aria-label={`Context window ${Math.round(contextUsage.usedPercent)}% used`}
+                  >
+                    <div className="composer-ctx-track">
+                      {contextBreakdown.length > 0 ? (
+                        contextBreakdown.map((s) => (
+                          <div
+                            key={s.key}
+                            className="chat-input-context-seg"
+                            style={{
+                              width: `${Math.min(100, (s.tokens / contextUsage.limit) * 100)}%`,
+                              background: s.color,
+                            }}
+                          />
+                        ))
+                      ) : (
+                        <div
+                          className="chat-input-context-fill"
+                          style={{ width: `${Math.min(100, contextUsage.usedPercent)}%` }}
+                        />
+                      )}
+                    </div>
+                    <span className="composer-ctx-pct">{Math.round(contextUsage.usedPercent)}%</span>
+                  </div>
+                )}
+                <div className="composer-actions">
                 {isProcessing && (
                   <button
                     type="button"
@@ -980,13 +975,20 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
                     </svg>
                   </button>
                 ) : (
-                  <button type="submit" className="chat-icon-btn btn-send" title="Send" aria-label="Send">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M22 2L11 13" />
-                      <path d="M22 2L15 22L11 13L2 9L22 2Z" />
+                  <button
+                    type="submit"
+                    className="chat-icon-btn btn-send"
+                    title="Send message"
+                    aria-label="Send message"
+                    disabled={!composerDraft.trim()}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25">
+                      <path d="M12 19V5" />
+                      <path d="m5 12 7-7 7 7" />
                     </svg>
                   </button>
                 )}
+                </div>
               </div>
             </div>
           </div>
@@ -994,10 +996,6 @@ function ChatComposer({ variant = "bottom" }: ChatComposerProps) {
       </div>
     </>
   );
-
-  if (variant === "home") {
-    return <div className="chat-composer chat-composer--home">{body}</div>;
-  }
 
   return body;
 }

@@ -22,6 +22,12 @@
   background: var(--bg-primary);
 }
 
+.terminal-drawer-panel {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+
 .terminal-header {
   display: flex;
   align-items: center;

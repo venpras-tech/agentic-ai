@@ -6,9 +6,18 @@ interface TerminalDrawerProps {
   projectPath: string | null;
   open: boolean;
   onToggle: () => void;
+  /** `panel` fills the bottom panel area; parent owns the tab strip. */
+  variant?: "drawer" | "panel";
+  hideHeader?: boolean;
 }
 
-function TerminalDrawer({ projectPath, open, onToggle }: TerminalDrawerProps) {
+function TerminalDrawer({
+  projectPath,
+  open,
+  onToggle,
+  variant = "drawer",
+  hideHeader = false,
+}: TerminalDrawerProps) {
   const [id, setId] = useState<string | null>(null);
   const [lines, setLines] = useState<TerminalOutputEvent[]>([]);
   const [input, setInput] = useState("");
@@ -112,6 +121,7 @@ function TerminalDrawer({ projectPath, open, onToggle }: TerminalDrawerProps) {
   };
 
   if (!open) {
+    if (variant === "panel") return null;
     return (
       <div className="terminal-drawer-closed">
         <button type="button" className="terminal-tab" onClick={onToggle} title="Open interactive terminal">
@@ -121,28 +131,52 @@ function TerminalDrawer({ projectPath, open, onToggle }: TerminalDrawerProps) {
     );
   }
 
+  const panelClose = () => {
+    if (variant === "panel") onToggle();
+    else close();
+  };
+
   return (
-    <div className="terminal-drawer">
-      <div className="terminal-header">
-        <span className="terminal-title">Terminal {id ? "— live" : exited ? "— ended" : ""}</span>
-        <div className="terminal-actions">
-          <button type="button" className="btn-index" onClick={() => void spawn(projectPath)} disabled={!!id && !exited}>
-            Spawn
-          </button>
-          <button
-            type="button"
-            className="btn-index"
-            onClick={mentionSelection}
-            disabled={!selection.trim()}
-            title="Insert the selected output into the chat composer as @terminal"
-          >
-            Mention
-          </button>
-          <button type="button" className="btn-index" onClick={close} title="Close terminal">
-            Close
-          </button>
+    <div className={`terminal-drawer${variant === "panel" ? " terminal-drawer-panel" : ""}`}>
+      {!hideHeader ? (
+        <div className="terminal-header">
+          <span className="terminal-title">Terminal {id ? "— live" : exited ? "— ended" : ""}</span>
+          <div className="terminal-actions">
+            <button type="button" className="btn-index" onClick={() => void spawn(projectPath)} disabled={!!id && !exited}>
+              Spawn
+            </button>
+            <button
+              type="button"
+              className="btn-index"
+              onClick={mentionSelection}
+              disabled={!selection.trim()}
+              title="Insert the selected output into the chat composer as @terminal"
+            >
+              Mention
+            </button>
+            <button type="button" className="btn-index" onClick={panelClose} title="Close terminal">
+              Close
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="terminal-header terminal-header-compact">
+          <div className="terminal-actions">
+            <button type="button" className="btn-index" onClick={() => void spawn(projectPath)} disabled={!!id && !exited}>
+              + Shell
+            </button>
+            <button
+              type="button"
+              className="btn-index"
+              onClick={mentionSelection}
+              disabled={!selection.trim()}
+              title="Insert selection into chat"
+            >
+              Mention
+            </button>
+          </div>
+        </div>
+      )}
       {error && <div className="terminal-error">{error}</div>}
       <div className="terminal-output" ref={scrollRef} onMouseUp={captureSelection} onKeyUp={captureSelection}>
         {lines.length === 0 && <span className="terminal-empty">Press Spawn to start a shell in the workspace.</span>}

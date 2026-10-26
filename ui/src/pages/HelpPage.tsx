@@ -3,7 +3,7 @@ import "./HelpPage.css";
 function HelpPage() {
   return (
     <div className="help-view">
-      <h2 className="help-title">AI Editor Help</h2>
+      <h2 className="help-title">Vencoder Help</h2>
 
       <section className="help-section">
         <h3 className="help-section-title">Modes</h3>
@@ -27,7 +27,7 @@ function HelpPage() {
           <dt><kbd>/models</kbd> or <kbd>/m</kbd></dt>
           <dd>Open Models page</dd>
           <dt><kbd>/index</kbd> or <kbd>/i</kbd></dt>
-          <dd>Open Project page</dd>
+          <dd>Open Workspace page</dd>
           <dt><kbd>/clear</kbd></dt>
           <dd>Clear context chips</dd>
           <dt><kbd>/mode agent|ask|plan</kbd></dt>
@@ -40,7 +40,7 @@ function HelpPage() {
         <p className="help-desc">Use the context buttons below the input to add context. Context appears as chips above the buttons.</p>
         <dl className="help-dl">
           <dt>@Files</dt>
-          <dd>Include full file contents. Right-click a file in the Project page to add it.</dd>
+          <dd>Include full file contents. Right-click a file in the Workspace explorer to add it.</dd>
           <dt>@Codebase</dt>
           <dd>Semantic search over the workspace. The AI gets relevant chunks based on your message.</dd>
           <dt>@Git</dt>

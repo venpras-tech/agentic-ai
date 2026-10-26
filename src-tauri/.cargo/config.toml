@@ -30,5 +30,9 @@ CMAKE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Com
 # locally-built desktop app loaded from a local path that is the right default;
 # if you ever need a redistributable binary, drop this section and set
 # `GGML_AVX2`/`GGML_F16C`/`GGML_FMA` explicitly instead.
+# `target-cpu=native` enables GGML_NATIVE kernels tuned to this CPU. It is
+# faster but has caused STATUS_HEAP_CORRUPTION in llama.cpp on some Windows
+# hosts. Opt in when you want the extra speed:
+#   $env:VENCODER_NATIVE_CPU = "1"
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = []

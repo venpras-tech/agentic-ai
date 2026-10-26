@@ -75,6 +75,27 @@
   background-attachment: fixed;
 }
 
+.page-content:has(.workspace-ide) {
+  overflow: hidden;
+  padding: 0;
+  background: var(--bg-primary);
+}
+
+.page-content:has(.media-studio),
+.page-content:has(.llama-cpp-page) {
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.llama-cpp-page {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.25rem 2rem;
+}
+
 .page-content[hidden] {
   display: none;
 }

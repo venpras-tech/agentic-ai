@@ -11,7 +11,12 @@ export interface SystemSnapshot {
 export interface ModelSuggestions {
   params: Partial<LlmSettings>;
   kvGiB: number;
+  /** KV cache alone fits in available RAM. */
   fitsRam: boolean;
+  /** Weights + KV cache fit in available RAM (the check that matters). */
+  fitsRamWithWeights: boolean;
+  /** Total RAM the model will need at the suggested context. */
+  totalGiB: number;
   bitsPerWeight: number | null;
   quantLevel: "good" | "caution" | "heavy";
   notes: string[];
@@ -43,6 +48,21 @@ export function suggestLlmParams(meta: ModelInfo, sys: SystemSnapshot | null): M
   params.contextSize = context;
   const fitsRam = !sys || sys.availableRamGb >= kvGiB;
 
+  // 1b. Weights + KV cache is the figure that actually decides whether a load
+  //     will thrash. A 2.7B model stored in F16 is ~5 GiB — as heavy as a 7B
+  //     Q5 — and on a small-RAM machine that is the difference between a fast
+  //     reply and 4 minutes per token while the OS pages. Report it explicitly
+  //     instead of only counting the (much smaller) KV cache.
+  const weightsGiB = meta.sizeBytes > 0 ? meta.sizeBytes / (1024 * 1024 * 1024) : 0;
+  const totalGiB = weightsGiB + kvGiB;
+  const fitsRamWithWeights = !sys || sys.availableRamGb >= totalGiB;
+  if (sys && weightsGiB > 0 && !fitsRamWithWeights) {
+    const deficit = totalGiB - sys.availableRamGb;
+    notes.push(
+      `Needs ~${totalGiB.toFixed(1)} GiB (${weightsGiB.toFixed(1)} GiB weights + ~${kvGiB.toFixed(1)} GiB KV cache) but only ~${sys.availableRamGb.toFixed(1)} GiB is free — about ${deficit.toFixed(1)} GiB short. The OS will page to disk and generation will slow to a crawl. Use a smaller quant or a smaller model.`,
+    );
+  }
+
   // 2. GPU offload: put every layer on the GPU when one is enabled.
   if (sys?.gpuEnabled && sys.gpu && sys.gpu.vramGb > 0) {
     params.nGpuLayers = meta.nLayer > 0 ? meta.nLayer : 0;
@@ -67,7 +87,11 @@ export function suggestLlmParams(meta: ModelInfo, sys: SystemSnapshot | null): M
     );
   }
 
-  // 6. Quantisation quality: bits-per-weight flags heavily-lossy downloads.
+  // 6. Quantisation quality: bits-per-weight flags heavily-lossy downloads —
+  //    and, in the other direction, a bloated one. An F16/BF16 build at ~16
+  //    bits/weight costs ~3.5x the RAM of Q4_K_M for no meaningful quality
+  //    gain, which is a common way to accidentally make a small model as heavy
+  //    as a much larger one.
   let bitsPerWeight: number | null = null;
   let quantLevel: ModelSuggestions["quantLevel"] = "good";
   if (meta.nParams > 0 && meta.sizeBytes > 0) {
@@ -78,8 +102,12 @@ export function suggestLlmParams(meta: ModelInfo, sys: SystemSnapshot | null): M
     } else if (bitsPerWeight < 4.0) {
       quantLevel = "caution";
       notes.push(`~${bitsPerWeight.toFixed(1)} bits/weight — low-ish quantisation. Prefer Q4_K_M (4.5+ b/w) or higher for critical coding work.`);
+    } else if (bitsPerWeight > 12.0) {
+      notes.push(
+        `~${bitsPerWeight.toFixed(1)} bits/weight — this is an unquantised (F16/BF16) build, so it is ~${(bitsPerWeight / 4.5).toFixed(1)}x larger in RAM than the same model at Q4_K_M for no real quality gain. A Q4_K_M or Q5_K_M requant of the same model will run much faster on limited RAM.`,
+      );
     }
   }
 
-  return { params, kvGiB, fitsRam, bitsPerWeight, quantLevel, notes };
+  return { params, kvGiB, fitsRam, fitsRamWithWeights, totalGiB, bitsPerWeight, quantLevel, notes };
 }

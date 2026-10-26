@@ -28,8 +28,8 @@ function TitleBar() {
     <div className="titlebar" data-tauri-drag-region>
       <div className="titlebar-drag" data-tauri-drag-region />
       <div className="titlebar-brand" data-tauri-drag-region>
-        <span className="titlebar-brand-name">AI Editor</span>
-        <span className="titlebar-brand-subtitle">local-first · agent-powered</span>
+        <span className="titlebar-brand-name">Vencoder</span>
+        <span className="titlebar-brand-subtitle">your personal AI assistant</span>
       </div>
       <div className="titlebar-model-status" data-tauri-drag-region>
         {modelLoading ? (

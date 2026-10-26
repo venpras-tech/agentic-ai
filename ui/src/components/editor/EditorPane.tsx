@@ -13,9 +13,20 @@ interface EditorPaneProps {
   onSave?: (path: string, content: string) => void;
   /** 1-based line to scroll into view when the file loads (one-shot per value change). */
   focusLine?: number | null;
+  /** When false, filename/path in the toolbar are hidden (e.g. editor tabs show the name). */
+  showTitleInHeader?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
-function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine }: EditorPaneProps) {
+function EditorPane({
+  selectedPath,
+  projectPath,
+  onAddContext,
+  onSave,
+  focusLine,
+  showTitleInHeader = true,
+  onDirtyChange,
+}: EditorPaneProps) {
   const [content, setContent] = useState("");
   const [original, setOriginal] = useState("");
   const [saving, setSaving] = useState(false);
@@ -29,6 +40,7 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
   const [restoring, setRestoring] = useState(false);
   const [diags, setDiags] = useState<LspDiagnostics | null>(null);
   const [diagsOpen, setDiagsOpen] = useState(false);
+  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem("editor-word-wrap") === "1");
   const diagReqRef = useRef(0);
   const navigate = useNavigate();
   const { setComposerDraft } = useChat();
@@ -44,6 +56,18 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
   originalRef.current = original;
 
   const dirty = selectedPath != null && content !== original;
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  const toggleWordWrap = useCallback(() => {
+    setWordWrap((on) => {
+      const next = !on;
+      localStorage.setItem("editor-word-wrap", next ? "1" : "0");
+      return next;
+    });
+  }, []);
 
   const refreshDiagnostics = useCallback(async (path: string) => {
     if (!isTauriRuntime()) return;
@@ -68,12 +92,18 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
       setFuture([]);
       void refreshDiagnostics(path);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const missing = /not found|cannot find|no such file|os error 2|system cannot find/i.test(msg);
       setContent("");
       setOriginal("");
       setPast([]);
       setFuture([]);
       setDiags(null);
-      setMessage({ kind: "err", text: e instanceof Error ? e.message : String(e) });
+      if (missing) {
+        setMessage({ kind: "ok", text: "New or missing file — edit and save (Ctrl+S) to write to disk." });
+      } else {
+        setMessage({ kind: "err", text: msg });
+      }
     }
   }, [refreshDiagnostics]);
 
@@ -242,13 +272,13 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
     window.dispatchEvent(new CustomEvent("vencoder-prefill-composer", { detail: prompt }));
     setSelection("");
     setSelRange(null);
-    navigate("/chat");
+    navigate("/");
   };
 
   const sendPrompt = (prompt: string) => {
     setComposerDraft(prompt);
     window.dispatchEvent(new CustomEvent("vencoder-prefill-composer", { detail: prompt }));
-    navigate("/chat");
+    navigate("/");
   };
 
   const explainDiagnostic = (d: LspDiagnostic) => {
@@ -402,10 +432,14 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
         e.preventDefault();
         redo();
       }
+      if (e.altKey && k === "z") {
+        e.preventDefault();
+        toggleWordWrap();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo]);
+  }, [undo, redo, toggleWordWrap]);
 
   const onEditorScroll = () => {
     const t = textareaRef.current;
@@ -471,10 +505,26 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
               <path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5v0A5.5 5.5 0 0 0 9.5 20H13" />
             </svg>
           </button>
-          <span className="editor-main-filename" title={selectedPath}>
-            {selectedPath.split(/[/\\]/).pop()}
-          </span>
-          <span className="editor-main-path">{selectedPath}</span>
+          <button
+            type="button"
+            className={`editor-icon-btn${wordWrap ? " is-on" : ""}`}
+            onClick={toggleWordWrap}
+            title="Toggle word wrap (Alt+Z)"
+            aria-label="Toggle word wrap"
+            aria-pressed={wordWrap}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M4 6h16M4 12h10M4 18h14" />
+            </svg>
+          </button>
+          {showTitleInHeader ? (
+            <>
+              <span className="editor-main-filename" title={selectedPath}>
+                {selectedPath.split(/[/\\]/).pop()}
+              </span>
+              <span className="editor-main-path">{selectedPath}</span>
+            </>
+          ) : null}
           {message && <span className={`editor-msg ${message.kind}`}>{message.text}</span>}
           {onAddContext && (
             <button type="button" className="btn-index" onClick={addContext} title="Add this file to the chat context">
@@ -584,11 +634,11 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
             )}
           </div>
         )}
-        <div className="editor-code-wrap">
+        <div className={`editor-code-wrap${wordWrap ? " editor-wrap" : ""}`}>
           <div className="editor-layer" ref={layerRef} aria-hidden="true">
             <div className="editor-pre" dangerouslySetInnerHTML={{ __html: html }} />
           </div>
-          {diags && diagCount > 0 && (
+          {diags && diagCount > 0 && !wordWrap && (
             <div className="editor-gutter" ref={gutterRef}>
               {diags.diagnostics.map((d, i) => (
                 <button
@@ -617,7 +667,7 @@ function EditorPane({ selectedPath, projectPath, onAddContext, onSave, focusLine
             onMouseUp={refreshSelection}
             onBlur={refreshSelection}
             spellCheck={false}
-            wrap="off"
+            wrap={wordWrap ? "soft" : "off"}
           />
           {selection && (
             <button

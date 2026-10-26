@@ -1,0 +1,463 @@
+# Full module enhancement todos — AI Editor (ui/ + src-tauri/)
+
+Generated from per-module review of the shipped codebase vs Cursor / Claude Code / LM Studio / Windsurf patterns.
+
+**Ship target:** `ui/` + `src-tauri/`. **Legacy:** root `src/` — reference only, do not extend.
+
+**Related lists:**
+- `enhancement.txt` — Hugging Face Hub + MCP (detailed P0–P4); Hub/MCP items below point there where duplicated.
+- `todos.txt` — mission spec; many P0–P5 items already checked off.
+- `PROJECT_STATUS.md` — historical audit (verify in `ui/` before treating as open).
+
+**Rules when implementing:** No code comments unless asked. Update `docs/commands-and-events.md` + `docs/manual-test-script.md` for new IPC/events. Run `npm test` in `ui/`, `cargo test` in `src-tauri/`.
+
+---
+
+## Cross-cutting / product shape
+
+- [ ] **XC.1 Primary IDE route** — Treat `/workspace` as canonical; demote `/project` and `/editor` to redirects or merged panels (duplicate tree, search, editor).
+- [ ] **XC.2 Workspace lifecycle helper** — One function: `setProjectPath` + `api.agentSetWorkspace` + index rebuild; fix `WorkspaceSwitcher` (often skips `agentSetWorkspace`).
+- [ ] **XC.3 Invalidate agent caches on workspace change** — Clear `ToolState.sem_index`, repo graph, and related maps on `agent_set_workspace` / watcher root change (stale semantic search).
+- [ ] **XC.4 Unify semantic search stacks** — Today: `commands/index.rs` keyword backend, `tools.rs` `semantic_search_codebase` TF-IDF walk, `rag.rs` hashed n-grams; converge on `SearchIndex` + optional `SemanticSearchBackend` embedder.
+- [ ] **XC.5 Wire LSP diagnostics into agent `read_lints`** — Editor + `verify.rs` use `LspManager`; `read_lints` tool uses heuristics only.
+- [ ] **XC.6 Local model tool protocol** — Local GGUF uses markdown `<execute_tool>` only; no native tool channel (`engine.rs`); document limits vs remote `tools` + `tool_choice`.
+- [ ] **XC.7 Persist secrets consistently** — Remote/HF tokens memory-only (`enhancement.txt` P4.2); OS keychain or backend-only vault for `hf_` + provider keys.
+- [ ] **XC.8 Help + shortcuts drift** — `HelpPage` / `GlobalShortcuts` Ctrl+1–5 omit Workspace, Security, Logs, Hub; align with `Sidebar` routes.
+- [ ] **XC.9 MCP visibility in chat** — Settings probe works; composer/status should show enabled MCP servers + tool count (`enhancement.txt` P3.3).
+- [ ] **XC.10 API server automation gaps** — `api_server.rs`: no SSE for `agent://*` events, no cancel endpoint, no auth on loopback (document threat model).
+
+---
+
+## Backend — `src-tauri/src/hub.rs` + `commands/model.rs` (Hugging Face Hub)
+
+**See `enhancement.txt` P0–P4** for the full Hub + Models provider list.
+
+**Extra module todos:**
+- [ ] **HUB.X1** — Align downloaded-model tokenizer with loaded GGUF (hub fetches `tokenizer.json`; context may still use bundled Qwen fallback for non-Qwen models).
+- [ ] **HUB.X2** — Expose “tool-capable / agent-capable” metadata for local GGUF loads (crude `n_params` gate in orchestrator only).
+
+---
+
+## Backend — `src-tauri/src/agent/mcp.rs` + MCP in `tools.rs` / `registry.rs`
+
+**See `enhancement.txt` P3–P4** for promote-native-tools, `tools/list` schemas, HF MCP preset, protocol gaps.
+
+**Extra module todos:**
+- [ ] **MCP.X1** — `add_mcp_server` agent tool is stdio-only; cannot add HTTP catalog entries from chat.
+- [ ] **MCP.X2** — After `add_mcp_server` / `remove_mcp_server`, call `agent_reset_mcp` or evict cache so stale connections are not reused.
+- [ ] **MCP.X3** — `extract_call_result` on `isError: true` should surface tool `content` text, not JSON-RPC `error` field (`enhancement.txt` P0.7).
+- [ ] **MCP.X4** — Align `call_mcp_tool` timeout: schema default 30s vs implementation 120s (`enhancement.txt` P3.7).
+
+---
+
+## Backend — `src-tauri/src/agent/tools.rs`
+
+**Today:** Hooks → policy → HITL → native tool dispatch; audit + `agent://tool-event`.
+
+- [ ] **TOOLS.1** — `read_lints`: call `LspManager` / merge with marker heuristics.
+- [ ] **TOOLS.2** — `semantic_search_codebase`: use `SearchIndex` / `index_semantic_search` instead of separate `SemIndex` walk.
+- [ ] **TOOLS.3** — Invalidate `sem_index` on workspace change.
+- [ ] **TOOLS.4** — `browse_web` screenshot action: implement or remove from schema.
+- [ ] **TOOLS.5** — Multi-root: search/git tools use `primary_workspace` inconsistently vs `agent_add_workspace`.
+- [ ] **TOOLS.6** — `attach_file` / RAG: PDF/binary/office attachments (Cursor-style).
+- [ ] **TOOLS.7** — `web_search`: pluggable provider + rate limits (not HTML scrape only).
+- [ ] **TOOLS.8** — `download_file` URL safety: DNS rebinding / private IP after resolve (policy has literal URL checks only).
+- [ ] **TOOLS.9** — `run_gh` / git tools: verify all GH-facing tools use real `gh` CLI (audit complete; re-check on change).
+
+---
+
+## Backend — `src-tauri/src/agent/registry.rs` + `core.rs`
+
+**Today:** Single source of tool schemas + dispatch names; parser for `<execute_tool>`.
+
+- [ ] **REG.1** — Register MCP tools as native entries when catalog enabled (depends MCP P3.1).
+- [ ] **REG.2** — Fix workflow example tool names (`workflows.rs` `edit_file` vs `write_file` / `apply_file_diff`).
+- [ ] **REG.3** — Tighter JSON Schema (`enum`, `oneOf`) for high-risk tools (shell, git).
+- [ ] **CORE.1** — Surface parse failures to UI (invalid `<execute_tool>` blocks), not only orchestrator warn append.
+
+---
+
+## Backend — `src-tauri/src/agent/policy.rs`
+
+**Today:** `.ai/policy.json`, red-zone, auto-approve categories, session allow, child gates.
+
+- [ ] **POL.1** — Merge policy across multi-root workspaces (today: first workspace only).
+- [ ] **POL.2** — Structured shell analysis vs substring red-zone (bypass / over-block).
+- [ ] **POL.3** — Clarify YOLO vs per-category auto-approve interaction in UI + backend.
+- [ ] **POL.4** — `calculate` in Ask mode: denied by `ask_mode_tool_verdict` though categorized read-only — align intent.
+
+---
+
+## Backend — `src-tauri/src/agent/subagent.rs` + `background.rs`
+
+**Today:** Profiles explore/implement/review/debug; depth limit; worker leasing; bg `run_agent_loop_pool`.
+
+- [ ] **SUB.1** — **Bug:** debug builtin mode adds tool name `list_directory`; registry tool is `list_dir` (`subagent.rs` ~344).
+- [ ] **SUB.2** — Wire `workflows::prompt_for` or remove dead code; align composer workflow prompts.
+- [ ] **SUB.3** — Custom mode local GGUF `model_override` per path (remote override exists).
+- [ ] **SUB.4** — Parent agent `allowedGlobs` from custom modes (parsed but not enforced on parent — verify `todos.txt` claim).
+- [ ] **SUB.5** — Subagent queue when pool exhausted (today: structured error only).
+- [ ] **BG.1** — Persist background task history across restart (ring buffer only today).
+- [ ] **BG.2** — Steer/context updates during bg run not merged into bg prompt.
+- [ ] **BG.3** — Disambiguate global `InterruptState` vs `abort_background_task`.
+
+---
+
+## Backend — `src-tauri/src/agent/orchestrator.rs` + `prompt.rs` + `interrupt.rs`
+
+**Today:** Generate → parse tools → dispatch → verify/summarize/steer/subagents/plan/todo nudges.
+
+- [ ] **ORCH.1** — User opt-out for `maybe_extract_memory` hidden LLM pass.
+- [ ] **ORCH.2** — Refusal detection (`is_refusal`) — reduce false positives/negatives vs provider signals.
+- [ ] **ORCH.3** — Document/measure real KV reuse wins on local multi-step runs (`cached_prefix_tokens`).
+- [ ] **ORCH.4** — HTTP trace export without live SSE for external automations.
+- [ ] **PROMPT.1** — Optional dynamic system sections (branch, open files, diag summary) in backend default, not only frontend `contextSections`.
+- [ ] **INT.1** — Per-session interrupt map if concurrent foreground tasks are ever supported.
+- [ ] **INT.2** — “Cancel step” vs “abort entire run” semantics.
+
+---
+
+## Backend — `src-tauri/src/agent/context.rs` + `rag.rs`
+
+**Today:** Token budget, pinned buffers, compaction helpers; session attachment index.
+
+- [ ] **CTX.1** — Expose `load_tokenizer` / compaction triggers via IPC (`commands/context.rs` gap).
+- [ ] **CTX.2** — Sync in-flight agent history with `ContextState` meter during long runs.
+- [ ] **CTX.3** — Image/tool-result buckets in context breakdown.
+- [ ] **RAG.1** — Cross-session attachment persistence.
+- [ ] **RAG.2** — Non–UTF-8 / PDF chunking for attachments.
+- [ ] **RAG.3** — Neural embedder alignment with index `SemanticSearchBackend` (deferred `embedder` feature).
+
+---
+
+## Backend — `src-tauri/src/agent/edits.rs` + `verify.rs` + `hooks.rs`
+
+**Today:** Propose/apply/reject edits; `.ai/verify.json` + LSP lines; `.ai/hooks.json` subset.
+
+- [ ] **EDITS.1** — Per-hunk apply primitive (deferred `todos.txt` P5.6 — backend file-granular today).
+- [ ] **EDITS.2** — `apply_file_diff` replace-all / occurrence index (Cursor multi-match).
+- [ ] **EDITS.3** — Auto-apply path when YOLO + edit category auto-approve (product decision).
+- [ ] **VERIFY.1** — Monorepo/task-runner aware verify commands beyond language defaults.
+- [ ] **VERIFY.2** — LSP verify race: doc not opened on server yet.
+- [ ] **VERIFY.3** — Tests: `.ai/verify.json` harness (`todos.txt` P4 Rust tests).
+- [ ] **HOOKS.1** — Additional hook events: UserPromptSubmit, Stop, SessionEnd, PreCompact.
+- [ ] **HOOKS.2** — `post_tool_use` optional side effects / veto policy (product decision).
+- [ ] **HOOKS.3** — Hook latency/failure in agent timeline.
+
+---
+
+## Backend — `src-tauri/src/agent/skills.rs` + `workflows.rs` + `plan.rs` + `todo.rs`
+
+**Today:** Rules/skills/memory; `.ai/workflows/*.md`; `.ai/plan.json`; `.ai/todos.json`.
+
+- [ ] **SKILLS.1** — Dedupe `append_memory` bullets.
+- [ ] **SKILLS.2** — Glob rules semantics aligned with `**` / ignore-style (vs naive matcher).
+- [ ] **SKILLS.3** — Skill install from URL/marketplace (optional).
+- [ ] **WF.1** — Multiline YAML `allowedTools` in workflow frontmatter.
+- [ ] **WF.2** — Structured workflow args (not slash name only).
+- [ ] **PLAN.1** — Reverse sync: editing `plan.md` updates JSON.
+- [ ] **PLAN.2** — Archive multiple plans per workspace.
+- [ ] **TODO.1** — Richer todo model (priority, status beyond done) if product wants Cursor parity.
+
+---
+
+## Backend — `src-tauri/src/engine.rs` + `remote.rs`
+
+**Today:** llama.cpp pool, chat templates, KV hooks; multi-provider SSE + native tools for remote.
+
+- [ ] **ENG.1** — Local vision/mmproj loading (VLM GGUF + projector companions).
+- [ ] **ENG.2** — Auto context/RAM fit at load time (LM Studio-style).
+- [ ] **ENG.3** — Split GGUF load guidance in agent errors → user-facing Hub hint.
+- [ ] **ENG.4** — Dynamic pool sizing under subagent load.
+- [ ] **REM.1** — Provider fallback chain beyond single `route(Editor)`.
+- [ ] **REM.2** — Expose prompt-cache / cost controls where APIs support them.
+- [ ] **REM.3** — Provider-specific tool schema quirks (beyond single OpenAI shape).
+
+---
+
+## Backend — `src-tauri/src/lsp/mod.rs` + `commands/lsp.rs`
+
+**Today:** rust-analyzer, typescript-language-server, pyright; publishDiagnostics + optional pull.
+
+- [ ] **LSP.1** — `lsp_format` command + editor action (deferred `todos.txt` P1.1).
+- [ ] **LSP.2** — Client capabilities: completion, codeAction, formatting, rename.
+- [ ] **LSP.3** — More languages via settings `lspServers` without rebuild.
+- [ ] **LSP.4** — `lsp_restart` / server health for debugging.
+- [ ] **LSP.5** — Push diagnostics subscription to UI (reduce poll-only).
+- [ ] **LSP.6** — Integration test with fake JSON-RPC (`todos.txt` P4).
+
+---
+
+## Backend — `src-tauri/src/commands/index.rs` + `watcher.rs`
+
+**Today:** Incremental index, regex search, `SemanticSearchBackend` (keyword default).
+
+- [ ] **IDX.1** — Wire `EmbedderBackend` when `embedder` feature enabled (`set_semantic_backend` unused).
+- [ ] **IDX.2** — Raise or configure caps (1MB/file, 200k files) for large monorepos.
+- [ ] **IDX.3** — Watcher integration test (`todos.txt` P4).
+- [ ] **IDX.4** — Emit explicit “index stale” for agent re-search nudge.
+- [ ] **WATCH.1** — Multi-root watcher lifecycle when several roots registered.
+
+---
+
+## Backend — `src-tauri/src/commands/agent.rs` + `session.rs` + `settings.rs` + `context.rs` + `editor.rs`
+
+**Today:** IPC surface for agent run, stream inference, sessions, settings, workspace, terminal.
+
+- [ ] **CMD-A.1** — Inline autocomplete UI deferred; backend `autocomplete_generate` complete (`ipc.ts` comment).
+- [ ] **CMD-A.2** — `stream_inference` vs `agent_run_task` feature parity (tools, policy).
+- [ ] **CMD-A.3** — Optional `agent_run_verify` toast in UI (`todos.txt` P1.2).
+- [ ] **SESS.1** — Server-side conversation search API (UI has in-chat Ctrl+F only).
+- [ ] **SESS.2** — Fork copies chat only — optional fork workspace plan/todo state.
+- [ ] **SET.1** — Seed default `.ai/policy.json` template on new workspace.
+- [ ] **SET.2** — Document `localApiServer.route_assistant` perf tradeoff.
+- [ ] **CTX-CMD.1** — IPC for user-triggered compaction / tokenizer register.
+- [ ] **EDIT-CMD.1** — `workspace_on_open` backend command optional (UI lifecycle handles today).
+
+---
+
+## Backend — `src-tauri/src/api_server.rs` + `terminal.rs` + `logging.rs` + `main.rs`
+
+**Today:** Loopback OpenAI-ish API; line-oriented shell; structured logs.
+
+- [ ] **API.1** — `POST /v1/agent/tasks/{id}/cancel`.
+- [ ] **API.2** — SSE or WebSocket bridge for `agent://*` events.
+- [ ] **API.3** — Chunked request bodies for large prompts.
+- [ ] **TERM.1** — Real PTY (xterm.js + ConPTY/Unix pty) vs line shell (colors, TUI, npm progress).
+- [ ] **TERM.2** — Share cwd/env between agent `execute_terminal_command` and integrated terminal.
+- [ ] **LOG.1** — Correlation id across session → tool → audit → log line.
+- [ ] **LOG.2** — Support bundle export (structured, redacted).
+
+---
+
+## Frontend — Pages
+
+### `ui/src/pages/HomePage.tsx`
+- [ ] **HOME.1** — Workspace-aware suggestions (`emptyState.ts`).
+- [ ] **HOME.2** — Recent chats / continue last session.
+- [ ] **HOME.3** — Model + index status on landing.
+- [ ] **HOME.4** — Quick nav: Hub, Workspace, Models.
+
+### `ui/src/pages/ChatPage.tsx`
+- [ ] **CHAT.1** — Markdown/JSON export with tool traces (`exportChat.ts` extension).
+- [ ] **CHAT.2** — Per-chat rename in History.
+- [ ] **CHAT.3** — Path links prefer `/workspace` over `/editor`.
+- [ ] **CHAT.4** — MCP/skills chip row in header.
+
+### `ui/src/pages/WorkspacePage.tsx`
+- [ ] **WS.1** — Persist resizable panel widths.
+- [ ] **WS.2** — Editor tabs + multi-file.
+- [ ] **WS.3** — Inline agent diff gutter in editor.
+- [ ] **WS.4** — Global terminal shortcut (Ctrl+`) from Workspace.
+- [ ] **WS.5** — Optional zen mode (hide chat).
+
+### `ui/src/pages/ProjectPage.tsx` (legacy overlap)
+- [ ] **PROJ.1** — Merge into Workspace or redirect; remove duplicate tree/search/read-only viewer.
+- [ ] **PROJ.2** — Git decorations in tree if kept temporarily.
+- [ ] **PROJ.3** — File create/rename/delete in tree.
+
+### `ui/src/pages/FileEditorPage.tsx`
+- [ ] **FED.1** — Route alias to Workspace with `?path=`; add terminal optional.
+- [ ] **FED.2** — Multi-tab `path` query support.
+
+### `ui/src/pages/ModelsPage.tsx`
+- [ ] **MOD.1** — `enhancement.txt` P4 (Router grouping, HF token, Hub vs Inference labels).
+- [ ] **MOD.2** — Per-model fit badge via `modelSuggest.ts`.
+- [ ] **MOD.3** — `navigate('/models/hub')` instead of `window.location.hash`.
+- [ ] **MOD.4** — Ollama/LM Studio health ping before list.
+- [ ] **MOD.5** — VLM mmproj companion hint when selecting models.
+
+### `ui/src/pages/ModelHubPage.tsx`
+- [ ] **HUB-UI** — All items in `enhancement.txt` P0–P2.
+- [ ] **HUB-UI.X1** — Wire `loadModel` on “On disk” rows.
+- [ ] **HUB-UI.X2** — Deep link row → Settings llama suggest for that quant.
+
+### `ui/src/pages/SettingsPage.tsx`
+- [ ] **SET-UI.1** — MCP copy mentions HTTP transport (`enhancement.txt` P3.6).
+- [ ] **SET-UI.2** — HF token storage shared with Hub/Models (`enhancement.txt` P4.2).
+- [ ] **SET-UI.3** — Show enabled MCP tool list on save without Test-only.
+- [ ] **SET-UI.4** — Skills/rules editor with validation + marketplace import (optional).
+
+### `ui/src/pages/SecurityPage.tsx`
+- [ ] **SEC.1** — Audit log filter/export + jump to turn.
+- [ ] **SEC.2** — Command pattern tester for policy rules.
+- [ ] **SEC.3** — Single source of truth for YOLO (composer vs Security).
+
+### `ui/src/pages/LogsPage.tsx`
+- [ ] **LOGS.1** — Live tail vs poll-only.
+- [ ] **LOGS.2** — Filter by session / agent run id.
+- [ ] **LOGS.3** — Jump from log line to chat turn.
+
+### `ui/src/pages/HelpPage.tsx`
+- [ ] **HELP.1** — Document Workspace, Security, Logs, Hub, RunBoard, rewind, queue/steer.
+- [ ] **HELP.2** — Fix shortcut list vs `GlobalShortcuts`.
+- [ ] **HELP.3** — @mentions, AttachmentsPanel, Provider registry.
+
+### `ui/src/pages/HomePage.tsx` + routing (`App.tsx`)
+- [ ] **ROUTE.1** — Consider default post-onboarding route → `/workspace` when `projectPath` set.
+
+---
+
+## Frontend — Shell & navigation
+
+### `ui/src/components/Layout.tsx` + `Sidebar.tsx` + `TitleBar.tsx` + `BottomBar.tsx`
+- [ ] **SHELL.1** — `BottomBar` on Workspace (or rename; today chat-only).
+- [ ] **SHELL.2** — Backend disconnected banner unified (`StatusBanners` + `Sidebar` retry).
+- [ ] **SHELL.3** — TitleBar: context % meter, branch name, API server port indicator.
+- [ ] **SHELL.4** — Sidebar: collapse Project/Editor into Workspace entry; index badge.
+
+### `ui/src/components/WorkspaceSwitcher.tsx`
+- [ ] **SW.1** — Always call `agentSetWorkspace` when switching roots.
+
+### `ui/src/components/CommandPalette.tsx`
+- [ ] **PAL.1** — File quick-open (`>file` / workspace index).
+- [ ] **PAL.2** — Reindex, load model, toggle MCP server.
+- [ ] **PAL.3** — Run slash commands from palette.
+
+### `ui/src/components/DownloadBar.tsx` + `ui/src/lib/downloads.ts`
+- [ ] **DL.1** — `enhancement.txt` P0.4–P0.6 (shard progress, cancel all parts, disk queue).
+- [ ] **DL.2** — Click bar → Hub row; dismiss all completed.
+
+### `ui/src/components/ProviderRegistry.tsx`
+- [ ] **PR.1** — Test connection + live model dropdown per provider.
+- [ ] **PR.2** — Warn when Editor role points at weak local model.
+- [ ] **PR.3** — Use autocomplete/embed roles in UI (registry exists; editor-focused today).
+
+---
+
+## Frontend — Chat & agent UI
+
+### `ui/src/components/ChatComposer.tsx` + `lib/mention.ts` + `lib/contextSections.ts`
+- [ ] **COMP.1** — Image paste / screenshot → vision providers (`contextState.visual` types exist).
+- [ ] **COMP.2** — Wire **@Past Chats**: HistoryPanel selections → `buildContext({ pastChats })` (chip exists; data not passed).
+- [ ] **COMP.3** — `@folder`, `@symbol` (LSP) in mention typeahead.
+- [ ] **COMP.4** — Slash `/compact`, `/export`, `/security` parity.
+- [ ] **COMP.5** — Drag-drop files → `AttachmentsPanel`.
+- [ ] **COMP.6** — Expose Settings “Ask uses chat completion” in composer.
+
+### `ui/src/components/MessageList.tsx` + `chat/*`
+- [ ] **MSG.1** — Copy tool I/O blocks; collapse very long tool runs.
+- [ ] **MSG.2** — Cite context chips per turn (which @files were pinned).
+- [ ] **CHAT-C.1** — `RunBoard.tsx`: open subagent transcript; filter columns.
+- [ ] **CHAT-C.2** — `EditReviewPanel`: partial apply subset UX polish with backend `editIds`.
+- [ ] **CHAT-C.3** — `CodeBlock.tsx`: “Apply to file” / open in editor.
+- [ ] **CHAT-C.4** — `ExecutionGraphPanel`: export graph image/JSON.
+
+### `ui/src/components/AgentChatSurface.tsx` + `hooks/useAgentStream.ts` + `useComposerSend.ts` + `useMessageQueue.ts` + `usePlanExecution.ts`
+- [ ] **STREAM.1** — Surface MCP tool errors in activity (`isError` body).
+- [ ] **STREAM.2** — Multi-chat concurrent runs UI (if backend ever allows).
+- [ ] **SEND.1** — Retry send with different model.
+- [ ] **SEND.2** — Cost estimate before send (remote usage).
+- [ ] **QUEUE.1** — Optional persist queued messages across reload.
+- [ ] **PLAN-UI.1** — Edit plan text before execute; export plan to file.
+
+### `ui/src/components/HistoryPanel.tsx` + `lib/sessionLog.ts`
+- [ ] **HIST.1** — Search/filter sessions; rename title.
+- [ ] **HIST.2** — Feed selected past chats into composer context pipeline.
+
+### `ui/src/components/AttachmentsPanel.tsx` + `ContextSelector.tsx`
+- [ ] **ATT.1** — Drag-drop + paste; PDF/images.
+- [ ] **CTX-UI.1** — Git sub-mode UI; terminal context chip wired to `contextSections`.
+- [ ] **CTX-UI.2** — Token cost estimate per chip.
+
+### `ui/src/components/GlobalShortcuts.tsx`
+- [ ] **GS.1** — Terminal, editor, clear composer shortcuts; don’t steal from `EditorPane`.
+
+---
+
+## Frontend — Editor
+
+### `ui/src/components/editor/EditorPane.tsx` + `highlight.ts`
+- [ ] **ED.1** — **Inline AI autocomplete** — ghost text via `api.autocomplete` (`ipc.ts`; backend ready).
+- [ ] **ED.2** — Monaco or CodeMirror 6 (multi-cursor, minimap, bracket match) vs textarea.
+- [ ] **ED.3** — Inline LSP squiggles in editor surface (not only diagnostics list).
+- [ ] **ED.4** — Format document (`lsp_format` when backend lands).
+- [ ] **ED.5** — Vim keymap option; problems panel sync with chat path links.
+- [ ] **ED.6** — Virtualize or cap very large files.
+
+### `ui/src/components/editor/FileTreePanel.tsx`
+- [ ] **FT.1** — Git status decorations; file-type icons.
+- [ ] **FT.2** — Context menu: new file/folder, reveal in OS.
+- [ ] **FT.3** — Deduplicate search UX with deprecated Project page.
+
+### `ui/src/components/editor/TerminalDrawer.tsx`
+- [ ] **TERM-UI.1** — xterm.js + true PTY when backend supports (`terminal.rs`).
+- [ ] **TERM-UI.2** — Multiple terminal tabs; cwd selector.
+
+---
+
+## Frontend — Context & model libs
+
+### `ui/src/context/AppContext.tsx` (+ slices)
+- [ ] **APP.1** — Persist sidebar/history layout prefs.
+- [ ] **APP.2** — MCP catalog snapshot exposed to chat layer.
+- [ ] **APP.3** — Error boundary per context slice.
+- [ ] **APP.4** — Refresh `modelMeta` after Hub load completes.
+
+### `ui/src/lib/ipc.ts`
+- [ ] **IPC.1** — Typed event catalog /codegen from `docs/commands-and-events.md`.
+- [ ] **IPC.2** — Vitest mock layer for non-Tauri dev.
+
+### `ui/src/lib/agentPrompt.ts` + `agentPrepare.ts` + `agentRequest.ts`
+- [ ] **APR.1** — Settings preview of assembled system prompt sections.
+- [ ] **APR.2** — Tests extended for new modes/workflows when added.
+
+### `ui/src/lib/modelSuggest.ts` + `localModelConfig.ts` + `llamaCpp.ts`
+- [ ] **MS.1** — Use in Hub + Models rows (`enhancement.txt` P1.1–P1.2).
+- [ ] **MS.2** — VRAM + AMD/Intel GPU detection parity with backend `system_info`.
+
+### `ui/src/lib/exportChat.ts`
+- [ ] **EXP.1** — Markdown export; optional redact secrets.
+- [ ] **EXP.2** — Include tool calls and reasoning blocks in exports.
+
+### `ui/src/lib/providers.ts`
+- [ ] **PROV.1** — Capability flags per provider (tools, vision, context window hints).
+
+---
+
+## Tests & documentation (from `todos.txt` P4 — still open)
+
+- [ ] **TEST.1** — `mcp_server_probe` with mock stdio server (Rust).
+- [ ] **TEST.2** — Watcher + incremental index integration test.
+- [ ] **TEST.3** — LSP fake JSON-RPC diagnostics test.
+- [ ] **TEST.4** — Verify harness reads `.ai/verify.json`.
+- [ ] **TEST.5** — Vitest: workspace lifecycle hook (mock ipc sequence).
+- [ ] **DOC.1** — Keep `docs/commands-and-events.md` in sync on every new command/event.
+- [ ] **DOC.2** — Extend `docs/manual-test-script.md` for Hub token, MCP native tools, LSP format when shipped.
+
+---
+
+## Deferred / out of scope (do not treat as regressions)
+
+- Semantic index **neural** embedder production pipeline (`SemanticSearchBackend` + `embedder` feature) — interface only until wired.
+- Per-hunk inline diff **editing** before apply — needs backend primitive (`todos.txt` P5.6).
+- Deleting legacy root `src/`.
+- Cloud billing, team sync, installer/NSIS changes.
+- Monaco migration explicitly optional — CodeMirror 6 or ghost-text on textarea acceptable intermediate.
+
+---
+
+## Suggested global implementation order
+
+1. **Correctness bugs** — SUB.1 (`list_directory` vs `list_dir`), MCP.X3, Hub `enhancement.txt` P0, workspace cache invalidation (XC.3).
+2. **Agent intelligence** — TOOLS.1–2, XC.4–5, MCP P3.1–P3.2 (`enhancement.txt`).
+3. **IDE consolidation** — XC.1–2, WS.*, PROJ.1, FED.1, ED.1–ED.3.
+4. **Models path** — Hub P1 + `enhancement.txt` P4 + MOD.* + MS.*.
+5. **Automation & polish** — API.1–2, TERM.1, TEST.*, HELP.1.
+
+---
+
+## Module index (files reviewed)
+
+| Area | Primary paths |
+|------|----------------|
+| Hub | `src-tauri/src/hub.rs`, `commands/model.rs`, `ui/.../ModelHubPage.tsx`, `downloads.ts`, `DownloadBar.tsx` |
+| MCP | `agent/mcp.rs`, `agent/tools.rs`, `commands/misc.rs`, `SettingsPage.tsx` |
+| Agent core | `agent/{orchestrator,tools,registry,core,policy,subagent,edits,context,rag,skills,workflows,plan,todo,hooks,verify,background,prompt,interrupt,mod}.rs` |
+| Inference | `engine.rs`, `remote.rs`, `commands/model.rs` |
+| Workspace intel | `commands/index.rs`, `watcher.rs`, `lsp/mod.rs`, `commands/lsp.rs` |
+| IPC / API | `commands/{agent,editor,session,settings,context}.rs`, `api_server.rs`, `ui/src/lib/ipc.ts` |
+| UI shell | `Layout.tsx`, `Sidebar.tsx`, `WorkspacePage.tsx`, `ChatComposer.tsx`, `EditorPane.tsx` |
+| Chat parity | `MessageList.tsx`, `AgentChatSurface.tsx`, `hooks/useAgentStream.ts` (P5 largely shipped per `todos.txt`) |
+
+When an item ships, check it off here and in `enhancement.txt` / `todos.txt` if applicable. Add a one-line note under the checkbox with date or PR if desired.

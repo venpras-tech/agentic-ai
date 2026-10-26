@@ -1,0 +1,57 @@
+.home-view-agents .connected-agents-rail {
+  width: 100%;
+  max-width: 42rem;
+  text-align: left;
+}
+
+.home-agent-bar {
+  width: 100%;
+  max-width: 28rem;
+}
+
+.home-quick-agents {
+  width: 100%;
+  max-width: 42rem;
+  text-align: left;
+}
+
+.home-quick-label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.home-quick-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-start;
+}
+
+.home-quick-agent {
+  padding: 0.45rem 0.75rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.home-quick-agent:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.home-quick-more {
+  border-style: dashed;
+}
+
+.agents-page .connected-agents-rail {
+  flex-shrink: 0;
+}

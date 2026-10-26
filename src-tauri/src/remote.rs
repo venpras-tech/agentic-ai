@@ -182,6 +182,10 @@ pub fn default_base_url(provider: &str) -> Option<&'static str> {
         "moonshot" => Some("https://api.moonshot.cn/v1"),
         "zai" => Some("https://api.z.ai/api/paas/v4"),
         "hyperbolic" => Some("https://api.hyperbolic.xyz/v1"),
+        "vllm" => Some("http://localhost:8000/v1"),
+        "localai" => Some("http://localhost:8080/v1"),
+        "litellm" => Some("http://localhost:4000/v1"),
+        "github" => Some("https://models.inference.ai.azure.com"),
         _ => None,
     }
 }

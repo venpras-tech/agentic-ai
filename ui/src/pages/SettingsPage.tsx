@@ -3,6 +3,7 @@ import { useShell, useModel, useAgentSettings } from "../context/AppContext";
 import { api, isTauriRuntime, type McpServerConfig, type McpTransport, type McpProbeResult, type Skill } from "../lib/ipc";
 import { suggestLlmParams, type SystemSnapshot } from "../lib/modelSuggest";
 import {
+  applyClearedConfig,
   mergeLocalConfig,
   normalizedConfig,
   sanitizeLocalConfig,
@@ -10,6 +11,7 @@ import {
   type LocalModelConfig,
 } from "../lib/localModelConfig";
 import ProviderRegistry from "../components/ProviderRegistry";
+import LlamaCppSettingsPanel from "../components/settings/LlamaCppSettingsPanel";
 import { getVersion } from "@tauri-apps/api/app";
 import "./SettingsPage.css";
 
@@ -197,7 +199,7 @@ function BanIcon() {
 
 function SettingsPage() {
   const { theme, setTheme, projectPath } = useShell();
-  const { llmSettings, loadLlmSettings, saveLlmSettings, modelMeta, activeModelConfig, activeLocalModelPath, saveLocalModelConfig } = useModel();
+  const { llmSettings, loadLlmSettings, saveLlmSettings, modelMeta, activeModelConfig, activeLocalModelPath, saveLocalModelConfig, reloadModel, modelLoading } = useModel();
   const { verify, setVerify, yolo, setYolo, maxSteps, setMaxSteps, tokenBudget, setTokenBudget, decompose, setDecompose, preferChatComplete, setPreferChatComplete } = useAgentSettings();
   const [activeSection, setActiveSection] = useState("general");
   const [formOpen, setFormOpen] = useState(false);
@@ -530,6 +532,16 @@ function SettingsPage() {
     setLocalErrors([]);
     void loadLlmSettings();
     notify("LLM settings reset to the last saved values.");
+  };
+
+  const reloadNow = async () => {
+    applyLlm();
+    try {
+      await reloadModel();
+      notify("Model reloaded with the latest LLM settings.");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err), true);
+    }
   };
 
   const applyMcp = async () => {
@@ -889,6 +901,7 @@ function SettingsPage() {
             { id: "providers", label: "Providers" },
             { id: "skills", label: "Skills" },
             { id: "llm", label: "LLM" },
+            { id: "llamacpp", label: "llama.cpp" },
             { id: "agent", label: "Agent" },
             { id: "mcp", label: "MCP" },
             { id: "about", label: "About" },
@@ -1135,6 +1148,9 @@ function SettingsPage() {
                     <span>Train ctx: {modelMeta.nCtxTrain.toLocaleString()}</span>
                     <span>Layers: {modelMeta.nLayer}</span>
                     <span>KV cache: ~{suggestions ? suggestions.kvGiB.toFixed(1) : "?"} GiB @ suggested ctx</span>
+                    {suggestions && suggestions.totalGiB > 0 && (
+                      <span>RAM needed: ~{suggestions.totalGiB.toFixed(1)} GiB (weights + cache)</span>
+                    )}
                   </div>
                   {suggestions && (
                     <div className="settings-llm-suggest-values">
@@ -1152,7 +1168,14 @@ function SettingsPage() {
                       </div>
                     </div>
                   )}
-                  {suggestions?.fitsRam === false && (
+                  {suggestions?.fitsRamWithWeights === false && (
+                    <p className="settings-llm-suggest-warn settings-llm-suggest-warn-strong">
+                      Warning: this model needs ~{suggestions.totalGiB.toFixed(1)} GiB in RAM (weights + KV cache) but
+                      the machine has less free — it will page to disk and generate extremely slowly. Use a smaller
+                      quant or a smaller model.
+                    </p>
+                  )}
+                  {suggestions?.fitsRam === false && suggestions?.fitsRamWithWeights !== false && (
                     <p className="settings-llm-suggest-warn">
                       Warning: the model plus its suggested context may exceed available RAM — consider a smaller
                       context or a smaller quant.
@@ -1236,10 +1259,28 @@ function SettingsPage() {
                 <button type="button" className="settings-btn settings-btn-primary" onClick={applyLlm}>
                   Apply
                 </button>
+                <button
+                  type="button"
+                  className="settings-btn"
+                  disabled={modelLoading || !activeLocalModelPath}
+                  title={
+                    activeLocalModelPath
+                      ? "Save and unload/reload the model so the new context size takes effect now"
+                      : "Load a local model to enable reload"
+                  }
+                  onClick={() => void reloadNow()}
+                >
+                  {modelLoading ? "Reloading…" : "Apply & reload model"}
+                </button>
                 <button type="button" className="settings-btn settings-btn-danger" onClick={resetLlm}>
                   Reset
                 </button>
               </div>
+              <p className="settings-hint">
+                Increasing <strong>Context length</strong> raises how much conversation and code the model can
+                hold at once. It is applied at load time, so use <strong>Apply &amp; reload model</strong> to
+                take effect immediately (a large context needs more RAM for the KV cache).
+              </p>
 
               <h4 style={{ margin: "18px 0 10px", fontSize: "0.85rem", fontWeight: 600, color: "var(--text-primary)" }}>
                 Local model server
@@ -1685,6 +1726,12 @@ curl -s http://127.0.0.1:${apiSrvPort}/v1/chat/completions \\
             </div>
           )}
 
+          {activeSection === "llamacpp" && (
+            <div className="settings-panel">
+              <LlamaCppSettingsPanel embedded />
+            </div>
+          )}
+
           {activeSection === "agent" && (
             <div className="settings-panel">
               <h3 className="settings-panel-heading">Agent behavior</h3>
@@ -1816,7 +1863,7 @@ curl -s http://127.0.0.1:${apiSrvPort}/v1/chat/completions \\
               <h3 className="settings-panel-heading">About</h3>
               <div className="settings-about-block">
                 <div className="settings-about-logo">AI</div>
-                <div className="settings-about-name">AI Editor</div>
+                <div className="settings-about-name">Vencoder</div>
                 <div className="settings-about-version">
                   Version {appVersion}
                   {isTauriRuntime() ? "" : " · dev preview (browser)"}
@@ -1824,7 +1871,7 @@ curl -s http://127.0.0.1:${apiSrvPort}/v1/chat/completions \\
               </div>
               <p className="settings-hint">
                 A local-first coding agent that runs fully on your machine — models, edits, and execution all
-                stay local. Pick a model on the Models page, then chat on the Home page to build.
+                stay local. Pick a model on the Agents page, then chat to build.
               </p>
               <div className="settings-field">
                 <label className="settings-label">System info</label>

@@ -216,6 +216,13 @@ impl McpHandle {
         Ok(parse_tools(&resp))
     }
 
+    /// Ask the server which tools it exposes via `tools/list`, returning full
+    /// tool definitions (name, description, inputSchema).
+    pub async fn list_tool_defs(&mut self) -> Result<Vec<Value>, String> {
+        let resp = self.request("tools/list", json!({})).await?;
+        Ok(parse_tool_defs(&resp))
+    }
+
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -351,6 +358,14 @@ impl McpClient {
             McpClient::Http(h) => h.list_tools().await,
         }
     }
+
+    /// Ask the server which tools it exposes via `tools/list`, returning full definitions.
+    pub async fn list_tool_defs(&mut self) -> Result<Vec<Value>, String> {
+        match self {
+            McpClient::Stdio(h) => h.list_tool_defs().await,
+            McpClient::Http(h) => h.list_tool_defs().await,
+        }
+    }
 }
 
 /// JSON-RPC over HTTP (MCP "Streamable HTTP" transport). A response may arrive
@@ -405,6 +420,11 @@ impl HttpClient {
     pub async fn list_tools(&mut self) -> Result<Vec<String>, String> {
         let resp = self.request("tools/list", json!({})).await?;
         Ok(parse_tools(&resp))
+    }
+
+    pub async fn list_tool_defs(&mut self) -> Result<Vec<Value>, String> {
+        let resp = self.request("tools/list", json!({})).await?;
+        Ok(parse_tool_defs(&resp))
     }
 
     fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -557,11 +577,13 @@ fn extract_call_result(resp: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| json!([]));
     let text = extract_text(&content);
     if err {
-        let mcp_err = resp
-            .get("error")
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "MCP tool reported an error".to_string());
-        return Err(mcp_err);
+        if !text.trim().is_empty() {
+            return Err(text);
+        }
+        if let Some(mcp_err) = resp.get("error").map(|e| e.to_string()) {
+            return Err(mcp_err);
+        }
+        return Err("MCP tool reported an error".to_string());
     }
     Ok(json!({ "text": text }))
 }
@@ -578,6 +600,15 @@ fn parse_tools(resp: &Value) -> Vec<String> {
     }
     tools.sort();
     tools
+}
+
+/// Return full tool definitions from a `tools/list` response.
+fn parse_tool_defs(resp: &Value) -> Vec<Value> {
+    if let Some(arr) = resp.pointer("/result/tools").and_then(|t| t.as_array()) {
+        arr.iter().cloned().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Flatten MCP `content` (list of `{type:"text"|"image"|…}` items) to a string.

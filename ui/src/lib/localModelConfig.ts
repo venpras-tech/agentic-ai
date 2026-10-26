@@ -3,12 +3,12 @@
 // default / auto), persisted per model path under `localModelConfigs` in
 // `settings.json`. Pure helpers here are unit-tested.
 //
-// Only the model-loading essentials are exposed: context, GPU offload, CPU
-// threads, plus max output tokens. Generation sampling is deliberately NOT
-// configurable — the engine always uses llama.cpp's own default sampler chain
-// so responses are never manipulated by the app. Everything else (batch size,
-// flash attention, KV cache, RoPE, llama.cpp argument overrides, …) falls back
-// to the engine defaults.
+// The essentials (context, GPU offload, CPU threads, max output tokens) are
+// edited on the LLM page; the advanced llama.cpp internals (batch size,
+// flash attention, KV-cache quantization, memory mapping, RoPE, raw argument
+// overrides, …) are edited on the llama.cpp page. Generation sampling is
+// deliberately NOT configurable — the engine always uses llama.cpp's own
+// default sampler chain so responses are never manipulated by the app.
 
 export interface LocalModelConfig {
   /** Layers offloaded to the GPU (0 = CPU only). */
@@ -19,6 +19,35 @@ export interface LocalModelConfig {
   nThreads?: number;
   /** Generation default: max output tokens. -1 = infinite (context-limited). */
   maxTokens?: number;
+  // ---- advanced llama.cpp internals (edited on the llama.cpp page) ----
+  /** How many parallel engine workers (each with its own context). */
+  nWorkers?: number;
+  /** Evaluation batch size (llama.cpp `n_batch`). */
+  nBatch?: number;
+  /** Physical batch size (llama.cpp `n_ubatch`). */
+  nUbatch?: number;
+  /** Unified KV cache (uKVC). */
+  unifiedKv?: boolean;
+  /** Flash attention. Unset = runtime auto. */
+  flashAttn?: boolean;
+  /** Offload the KV cache to GPU memory (`--no-kv-offload` disables). */
+  offloadKqv?: boolean;
+  /** Memory-map the weights (`--mmap`). */
+  useMmap?: boolean;
+  /** Lock the model in memory (`--mlock`). */
+  useMlock?: boolean;
+  /** RoPE frequency base override. */
+  ropeFreqBase?: number;
+  /** RoPE frequency scale override. */
+  ropeFreqScale?: number;
+  /** K-cache quantization type (e.g. `Q8_0`). */
+  cacheTypeK?: string;
+  /** V-cache quantization type (e.g. `Q8_0`). */
+  cacheTypeV?: string;
+  /** Seed used for local generations when the request carries none. */
+  seed?: number;
+  /** Raw llama.cpp argument overrides (space separated). */
+  llamaArgs?: string;
 }
 
 export const LOCAL_CONFIG_KEYS: (keyof LocalModelConfig)[] = [
@@ -26,7 +55,37 @@ export const LOCAL_CONFIG_KEYS: (keyof LocalModelConfig)[] = [
   "contextSize",
   "nThreads",
   "maxTokens",
+  "nWorkers",
+  "nBatch",
+  "nUbatch",
+  "unifiedKv",
+  "flashAttn",
+  "offloadKqv",
+  "useMmap",
+  "useMlock",
+  "ropeFreqBase",
+  "ropeFreqScale",
+  "cacheTypeK",
+  "cacheTypeV",
+  "seed",
+  "llamaArgs",
 ];
+
+/** Keys whose value is a boolean (so sanitizing must not coerce them to numbers). */
+const BOOLEAN_CONFIG_KEYS = new Set<keyof LocalModelConfig>([
+  "unifiedKv",
+  "flashAttn",
+  "offloadKqv",
+  "useMmap",
+  "useMlock",
+]);
+
+/** Keys whose value is a string. */
+const STRING_CONFIG_KEYS = new Set<keyof LocalModelConfig>([
+  "cacheTypeK",
+  "cacheTypeV",
+  "llamaArgs",
+]);
 
 const DEFAULT_CONFIG_KEY = "default";
 
@@ -54,6 +113,16 @@ export function sanitizeLocalConfig<T extends Partial<LocalModelConfig>>(
   for (const key of LOCAL_CONFIG_KEYS) {
     const v = (cfg as Record<string, unknown>)[key];
     if (v === undefined || v === null) continue;
+    if (BOOLEAN_CONFIG_KEYS.has(key)) {
+      if (typeof v === "boolean") (out as Record<string, unknown>)[key] = v;
+      continue;
+    }
+    if (STRING_CONFIG_KEYS.has(key)) {
+      if (typeof v === "string" && v.trim() !== "") {
+        (out as Record<string, unknown>)[key] = v;
+      }
+      continue;
+    }
     if (typeof v === "string") {
       if (v.trim() === "") continue;
       const n = Number(v);
@@ -87,6 +156,36 @@ export function mergeLocalConfig(
 /** Keep only the defined keys (drop `undefined`/`null`/`""`/`NaN`) so nothing redundant is persisted. */
 export function normalizedConfig<T extends Partial<LocalModelConfig>>(c: T): T {
   return sanitizeLocalConfig(c as Record<string, unknown>) as T;
+}
+
+/**
+ * Overlay `patch` on top of `base`, where a key the caller explicitly set to
+ * `null` (or `""`) is *removed* rather than ignored.
+ *
+ * `mergeLocalConfig` cannot unset a value — a sanitized patch just omits it,
+ * which leaves the previous value in place. Forms that let a user blank a field
+ * back to "auto/engine default" need that removal, so they call this instead.
+ */
+export function applyClearedConfig(
+  base: Partial<LocalModelConfig> | undefined,
+  patch: Record<string, unknown>,
+): Partial<LocalModelConfig> {
+  const out: Partial<LocalModelConfig> = { ...(sanitizeLocalConfig(base ?? {})) };
+  const target = out as Record<string, unknown>;
+  for (const key of LOCAL_CONFIG_KEYS) {
+    if (!(key in patch)) continue;
+    const raw = patch[key];
+    const cleared =
+      raw === null || raw === undefined || (typeof raw === "string" && raw.trim() === "");
+    if (cleared) {
+      delete target[key];
+      continue;
+    }
+    const clean = sanitizeLocalConfig({ [key]: raw } as Record<string, unknown>);
+    const v = clean[key];
+    if (v !== undefined) target[key] = v;
+  }
+  return out;
 }
 
 const int = (v: unknown, label: string): number | null => {

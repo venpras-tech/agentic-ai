@@ -1,0 +1,410 @@
+# Implementation prompt: fully working OpenCode-style TUI for AI Editor
+
+You are implementing a production-ready terminal user interface (TUI) for the **ai-editor** repository (`D:\ai` / repo root). The TUI must provide **full agentic coding parity** with the existing Tauri + React desktop app, with UX and interaction patterns aligned to **OpenCode** (terminal-first coding agent: project cwd, streaming chat, tool timeline, permissions, file edits with review, sessions, slash commands, model routing). Do not ship a thin HTTP demo; ship a **standalone headless binary** that runs without WebView.
+
+**Constraints**
+- Ship target: `ui/` + `src-tauri/` only. Do not extend legacy root `src/`.
+- Do not add source code comments unless explicitly requested.
+- Liquibase: if any DB migrations appear, use SQL changesets only.
+- Update `docs/commands-and-events.md` and `docs/manual-test-script.md` for any new IPC, CLI flags, events, or TUI-only surfaces.
+- Run `npm test` in `ui/` and `cargo test` in `src-tauri/` before considering done.
+- Never commit secrets (HF tokens, API keys).
+
+---
+
+## 1. Product definition
+
+### 1.1 Binary and entrypoints
+
+Add a **second binary** in the workspace (preferred) or a feature-gated subcommand:
+
+- **Name:** `ai-editor-tui` (or `ai-editor` with `ai-editor tui` subcommand via `clap`).
+- **Invocation examples:**
+  - `ai-editor-tui` — open TUI in current directory if git/workspace else prompt for path.
+  - `ai-editor-tui --cwd C:\path\to\repo`
+  - `ai-editor-tui --model path\to\model.gguf`
+  - `ai-editor-tui --remote` — use Settings/providers route for `editor` role without GUI.
+  - `AI_EDITOR_TUI=1` optional env mirror for CI smoke.
+
+Release builds must **not** require port 1420 or embedded `dist/`; TUI uses Rust core only (`custom-protocol` irrelevant for TUI binary).
+
+### 1.2 OpenCode parity (must-have)
+
+| Area | Requirement |
+|------|-------------|
+| Workspace | Set primary workspace (`agent_set_workspace`), optional multi-root (`agent_add_workspace` / `agent_remove_workspace`), show cwd in status bar |
+| Chat | Multi-turn transcript, streaming assistant tokens, markdown rendering (limited: bold, code fences, lists) |
+| Agent loop | Same backend as GUI: `agent_run_task` core via shared `run_agent_task_inner` |
+| Tools | Live tool badges, `agent://tool-event`, `agent://tool-output`, exit codes |
+| HITL | `agent://hitl-gate`, `agent://permission-request`, `agent://question-request` — blocking modal panes; map to `agent_respond_hitl`, `agent_respond_permission`, `agent_respond_question` |
+| Edits | `agent://edit-proposed` → review UI with unified diff (`similar` already in backend); apply/reject/conflict via `agent_apply_edits`, `agent_reject_edits`, `agent_resolve_edit_conflict`; listen for `agent://edit-applied`, `agent://edit-failed` |
+| Verify | Show `agent://verify-result`; manual `agent_run_verify` |
+| Checkpoints | `agent_checkpoint_list`, `agent_checkpoint_restore`; `/undo` `/rewind` using `ui/src/lib/rewind.ts` logic (`selectRewindCheckpoints`, `planRewind`, `restoreRewind`) ported to Rust or shared crate |
+| Plan mode | `planMode: true` then user approves → second run with `planMode: false` (mirror `buildPlanExecutionRequest` in `ui/src/lib/agentRequest.ts`) |
+| Modes | `agent` / `ask` / `plan` — mirror `useApp` `currentMode` and `buildSystemPrompt` / `backendAgentMode` in `ui/src/lib/agentPrepare.ts` |
+| Workflows | Load `agent_workflows`, `/workflow <name>`, enforce via `workflow_enforce_tools` |
+| Custom modes | `agent_modes`, `.ai/modes/*.md` selection |
+| Steer / abort | `agent_steer` while running; `abort_agent_execution`; show `agent://steer-applied` |
+| Queue | While `isProcessing`, queue user messages (mirror `useMessageQueue.ts`) with option to steer instead |
+| Context | Port `prepareAgentTurn` + `buildContext` from `ui/src/lib/agentPrepare.ts` and `ui/src/lib/contextSections.ts`: system prompt, pinned buffer, `context_push_turn`, `context_set_selection`, attachments |
+| Sessions | `session_append`, `session_tail`, `session_fork`, `session_delete_chat`, `session_projects`; persist per project like GUI |
+| Settings | Read/write `settings_load` / `settings_save`; honor `buildAgentRequest` defaults (`DEFAULT_MAX_TOKENS`, `DEFAULT_MAX_STEPS`, small-model cap) |
+| Models | `auto_load_model`, `load_model_from_path`, `unload_model`, `model_status`, `providers_route("editor")`, `configure_remote_model`, `list_downloaded_models` |
+| Index | `index_rebuild`, `index_status`, `index_search`, `index_semantic_search`; show `index://progress` |
+| MCP | `mcp_catalog_load`, probe status in status bar; respect allow-lists (no GUI-only bypass) |
+| Policy | `agent_policy_snapshot`, YOLO toggle `agent_set_yolo`, path grants `agent_grant_path` / `agent_revoke_path`, audit tail `agent_audit_log` |
+| Background tasks | `agent_run_background`, `list_background_tasks`, `background_task_output`, `abort_background_task`, `agent://bg-task-event` |
+| Subagents | Render `agent://subagent-run` |
+| Plan/todo UI | `agent://plan-step`, `agent://todo-update`, `agent://subtask` |
+| Run trace | `agent://run-trace` footer or `:trace` command |
+| Slash commands | Port from `ui/src/components/ChatComposer.tsx` `handleSlashCommand`: `/new`, `/models`, `/index`, `/clear`, `/undo`, `/rewind`, `/mode agent|ask|plan`, `/workflow <name>` |
+| Mentions | Port tokens from `ui/src/lib/mention.ts` (`@file`, `@terminal`, etc.) into context path chips |
+| Logs | Optional pane: `log_read`, `log_files` or tail `console-log` equivalent routed to TUI log buffer |
+| Help | Static shortcut overlay (`?`) listing keys and slash commands |
+
+### 1.3 Explicit non-goals (GUI-only; stub with message)
+
+- Monaco editor pane, drag-drop HF hub browser UI, system tray, voice dictation (unless `voice_transcribe_data` wired later), native file picker dialogs → use TUI file picker or `$EDITOR` for manual edits.
+- Hugging Face download progress UI → CLI flags or defer to desktop app; optional minimal `hf_search` + `hf_download_model` text progress bar.
+
+---
+
+## 2. Architecture (mandatory refactor)
+
+Today almost all logic is behind Tauri `AppHandle` + `emit`. The TUI **must not** spawn a hidden WebView. Extract a **headless application core** reused by Tauri `main.rs` and the TUI binary.
+
+### 2.1 New module layout (under `src-tauri/`)
+
+Create `src-tauri/src/core/` (or `src-tauri/src/app_core/`):
+
+```
+core/
+  mod.rs
+  runtime.rs      # AppCore: owns all managed state (mirror main.rs .manage(...))
+  events.rs       # EventBus: typed enum AgentEvent + broadcast channel (tokio::sync::broadcast or crossbeam)
+  dispatch.rs     # invoke-equivalent async API: run_agent_task, settings_load, ... (no Tauri)
+  init.rs         # bootstrap logging, knowledge scan, default policy
+```
+
+**AppCore** holds:
+- `InferenceState`, `ProviderRegistryState`, `ContextState`, `Arc<ToolState>`, `InterruptState`, `SearchIndex`, `WatcherState`, `KnowledgeState`, `LspManager`, `TerminalSessions`, `HubState`, `ApiServerState` (optional for TUI).
+
+**Event emission:** Replace direct `app.emit("agent://...", payload)` in orchestrator/tools with `EventSink` trait:
+
+```rust
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: &str, payload: Value);
+}
+```
+
+Implementations:
+- `TauriEventSink(AppHandle)` — existing behavior.
+- `BusEventSink(Sender<CoreEvent>)` — TUI subscribes.
+
+Refactor `orchestrator.rs`, `tools.rs`, `commands/agent.rs`, `engine` token path, `watcher`, `index` to accept `&dyn EventSink` or `Arc<dyn EventSink>` instead of hard-coded `AppHandle` where feasible. **Minimize duplication:** `run_agent_task_inner` must call the same code from TUI `dispatch::agent_run_task`.
+
+### 2.2 TUI crate/binary
+
+```
+src-tauri/src/bin/ai_editor_tui.rs   # main: clap, crossterm, ratatui loop
+src-tauri/src/tui/
+  mod.rs
+  app.rs           # TuiApp state machine
+  ui/              # layout components
+    chat.rs
+    status_bar.rs
+    tool_log.rs
+    diff_review.rs
+    permission_modal.rs
+    question_modal.rs
+    file_picker.rs
+    session_sidebar.rs
+  input.rs         # textarea + history (mirror console_history)
+  stream.rs        # maps CoreEvent → UI mutations (port useAgentStream.ts)
+  theme.rs
+  markdown.rs      # lightweight terminal markdown
+```
+
+**Dependencies to add** (`src-tauri/Cargo.toml`):
+- `ratatui` (with `crossterm` backend)
+- `crossterm`
+- `clap` (derive)
+- `unicode-width`, `textwrap` (layout)
+- Reuse existing: `serde_json`, `tokio`, `similar` (for TUI-side diff preview if needed)
+
+### 2.3 Session / event filtering (port `useAgentStream.ts`)
+
+Implement the same invariants:
+- `activeSessionId`, `sessionClaimPending`, `sessionOwned` — ignore stale events from prior runs after `/new`.
+- On send: `claimNextSession` → `prepareAgentTurn` → `context_push_turn(user)` → `agent_run_task` → `setActiveSessionId`.
+- Filter all `agent://*` and `inference-token` / `inference-done` by `sessionId` when `sessionOwned`.
+- On `inference-done`: append assistant turn via `session_append`; clear processing flag.
+- Permission/question modals: single-flight; queue additional requests.
+
+Reference files to port line-by-line:
+- `ui/src/hooks/useAgentStream.ts`
+- `ui/src/hooks/useComposerSend.ts`
+- `ui/src/lib/agentPrepare.ts`
+- `ui/src/lib/agentRequest.ts`
+- `ui/src/lib/sessionLog.ts`
+- `ui/src/lib/execGraph.ts` (optional compact tool graph in side panel)
+- `ui/src/components/chat/PermissionPrompt.tsx` (decision mapping)
+- `ui/src/components/chat/EditReviewPanel.tsx` (apply/reject flows)
+
+---
+
+## 3. Backend API surface (complete command list)
+
+Wire **every** command the agent TUI needs through `core::dispatch`. Source of truth: `docs/commands-and-events.md`, `ui/src/lib/ipc.ts`, `src-tauri/src/main.rs` `invoke_handler`.
+
+### 3.1 Workspace / files
+`pick_workspace_folder` → TUI: path input or browse via `list_directory` from home
+`agent_set_workspace`, `agent_get_workspace`, `agent_get_workspaces`, `agent_add_workspace`, `agent_remove_workspace`
+`list_directory`, `read_text_file`, `write_text_file`, `path_exists`, `revert_file`
+`start_file_watcher`, `stop_file_watcher`
+`index_status`, `index_rebuild`, `index_search`, `index_semantic_search`
+`lsp_diagnostics` (show in `:lint <path>`)
+
+### 3.2 Agent
+`agent_run_task`, `agent_run_background`, `list_background_tasks`, `abort_background_task`, `background_task_output`
+`abort_agent_execution`, `agent_steer`
+`agent_execute_tool`, `agent_batch_execute`, `agent_tool_schemas`
+`agent_respond_hitl`, `agent_respond_permission`, `agent_respond_question`
+`agent_list_pending_edits`, `agent_apply_edits`, `agent_reject_edits`, `agent_resolve_edit_conflict`
+`agent_checkpoint_list`, `agent_checkpoint_restore`, `agent_run_verify`
+`agent_git_checkpoint_cmd`, `agent_git_checkpoints_cmd`, `agent_git_revert_cmd`
+`session_append`, `session_load`, `session_tail`, `session_fork`, `session_delete_chat`, `session_projects`, `console_history`
+`context_status`, `context_set_system_prompt`, `context_set_file_buffer`, `context_set_selection`, `context_push_turn`
+`agent_attach_file`, `agent_detach_file`, `agent_list_attachments`, `pick_text_file` → TUI path entry
+
+### 3.3 Policy / skills / MCP
+`agent_policy_snapshot`, `agent_policy_save`, `agent_set_yolo`, `agent_grant_path`, `agent_revoke_path`, `agent_audit_log`
+`agent_modes`, `agent_workflows`, `workflow_enforce_tools`, `agent_reset_mcp`
+`mcp_catalog_load`, `mcp_catalog_save`, `mcp_server_probe`
+`skill_install`, `skill_uninstall`, `skill_set_active`, `knowledge_scan`, `knowledge_report_cmd`
+
+### 3.4 Models
+`model_status`, `loaded_model_path`, `load_model_from_path`, `auto_load_model`, `unload_model`, `pick_and_load_model` → TUI path
+`stream_inference`, `cancel_inference` (Ask-only chat-complete path when mode=ask and setting enabled)
+`configure_remote_model`, `list_remote_models`, `providers_*`, `remote_config_load`
+`list_downloaded_models`, `delete_downloaded_model`, `models_dir_info`, `local_model_configs_load`, `local_model_config_save`
+`settings_load`, `settings_save`, `system_info`
+
+### 3.5 Events to subscribe (CoreEvent enum)
+
+Engine:
+- `inference-token`, `inference-done`, `execution-aborted`, `console-log`
+- `model-loaded`, `model-load-progress`, `model-path`
+
+Agent (`agent://` prefix in Tauri; normalize in CoreEvent):
+- `agent-step`, `agent-subtask`, `agent-knowledge`
+- `tool-event`, `tool-output`, `plan-step`, `todo-update`
+- `hitl-gate`, `permission-request`, `question-request`
+- `steer-applied`, `terminal-output`
+- `bg-task-event`, `context-trimmed`
+- `run-trace`, `file-changed`, `edit-proposed`, `edit-applied`, `edit-failed`
+- `verify-result`, `subagent-run`, `hook`, `skills-changed`, `workspace-changed`
+- `thinking-updated`, `thinking-snapshot` (if emitted)
+
+Workspace:
+- `workspace://file-changed`
+- `index://progress`
+
+TUI event loop: `tokio::select!` between crossterm input, event bus recv, and optional watcher.
+
+---
+
+## 4. AgentTaskRequest (wire format)
+
+Mirror `src-tauri/src/agent/orchestrator.rs` `AgentTaskRequest` (camelCase JSON):
+
+```json
+{
+  "prompt": "string",
+  "maxTokens": 4096,
+  "maxSteps": 12,
+  "stopWords": [],
+  "planMode": false,
+  "verify": true,
+  "decompose": false,
+  "tokenBudget": null,
+  "agentMode": "ask|undefined",
+  "workflow": "string|null",
+  "images": [{ "dataUrl": "data:image/png;base64,..." }]
+}
+```
+
+Build requests with same rules as `ui/src/lib/agentRequest.ts` `buildAgentRequest`.
+
+**Prepare turn order** (critical):
+1. Resolve workspace; `agent_set_workspace`
+2. `context_set_system_prompt(buildSystemPrompt(mode, nParams))`
+3. `buildContext` → `context_set_file_buffer`, attach images
+4. `context_push_turn("user", userText)` last (evictable)
+5. `agent_run_task(request)`
+
+---
+
+## 5. TUI layout and keybindings
+
+### 5.1 Default layout (ratatui)
+
+```
+┌─ Sessions ─┬──────────────── Chat transcript ────────────────┬─ Tools ─┐
+│  chat list │  user / assistant bubbles (scroll)              │ timeline│
+│            │                                                  │ + todos │
+├────────────┴──────────────────────────────────────────────────┴─────────┤
+│ Composer (multiline)  [agent|ask|plan]  model:name  ctx:72%  cwd:...   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Keys (OpenCode-like):**
+- `Enter` — send (Shift+Enter newline)
+- `Ctrl+C` — abort run if processing else quit
+- `Ctrl+L` — clear screen / clear composer
+- `Ctrl+O` — open diff review for pending edits
+- `Ctrl+Y` / `Ctrl+N` — approve/deny permission when modal open
+- `Tab` — cycle focus: chat / composer / side panel
+- `Esc` — close modal; double-Esc → undo last turn (rewind)
+- `?` — help overlay
+- `Ctrl+P` — command palette (`:commands`)
+
+### 5.2 Permission modal
+
+Payload types from backend (mirror `PermissionRequest` in `ipc.ts`):
+- Show tool name, args summary, category
+- Decisions: `allow`, `allow_once`, `deny` → `agent_respond_permission(requestId, decision)`
+- YOLO toggle in `:yolo on|off` → `agent_set_yolo`
+
+### 5.3 Diff review modal
+
+On `edit-proposed`:
+- List files in group; selected file shows unified diff (scroll)
+- `a` apply group, `r` reject, `o` overwrite on conflict (`agent_resolve_edit_conflict`)
+- After apply, listen `edit-applied` / `verify-result`
+
+### 5.4 Ask mode
+
+When `currentMode === "ask"`: use `stream_inference` instead of `agent_run_task` if `preferChatComplete` setting true (read from settings); else `agent_run_task` with `agentMode: "ask"` and verify false.
+
+---
+
+## 6. Loopback API (optional complement, not primary)
+
+If keeping desktop app running concurrently is desired, extend `api_server.rs` per `full_enhance.txt` **XC.10**:
+- `GET /v1/agent/events` SSE multiplexing all `agent://*` + inference events
+- `POST /v1/agent/sessions/{id}/cancel`
+- Document threat model (loopback only)
+
+TUI binary must **not depend** on this for normal operation.
+
+---
+
+## 7. Model load and startup sequence
+
+1. Parse CLI args → resolve `cwd`
+2. `logging::init` to app data logs dir (reuse `app_data_dir` helper extracted from Tauri path or `dirs` crate)
+3. Construct `AppCore::new`
+4. `settings_load` → `auto_load_model` or `providers_route("editor")` + `configure_remote_model`
+5. `agent_set_workspace(cwd)` + `index_rebuild` async (show progress chip)
+6. `knowledge_scan` optional background
+7. Enter TUI main loop
+8. On exit: `LspManager::shutdown_all`, unload model, flush sessions
+
+**Smoke test:** `AI_EDITOR_TUI_SMOKE=1 ai-editor-tui --cwd . --no-model` exits 0 after init without curses if env set; or script driving `expect`/`script` in CI.
+
+---
+
+## 8. Implementation phases (execute in order)
+
+### Phase A — Core extraction (blocking)
+1. Add `EventSink` + refactor emits in orchestrator/tools/engine paths used by agent loop.
+2. Add `AppCore` with `dispatch::*` functions wrapping existing command bodies (move logic from `#[tauri::command]` fns into `commands/*` inner fns callable with `&AppCore`).
+3. Tauri commands become thin wrappers: `state(app) -> app.core().dispatch(...)`.
+4. `cargo test` must pass unchanged.
+
+### Phase B — TUI skeleton
+1. `ai_editor_tui` binary: ratatui + event bus subscription.
+2. Status bar + composer + static chat log.
+3. Wire send path: prepare turn + `agent_run_task` + token streaming.
+
+### Phase C — HITL + edits
+1. Permission/question modals.
+2. Diff review + apply/reject/conflict.
+3. Checkpoint rewind `/undo`.
+
+### Phase D — Sessions + slash commands + modes
+1. Session sidebar + persistence.
+2. Full slash command table.
+3. Plan mode two-phase flow.
+
+### Phase E — Polish
+1. Background tasks panel.
+2. MCP/policy/status commands.
+3. Index search UI (`:search query`).
+4. Manual test script steps for TUI.
+
+---
+
+## 9. Testing requirements
+
+### 9.1 Rust
+- Unit tests for `EventSink` bus (subscribe receives emitted agent event).
+- Integration test: `AppCore` + mock engine or `--ignored` GGUF run single tool round (reuse patterns from `engine.rs` headless test).
+- Test session filter logic (stale session id ignored).
+
+### 9.2 Manual (`docs/manual-test-script.md` add section "TUI")
+- [ ] Open TUI in sample repo; index rebuild completes
+- [ ] Send prompt; tokens stream; tool event appears
+- [ ] Permission deny stops tool; allow continues
+- [ ] Edit proposed → apply → file on disk changes → verify-result
+- [ ] `/undo` restores checkpoint + truncates transcript
+- [ ] `/mode ask` refuses write tools
+- [ ] `abort` mid-run emits aborted state
+- [ ] `agent_steer` injects user text mid-run
+- [ ] Session survives restart (`session_tail`)
+
+---
+
+## 10. Acceptance criteria (definition of done)
+
+- [ ] `cargo build --release --bin ai-editor-tui` succeeds on Windows (primary dev OS).
+- [ ] TUI runs with **no** vite dev server and **no** WebView process.
+- [ ] Feature parity table in §1.2 implemented except §1.3 non-goals.
+- [ ] All agent events in §3.5 handled without panic (unknown events logged once).
+- [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` pass.
+- [ ] `npm test` in `ui/` still pass (no regressions to shared types/docs).
+- [ ] Docs updated: commands-and-events (TUI binary, EventSink), manual-test-script (TUI section).
+
+---
+
+## 11. Reference map (read before coding)
+
+| Topic | Path |
+|-------|------|
+| Commands/events doc | `docs/commands-and-events.md` |
+| IPC wrappers | `ui/src/lib/ipc.ts` |
+| Agent stream state machine | `ui/src/hooks/useAgentStream.ts` |
+| Send pipeline | `ui/src/hooks/useComposerSend.ts` |
+| Context prep | `ui/src/lib/agentPrepare.ts`, `ui/src/lib/contextSections.ts` |
+| Request builder | `ui/src/lib/agentRequest.ts` |
+| Orchestrator request struct | `src-tauri/src/agent/orchestrator.rs` |
+| Shared run entry | `src-tauri/src/commands/agent.rs` `run_agent_task_inner` |
+| HTTP agent task | `src-tauri/src/api_server.rs` `POST /v1/agent/tasks` |
+| Managed state | `src-tauri/src/main.rs` |
+| Enhancement backlog | `full_enhance.txt` (TERM/API gaps) |
+| Rewind | `ui/src/lib/rewind.ts` |
+
+---
+
+## 12. Deliverables checklist
+
+1. `src-tauri/src/core/*` + `EventSink` refactor
+2. `src-tauri/src/tui/*` + `src-tauri/src/bin/ai_editor_tui.rs`
+3. `src-tauri/Cargo.toml` `[[bin]]` + dependencies
+4. Thin Tauri command wrappers (no behavior drift)
+5. `docs/commands-and-events.md` updated
+6. `docs/manual-test-script.md` TUI section
+7. Optional: `scripts/tui-smoke.ps1` for CI
+
+Implement everything above in one cohesive change set. Prefer correctness and parity with the existing agent loop over visual novelty. Match OpenCode ergonomics: fast startup, obvious cwd, transparent tool stream, safe permission gates, and first-class diff review before apply.

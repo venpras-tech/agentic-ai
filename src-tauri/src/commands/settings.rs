@@ -283,11 +283,62 @@ pub async fn local_model_config_save(
     Ok(())
 }
 
+/// Drop `localModelConfigs` entries whose GGUF is no longer on disk.
+///
+/// The map is keyed by model path and never validated against the filesystem,
+/// so deleting (or never finishing a download of) a model leaves a stale entry
+/// behind — it then shows up in Settings as a model that cannot be loaded. The
+/// `"default"` fallback key is not a path and is always kept; a key that is not
+/// an existing `.gguf` file is removed, and any other key (unexpected, but
+/// possible in a hand-edited file) is left alone so nothing is silently lost.
+fn prune_missing_model_configs(
+    configs: HashMap<String, ModelInitParams>,
+) -> (HashMap<String, ModelInitParams>, usize) {
+    let mut removed = 0usize;
+    let kept = configs
+        .into_iter()
+        .filter(|(key, _)| {
+            if key == DEFAULT_LOCAL_CONFIG_KEY {
+                return true;
+            }
+            let path = std::path::Path::new(key);
+            let is_gguf = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+            if !is_gguf {
+                // Not a model path (or not one we recognize) — keep it.
+                return true;
+            }
+            if path.is_file() {
+                return true;
+            }
+            removed += 1;
+            false
+        })
+        .collect();
+    (kept, removed)
+}
+
 #[tauri::command]
 pub async fn local_model_configs_load(
     app: AppHandle,
 ) -> Result<HashMap<String, ModelInitParams>, String> {
-    Ok(read_settings(&app).local_model_configs)
+    let mut settings = read_settings(&app);
+    let (pruned, removed) =
+        prune_missing_model_configs(std::mem::take(&mut settings.local_model_configs));
+    if removed > 0 {
+        crate::logging::info(
+            None,
+            "settings",
+            &format!(
+                "dropped {removed} local model config entr{} whose GGUF is missing",
+                if removed == 1 { "y" } else { "ies" }
+            ),
+        );
+        settings.local_model_configs = pruned.clone();
+        write_settings_best_effort(&app, &settings).await;
+    }
+    Ok(pruned)
 }
 
 /// Resolve the per-model config for `path` (persisted `"default"` → per-path →
@@ -543,6 +594,38 @@ mod tests {
                 .and_then(|c| c.context_size),
             Some(1024)
         );
+    }
+
+    /// `prune_missing_model_configs` drops path-keyed entries whose GGUF is
+    /// gone, while always keeping `"default"` and any non-`.gguf` key.
+    #[test]
+    fn prune_drops_only_missing_gguf_paths() {
+        let dir = std::env::temp_dir().join("ai-editor-prune-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let present = dir.join("present.gguf");
+        std::fs::write(&present, b"GGUF").expect("write fixture");
+        let present_key = present.to_string_lossy().into_owned();
+        let missing_key = dir.join("gone.gguf").to_string_lossy().into_owned();
+
+        let mut configs: HashMap<String, ModelInitParams> = HashMap::new();
+        configs.insert(DEFAULT_LOCAL_CONFIG_KEY.into(), cfg(4096, 0));
+        configs.insert(present_key.clone(), cfg(8192, 24));
+        configs.insert(missing_key.clone(), cfg(1024, 0));
+        // A non-.gguf key is not a model path; leave it untouched.
+        configs.insert("someSetting".into(), cfg(1, 1));
+
+        let (kept, removed) = prune_missing_model_configs(configs);
+        assert_eq!(removed, 1, "only the missing GGUF is dropped");
+        assert!(kept.contains_key(DEFAULT_LOCAL_CONFIG_KEY));
+        assert!(kept.contains_key(&present_key));
+        assert!(!kept.contains_key(&missing_key), "missing path is pruned");
+        assert!(
+            kept.contains_key("someSetting"),
+            "non-model key is preserved"
+        );
+
+        let _ = std::fs::remove_file(&present);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// `localApiServer` defaults to enabled on port 8080 with assistant routing,

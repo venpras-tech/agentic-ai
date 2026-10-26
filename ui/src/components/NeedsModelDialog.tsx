@@ -18,17 +18,17 @@ function NeedsModelDialog({
   return (
     <div className="model-prompt-overlay" role="dialog" aria-modal="true" aria-label="Model required">
       <div className="model-prompt-modal">
-        <div className="model-prompt-badge">MODEL REQUIRED</div>
-        <h3 className="model-prompt-title">Your last model isn't available</h3>
-        <p className="model-prompt-model">{modelLabel || "AI Editor"} could not be reconnected.</p>
+        <div className="model-prompt-badge">AGENT REQUIRED</div>
+        <h3 className="model-prompt-title">No agent backend is connected</h3>
+        <p className="model-prompt-model">{modelLabel || "Vencoder"} could not be reconnected.</p>
         {error && <p className="model-prompt-reason">{error}</p>}
         <p className="model-prompt-hint">
-          Download a local model or connect a provider to start working. The app stays fully functional —
-          chat and tools simply wait for a model.
+          Connect an external agent (OpenAI, Claude, Ollama, …) or load a local GGUF model. Chat and
+          tools stay idle until a backend is active.
         </p>
         <div className="model-prompt-actions">
           <button type="button" className="model-prompt-proceed" onClick={onProceed}>
-            Choose a model →
+            Connect agent →
           </button>
           <button type="button" className="model-prompt-dismiss" onClick={onDismiss}>
             Later

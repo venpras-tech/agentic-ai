@@ -3,7 +3,7 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { createPortal } from "react-dom";
-import { parseChatSegments } from "../lib/chatParse";
+import { parseChatSegments, stripChatTags } from "../lib/chatParse";
 import type { ChatSegment } from "../lib/chatParse";
 import { planRewind, restoreRewind, type RewindPlan } from "../lib/rewind";
 import { useShell, useChat } from "../context/AppContext";
@@ -28,6 +28,7 @@ export interface LiveToolState {
   status: string;
   summary: string;
   output?: string;
+  detail?: string;
   durationMs?: number;
   exitCode?: number;
 }
@@ -193,7 +194,7 @@ function SegmentView({
         <ToolExecutionBadge
           name={segment.name}
           status={segment.status as ToolStatus}
-          output={segment.text}
+          output={segment.text || segment.args || ""}
           streaming={isLast ? streaming : false}
           durationMs={segment.durationMs}
           exitCode={segment.exitCode}
@@ -263,6 +264,10 @@ function StepGroup({
   const tools = segments.filter((s) => s.kind === "tool");
   const edits = segments.filter((s) => s.kind === "diff").length;
   const failed = tools.some((s) => s.kind === "tool" && (s.status === "error" || s.status === "failed"));
+
+  useEffect(() => {
+    if (failed && !streaming) setOpen(true);
+  }, [failed, streaming]);
 
   const summary = [
     `${segments.length} step${segments.length === 1 ? "" : "s"}`,
@@ -612,6 +617,19 @@ const Message = memo(function Message({
     [role, content],
   );
 
+  const plainFallback = useMemo(() => {
+    if (role !== "assistant") return "";
+    const hasVisibleSegment = segments.some(
+      (s) =>
+        (s.kind === "text" && s.text.trim()) ||
+        s.kind === "reasoning" ||
+        s.kind === "tool" ||
+        s.kind === "diff",
+    );
+    if (hasVisibleSegment) return "";
+    return stripChatTags(content || "").trim();
+  }, [role, content, segments]);
+
   // Per-turn change summary (Cursor-style pill): files touched and +/− line
   // counts, derived from the diff segments the backend embedded in the reply.
   const changes = useMemo(() => {
@@ -780,6 +798,11 @@ const Message = memo(function Message({
                 statusByPath={statusByPath}
                 projectPath={projectPath}
               />
+              {plainFallback ? (
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                  {plainFallback}
+                </ReactMarkdown>
+              ) : null}
               {streaming && <span className="msg-caret" aria-hidden />}
             </>
           ) : (
@@ -1072,15 +1095,15 @@ function MessageList({
     return map;
   }, [pendingEdits]);
   const latestMessage = messages[messages.length - 1];
-  const messageToolNames = useMemo(() => {
+  const embeddedToolCallIds = useMemo(() => {
     if (!latestMessage || latestMessage.role !== "assistant") return new Set<string>();
     return new Set(
       parseChatSegments(latestMessage.content || "")
-        .filter((s) => s.kind === "tool")
-        .map((s) => s.name),
+        .filter((s) => s.kind === "tool" && s.callId)
+        .map((s) => (s.kind === "tool" ? s.callId! : "")),
     );
   }, [latestMessage]);
-  const liveToolList = Object.values(liveTools).filter((lt) => !messageToolNames.has(lt.tool));
+  const liveToolList = Object.values(liveTools).filter((lt) => !embeddedToolCallIds.has(lt.id));
   const activeStage = stageOrQueued(stage, isProcessing);
   const showStage = isStageVisible(activeStage);
 
@@ -1112,7 +1135,7 @@ function MessageList({
               key={lt.id}
               name={lt.tool}
               status={(lt.status === "done" ? "success" : lt.status) as ToolStatus}
-              output={lt.output ?? lt.summary ?? ""}
+              output={lt.output ?? lt.detail ?? (lt.status === "error" ? lt.summary : "") ?? ""}
               streaming={lt.status === "running"}
               durationMs={lt.durationMs}
               exitCode={lt.exitCode}
@@ -1176,7 +1199,7 @@ function MessageList({
       <Virtuoso
         ref={virtuosoRef}
         className={scrollClassName}
-        style={{ height: "100%", flex: 1, minHeight: 0 }}
+        style={{ flex: "1 1 0", minHeight: 0, width: "100%" }}
         data={visibleMessages}
         computeItemKey={(index) => visibleMessages[index]?.turnId ?? index}
         itemContent={(index, message) => {

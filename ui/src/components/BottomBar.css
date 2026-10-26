@@ -2,8 +2,18 @@
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-sidebar);
+  border-top: none;
+  background: transparent;
+}
+
+.composer-dock {
+  padding: 0 0 12px;
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--bg-sidebar) 96%, transparent) 0%,
+    color-mix(in srgb, var(--bg-sidebar) 70%, transparent) 55%,
+    transparent 100%
+  );
 }
 
 .status-bar {
@@ -27,59 +37,145 @@
 }
 
 .input-row-wrap {
-  padding: 12px 16px;
+  padding: 8px 20px 4px;
 }
 
 .input-wrap {
   width: 100%;
 }
 
+.composer-card,
 .chat-input-box {
-  max-width: 52rem;
+  max-width: 44rem;
   margin: 0 auto;
-  background: var(--bg-sidebar);
-  border: 1px solid var(--border-color);
-  border-radius: 16px;
+  background: color-mix(in srgb, var(--bg-sidebar) 88%, var(--bg-main));
+  border: 1px solid color-mix(in srgb, var(--border-color) 90%, transparent);
+  border-radius: 22px;
   overflow: hidden;
   transition: border-color 0.2s, box-shadow 0.2s;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(15, 23, 42, 0.06);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--border-color) 40%, transparent),
+    0 8px 32px rgba(15, 23, 42, 0.08);
 }
 
+.composer-card:focus-within,
 .chat-input-box:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-subtle), 0 4px 16px rgba(14, 165, 233, 0.08);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-color));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
+    0 0 0 4px var(--accent-subtle),
+    0 12px 40px rgba(14, 165, 233, 0.1);
 }
 
+.composer-card.processing,
 .chat-input-box.processing {
   border-color: var(--accent);
 }
 
+.composer-editor,
 .chat-input-main {
   position: relative;
-  padding: 12px 16px;
+  padding: 14px 16px 6px;
 }
 
+.composer-textarea,
+.composer-editor textarea,
 .chat-input-main textarea {
   width: 100%;
   border: none;
   background: transparent;
-  font-size: 0.9375rem;
-  line-height: 1.5;
+  font-size: 0.975rem;
+  line-height: 1.55;
   color: var(--text-primary);
   resize: none;
-  max-height: 140px;
+  min-height: 52px;
+  max-height: 200px;
 }
 
+.composer-textarea:focus,
+.composer-editor textarea:focus,
 .chat-input-main textarea:focus {
   outline: none;
 }
 
+.composer-textarea::placeholder,
+.composer-editor textarea::placeholder,
 .chat-input-main textarea::placeholder {
   color: var(--text-muted);
 }
 
+.composer-textarea:disabled,
+.composer-editor textarea:disabled,
 .chat-input-main textarea:disabled {
   opacity: 0.7;
+}
+
+.composer-toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 10px 10px;
+}
+
+.composer-toolbar-start {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.composer-toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.composer-mode-select {
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.composer-ctx-meter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-hover) 80%, transparent);
+  border: 1px solid var(--border-color);
+}
+
+.composer-ctx-meter.overflow {
+  border-color: color-mix(in srgb, #e5484d 50%, var(--border-color));
+}
+
+.composer-ctx-track {
+  width: 48px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-color);
+  overflow: hidden;
+  display: flex;
+}
+
+.composer-ctx-pct {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  min-width: 2.2em;
+  text-align: right;
 }
 
 .chat-input-footer {
@@ -387,19 +483,26 @@ html.theme-dark .chat-icon-btn.chat-icon-yolo.yolo-active {
 .btn-send {
   background: var(--accent);
   color: #fff;
-  padding: 8px;
-  border-radius: 8px;
-  transition: all 0.2s;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+  transition: background 0.15s, transform 0.15s, opacity 0.15s;
 }
 
-.btn-send:hover {
+.btn-send:hover:not(:disabled) {
   background: var(--accent-hover);
   color: #fff;
-  transform: scale(1.05);
+  transform: scale(1.04);
 }
 
-.btn-send:active {
-  transform: scale(0.95);
+.btn-send:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.btn-send:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .btn-cancel {

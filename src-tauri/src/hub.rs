@@ -10,25 +10,55 @@
 //! Everything here talks to `huggingface.co` directly with plain HTTPS —
 //! no extra SDK dependency.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 const HF_API_BASE: &str = "https://huggingface.co";
+const HF_USER_AGENT: &str =
+    "ai-editor/0.1 (+local desktop AI editor; huggingface-hub-client)";
 /// Hard cap per model file (200 GiB) purely as a sanity guard.
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024 * 1024;
 /// How often the download loop pauses to re-read the cancel/pause flags.
 /// This bounds how late a user-issued cancel/pause can land.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Search responses are cached briefly so changing the sort control does not
+/// hammer the API, and so pagination back/forward feels instant.
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(120);
+const TREE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent("ai-editor/0.1 (+local)")
+        .user_agent(HF_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))
+}
+
+fn with_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
+/// A gated/private response is the single most common hub failure: turn it into
+/// an instruction the user can act on instead of a bare status code.
+pub fn http_error(status: reqwest::StatusCode, what: &str) -> String {
+    match status.as_u16() {
+        401 | 403 => format!(
+            "{what}: gated — accept the license on huggingface.co, then add a token in Settings."
+        ),
+        404 => format!("{what}: not found (wrong revision or file name?)"),
+        429 => format!("{what}: rate limited by Hugging Face — wait a moment and retry."),
+        503 => format!("{what}: Hugging Face is temporarily unavailable (503) — retry shortly."),
+        _ => format!("{what} returned HTTP {status}"),
+    }
 }
 
 /// One downloadable GGUF weight file inside a repository.
@@ -38,6 +68,9 @@ pub struct HfFile {
     /// File name within the repo, e.g. `model-q4_k_m.gguf`.
     pub name: String,
     pub size: Option<u64>,
+    /// LFS SHA256 (when the file is stored in LFS), used for integrity checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// A GGUF repository matching a hub search.
@@ -51,6 +84,31 @@ pub struct HfModel {
     pub downloads: i64,
     /// `.gguf` siblings with sizes (when known).
     pub files: Vec<HfFile>,
+    #[serde(default)]
+    pub pipeline_tag: Option<String>,
+    /// `true`, `false`, or one of HF's gated strings (`auto`, `manual`).
+    #[serde(default)]
+    pub gated: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Commit SHA the listing was pinned to (`main` moves under the user).
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+impl HfModel {
+    pub fn is_gated(&self) -> bool {
+        match &self.gated {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => !s.is_empty() && s != "false",
+            Some(serde_json::Value::Null) | None => false,
+            Some(_) => true,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -64,6 +122,16 @@ struct ApiModel {
     downloads: i64,
     #[serde(default)]
     siblings: Vec<ApiSibling>,
+    #[serde(default)]
+    pipeline_tag: Option<String>,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    last_modified: Option<String>,
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +139,8 @@ struct ApiSibling {
     rfilename: String,
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    lfs: Option<ApiTreeLfs>,
 }
 
 #[derive(Deserialize)]
@@ -79,58 +149,180 @@ struct ApiTreeEntry {
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
     lfs: Option<ApiTreeLfs>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ApiTreeLfs {
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
-/// Per-repo file sizes (`/api/models/{repo_id}/tree/main`). The flat search
-/// API frequently reports `null` sizes for GGUF siblings, so each repo that is
-/// missing sizes is back-filled here with a single cheap request.
+#[derive(Debug, Clone)]
+pub struct HfTreeEntry {
+    pub path: String,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+impl ApiTreeEntry {
+    fn into_entry(self) -> HfTreeEntry {
+        let sha256 = self
+            .lfs
+            .as_ref()
+            .and_then(|l| l.sha256.clone().or_else(|| l.oid.clone()))
+            .or(self.oid);
+        let size = self.size.or_else(|| self.lfs.and_then(|l| l.size));
+        HfTreeEntry {
+            path: self.path,
+            size,
+            sha256,
+        }
+    }
+}
+
+fn tree_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<HfTreeEntry>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<HfTreeEntry>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fetch the repo tree recursively so nested GGUFs are included. `revision` is
+/// a commit SHA from the search payload when available, otherwise `main`.
+pub async fn fetch_tree_entries(
+    repo_id: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<Vec<HfTreeEntry>, String> {
+    let key = format!("{repo_id}@{revision}");
+    if let Ok(cache) = tree_cache().lock() {
+        if let Some((at, entries)) = cache.get(&key) {
+            if at.elapsed() < TREE_CACHE_TTL {
+                return Ok(entries.clone());
+            }
+        }
+    }
+    let url = format!("{HF_API_BASE}/api/models/{repo_id}/tree/{revision}?recursive=true");
+    let client = http_client()?;
+    let resp = with_auth(client.get(&url), token)
+        .send()
+        .await
+        .map_err(|e| format!("HF tree failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status(), "HF tree"));
+    }
+    let entries = resp
+        .json::<Vec<ApiTreeEntry>>()
+        .await
+        .map_err(|e| format!("Bad HF tree response: {e}"))?
+        .into_iter()
+        .map(ApiTreeEntry::into_entry)
+        .collect::<Vec<_>>();
+    if let Ok(mut cache) = tree_cache().lock() {
+        cache.insert(key, (Instant::now(), entries.clone()));
+    }
+    Ok(entries)
+}
+
+/// Per-repo file sizes (`/api/models/{repo_id}/tree/{revision}`). The flat
+/// search API frequently reports `null` sizes for GGUF siblings, so each repo
+/// that is missing sizes is back-filled here with a single cheap request.
 async fn fetch_tree_sizes(
     client: &reqwest::Client,
     repo_id: &str,
-) -> std::collections::HashMap<String, u64> {
-    let url = format!("{HF_API_BASE}/api/models/{}/tree/main", repo_id);
-    let Ok(resp) = client.get(&url).send().await else {
-        return std::collections::HashMap::new();
+    revision: &str,
+    token: Option<&str>,
+) -> HashMap<String, u64> {
+    let url = format!("{HF_API_BASE}/api/models/{repo_id}/tree/{revision}?recursive=true");
+    let Ok(resp) = with_auth(client.get(&url), token).send().await else {
+        return HashMap::new();
     };
     if !resp.status().is_success() {
-        return std::collections::HashMap::new();
+        return HashMap::new();
     }
     let Ok(entries) = resp.json::<Vec<ApiTreeEntry>>().await else {
-        return std::collections::HashMap::new();
+        return HashMap::new();
     };
     entries
         .into_iter()
         .filter_map(|e| {
-            let size = e.size.or_else(|| e.lfs.and_then(|l| l.size))?;
+            let size = e.size.or_else(|| {
+                e.lfs
+                    .as_ref()
+                    .and_then(|l| l.size)
+            })?;
             Some((e.path, size))
         })
         .collect()
 }
 
-/// Search the hub for GGUF model repos. `full` + `blobs` query params make
-/// the API include sibling filenames and their byte sizes.
-pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
-    let limit = limit.clamp(1, 50);
-    let url = format!(
-        "{HF_API_BASE}/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit={limit}&full=true&blobs=true",
+fn search_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<HfModel>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<HfModel>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Search the hub for GGUF model repos. `sort` is applied on the API where HF
+/// supports it (`downloads`/`likes`), and client-side for `name`/`size`.
+/// `relevance` leaves the API's own ordering untouched.
+pub async fn search(
+    query: &str,
+    limit: usize,
+    offset: usize,
+    sort: &str,
+    token: Option<&str>,
+) -> Result<Vec<HfModel>, String> {
+    let limit = limit.clamp(1, 100);
+    let cache_key = format!(
+        "{}|{}|{}|{}|{}",
+        query.trim().to_ascii_lowercase(),
+        limit,
+        offset,
+        sort,
+        token.is_some()
+    );
+    if let Ok(cache) = search_cache().lock() {
+        if let Some((at, models)) = cache.get(&cache_key) {
+            if at.elapsed() < SEARCH_CACHE_TTL {
+                return Ok(models.clone());
+            }
+        }
+    }
+
+    let mut url = format!(
+        "{HF_API_BASE}/api/models?search={}&filter=gguf&limit={limit}&offset={offset}&full=true&blobs=true",
         urlencode(query)
     );
-    let client = http_client()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("HF search failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("HF search returned HTTP {}", resp.status()));
+    match sort {
+        "downloads" => url.push_str("&sort=downloads&direction=-1"),
+        "likes" => url.push_str("&sort=likes&direction=-1"),
+        // `relevance` and client-side sorts use the API's natural ordering.
+        _ => {}
     }
+
+    let client = http_client()?;
+    let mut resp = None;
+    for attempt in 0..3u32 {
+        let r = with_auth(client.get(&url), token)
+            .send()
+            .await
+            .map_err(|e| format!("HF search failed: {e}"))?;
+        let status = r.status();
+        if status.is_success() {
+            resp = Some(r);
+            break;
+        }
+        if attempt < 2 && (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt + 1))).await;
+            continue;
+        }
+        return Err(http_error(status, "HF search"));
+    }
+    let resp = resp.ok_or_else(|| "HF search failed after retries".to_string())?;
     let models: Vec<ApiModel> = resp
         .json()
         .await
@@ -138,43 +330,76 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
 
     let mut out: Vec<HfModel> = models
         .into_iter()
-        .map(|m| HfModel {
-            files: m
-                .siblings
-                .into_iter()
-                .filter(|s| s.rfilename.to_ascii_lowercase().ends_with(".gguf"))
-                .map(|s| HfFile {
-                    name: s.rfilename,
-                    size: s.size,
-                })
-                .collect(),
-            repo_id: m.id,
-            author: m.author,
-            likes: m.likes,
-            downloads: m.downloads,
+        .map(|m| {
+            let license = m
+                .tags
+                .iter()
+                .find_map(|t| t.strip_prefix("license:").map(str::to_string));
+            HfModel {
+                files: m
+                    .siblings
+                    .into_iter()
+                    .filter(|s| s.rfilename.to_ascii_lowercase().ends_with(".gguf"))
+                    .map(|s| {
+                        let lfs = s.lfs.clone();
+                        HfFile {
+                            name: s.rfilename,
+                            size: s.size.or_else(|| lfs.as_ref().and_then(|l| l.size)),
+                            sha256: lfs.and_then(|l| l.sha256.or(l.oid)),
+                        }
+                    })
+                    .collect(),
+                repo_id: m.id,
+                author: m.author,
+                likes: m.likes,
+                downloads: m.downloads,
+                pipeline_tag: m.pipeline_tag,
+                gated: m.gated,
+                tags: m.tags,
+                last_modified: m.last_modified,
+                license,
+                sha: m.sha,
+            }
         })
         .filter(|m| !m.files.is_empty())
         .collect();
 
     // Back-fill missing sizes for repos the search API gave us nothing for.
-    let missing: Vec<String> = out
+    let missing: Vec<(String, String)> = out
         .iter()
-        .filter(|m| m.files.iter().any(|f| f.size.is_none()))
-        .map(|m| m.repo_id.clone())
+        .filter(|m| m.files.iter().any(|f| f.size.is_none() || f.sha256.is_none()))
+        .map(|m| {
+            (
+                m.repo_id.clone(),
+                m.sha.clone().unwrap_or_else(|| "main".to_string()),
+            )
+        })
         .collect();
     if !missing.is_empty() {
         use futures_util::stream;
-        let sizes: Vec<(String, std::collections::HashMap<String, u64>)> = stream::iter(missing)
-            .map(|repo| {
+        let sizes: Vec<(String, HashMap<String, HfTreeEntry>)> = stream::iter(missing)
+            .map(|(repo, revision)| {
                 let client = client.clone();
                 async move {
                     let repo2 = repo.clone();
                     let map = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        fetch_tree_sizes(&client, &repo),
+                        fetch_tree_sizes(&client, &repo, &revision, token),
                     )
                     .await
-                    .unwrap_or_else(|_| std::collections::HashMap::new());
+                    .unwrap_or_else(|_| HashMap::new())
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            HfTreeEntry {
+                                path: k,
+                                size: Some(v),
+                                sha256: None,
+                            },
+                        )
+                    })
+                    .collect();
                     (repo2, map)
                 }
             })
@@ -182,20 +407,97 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<HfModel>, String> {
             .collect()
             .await;
 
-        let mut index: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
+        let mut index: HashMap<String, HashMap<String, HfTreeEntry>> =
             sizes.into_iter().collect();
         for model in out.iter_mut() {
             if let Some(size_map) = index.remove(&model.repo_id) {
                 for f in model.files.iter_mut() {
                     if f.size.is_none() {
-                        f.size = size_map.get(&f.name).copied();
+                        f.size = size_map.get(&f.name).and_then(|e| e.size);
                     }
                 }
             }
         }
     }
 
+    if sort == "name" {
+        out.sort_by(|a, b| a.repo_id.to_ascii_lowercase().cmp(&b.repo_id.to_ascii_lowercase()));
+    } else if sort == "size" {
+        out.sort_by(|a, b| {
+            let sa: u64 = a.files.iter().filter_map(|f| f.size).sum();
+            let sb: u64 = b.files.iter().filter_map(|f| f.size).sum();
+            sb.cmp(&sa)
+        });
+    }
+
+    if let Ok(mut cache) = search_cache().lock() {
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(cache_key, (Instant::now(), out.clone()));
+    }
     Ok(out)
+}
+
+/// Repo metadata (`/api/models/{repo}`) for the agent's `hf_model_info` tool
+/// and for discovering a GGUF repo's `base_model` tokenizer source.
+pub async fn model_info(repo_id: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    let url = format!("{HF_API_BASE}/api/models/{repo_id}");
+    let client = http_client()?;
+    let resp = with_auth(client.get(&url), token)
+        .send()
+        .await
+        .map_err(|e| format!("HF model info failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(http_error(resp.status(), "HF model info"));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Bad HF model info: {e}"))
+}
+
+/// Extract `base_model` entries from a model-info payload. HF exposes them as
+/// `cardData.base_model` (string/array) and as `base_model:*` tags.
+fn base_models(info: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |v: &serde_json::Value| {
+        if let Some(s) = v.as_str() {
+            if !s.trim().is_empty() {
+                out.push(s.trim().to_string());
+            }
+        }
+    };
+    if let Some(card) = info.get("cardData") {
+        for key in ["base_model", "base_models"] {
+            match card.get(key) {
+                Some(serde_json::Value::Array(items)) => {
+                    for item in items {
+                        if let Some(name) = item.get("id").or_else(|| item.get("name")) {
+                            push(name);
+                        } else {
+                            push(item);
+                        }
+                    }
+                }
+                Some(v) => push(v),
+                None => {}
+            }
+        }
+    }
+    if let Some(tags) = info.get("tags").and_then(|t| t.as_array()) {
+        for tag in tags {
+            if let Some(s) = tag.as_str() {
+                if let Some(rest) = s.strip_prefix("base_model:") {
+                    if !rest.trim().is_empty() {
+                        out.push(rest.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Destination path for a repo file under `models_dir`
@@ -215,46 +517,142 @@ pub fn repo_dir(models_dir: &Path, repo_id: &str) -> PathBuf {
     models_dir.join(slug)
 }
 
+/// Parse a split-GGUF shard filename (`…-00002-of-00003.gguf`) into the 1-based
+/// part number and the total part count. Returns `None` for ordinary files.
+pub fn parse_shard(file_name: &str) -> Option<(u32, u32)> {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    let lower = base.to_ascii_lowercase();
+    let rest = lower.strip_suffix(".gguf")?;
+    let (head, total) = rest.rsplit_once("-of-")?;
+    let (stem, part) = head.rsplit_once('-')?;
+    if stem.is_empty() || part.len() != 5 || total.len() != 5 {
+        return None;
+    }
+    let part: u32 = part.parse().ok()?;
+    let total: u32 = total.parse().ok()?;
+    if part == 0 || total < 2 || part > total {
+        return None;
+    }
+    Some((part, total))
+}
+
+/// Rewrite the 5-digit part field of a shard filename, preserving the prefix
+/// (including any subdirectory) and the total: `m-00003-of-00003.gguf` with
+/// `k = 1` → `m-00001-of-00003.gguf`. Returns `file_name` unchanged when it is
+/// not a recognised shard name.
+pub fn replace_shard_part(file_name: &str, k: u32, _total: u32) -> String {
+    let Some((_, real_total)) = parse_shard(file_name) else {
+        return file_name.to_string();
+    };
+    // A shard suffix is always `-NNNNN-of-NNNNN.gguf`, so its length is fixed.
+    let cut = format!("-{:05}-of-{:05}.gguf", 1, real_total).len();
+    let prefix = &file_name[..file_name.len() - cut];
+    format!("{prefix}-{k:05}-of-{real_total:05}.gguf")
+}
+
+/// Every shard filename of the split model that `file_name` belongs to.
+///
+/// llama.cpp can only open the **first** shard (`…-00001-of-0000N.gguf`) and
+/// requires every sibling in the same folder, so downloading a single shard
+/// always produces an unloadable model. Given any part of a split, this returns
+/// all parts in ascending order; for a single-file model it returns just that
+/// file. The original prefix (including any subdirectory and its casing) is
+/// preserved, only the 5-digit part field is rewritten.
+pub fn shard_group(file_name: &str) -> Vec<String> {
+    let Some((_, total)) = parse_shard(file_name) else {
+        return vec![file_name.to_string()];
+    };
+    (1..=total)
+        .map(|k| replace_shard_part(file_name, k, total))
+        .collect()
+}
+
 /// Best-effort fetch of a repo's `tokenizer.json` into its folder so the
 /// orchestrator can register exact token counts for a downloaded model.
-/// Tolerant: GGUF repos that do not ship a tokenizer (they inherit the base
-/// model's tokenizer) simply 404 and this returns `false` rather than failing
-/// the model download. Returns `true` when the tokenizer is on disk.
-pub async fn download_tokenizer(models_dir: &Path, repo_id: &str) -> bool {
+///
+/// Bartowski-style GGUF repos often do not ship a tokenizer; when the repo
+/// itself 404s this follows the model card's `base_model:` and fetches the
+/// tokenizer from the upstream instruct model instead. Tolerant: no tokenizer
+/// anywhere simply returns `false` rather than failing the model download.
+pub async fn download_tokenizer(
+    models_dir: &Path,
+    repo_id: &str,
+    token: Option<&str>,
+) -> bool {
     let dest = repo_dir(models_dir, repo_id).join("tokenizer.json");
     if dest.is_file() {
         return true;
     }
-    let url = format!("{HF_API_BASE}/{repo_id}/resolve/main/tokenizer.json");
     let client = match http_client() {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let resp = match client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
+    let mut candidates = vec![repo_id.to_string()];
+    if let Ok(info) = model_info(repo_id, token).await {
+        candidates.extend(base_models(&info));
+    }
+    for candidate in candidates {
+        let url = format!("{HF_API_BASE}/{candidate}/resolve/main/tokenizer.json");
+        let resp = match with_auth(client.get(&url), token)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let bytes = match resp.bytes().await {
+            Ok(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        // tokenizer.json is a few MB at most; guard against a misrouted URL.
+        if bytes.len() > 50 * 1024 * 1024 {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(repo_dir(models_dir, repo_id));
+        if tokio::fs::write(&dest, &bytes).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// SHA256 of an on-disk file, for LFS integrity verification.
+pub async fn file_sha256(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut file = tokio::fs::File::open(path)
         .await
-    {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    if !resp.status().is_success() {
-        return false;
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        use tokio::io::AsyncReadExt;
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
     }
-    let bytes = match resp.bytes().await {
-        Ok(b) if !b.is_empty() => b,
-        _ => return false,
-    };
-    // tokenizer.json is a few MB at most; guard against a misrouted URL.
-    if bytes.len() > 50 * 1024 * 1024 {
-        return false;
-    }
-    let _ = std::fs::create_dir_all(repo_dir(models_dir, repo_id));
-    match tokio::fs::write(&dest, &bytes).await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Expected SHA256 for `file_name` in `repo_id` at `revision`, using the same
+/// tree metadata the downloader already fetches.
+pub async fn expected_sha256(
+    repo_id: &str,
+    file_name: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    fetch_tree_entries(repo_id, revision, token)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|e| e.path == file_name)
+        .and_then(|e| e.sha256)
 }
 
 /// Progress callback payload handed to `download_file`.
@@ -265,7 +663,7 @@ pub struct DownloadProgress {
     pub done: bool,
 }
 
-/// Stream `https://huggingface.co/{repo}/resolve/main/{file}` into
+/// Stream `https://huggingface.co/{repo}/resolve/{revision}/{file}` into
 /// `dest_path(models_dir, repo, file)`.
 ///
 /// * **Resume** — a partial `*.part` file left by a previous pause/cancel is
@@ -281,6 +679,8 @@ pub async fn download_file(
     models_dir: &Path,
     repo_id: &str,
     file_name: &str,
+    revision: &str,
+    token: Option<&str>,
     cancel: &CancellationToken,
     paused: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(DownloadProgress),
@@ -295,7 +695,17 @@ pub async fn download_file(
     /// to hang a download forever now heal themselves.
     const MAX_STALLS: u32 = 3;
 
-    let url = format!("{HF_API_BASE}/{repo_id}/resolve/main/{file_name}");
+    let revision = if revision.trim().is_empty() {
+        "main"
+    } else {
+        revision.trim()
+    };
+    let encoded_file = file_name
+        .split('/')
+        .map(urlencode)
+        .collect::<Vec<_>>()
+        .join("/");
+    let url = format!("{HF_API_BASE}/{repo_id}/resolve/{revision}/{encoded_file}");
     let dest = dest_path(models_dir, repo_id, file_name);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
@@ -333,7 +743,7 @@ pub async fn download_file(
 
         // Connect with a Range resume header; bounded so neither a dead
         // server nor a cancel can block the reconnect path indefinitely.
-        let mut req = http_client()?.get(&url).timeout(Duration::MAX);
+        let mut req = with_auth(http_client()?.get(&url), token).timeout(Duration::MAX);
         if received > 0 {
             req = req.header("Range", format!("bytes={received}-"));
         }
@@ -365,7 +775,7 @@ pub async fn download_file(
         if !resp.status().is_success() {
             let code = resp.status();
             drop(file);
-            return Err(format!("Download returned HTTP {code}"));
+            return Err(http_error(code, "Download"));
         }
 
         // Negotiate resume: `206 Partial Content` means the server honoured
@@ -453,9 +863,10 @@ pub async fn download_file(
 }
 
 /// A file that can actually be loaded as a model: a `*.gguf` that is neither a
-/// calibration artifact (`imatrix`) nor a multimodal vision projector
-/// (`mmproj`), both of which cannot run standalone.
-fn is_runnable_gguf(p: &Path) -> bool {
+/// calibration artifact (`imatrix`) nor a multimodal vision projector. The
+/// projector check uses filename-token rules instead of a plain substring so a
+/// real LLM whose name merely contains `vision`/`vit` is not excluded.
+pub fn is_runnable_gguf(p: &Path) -> bool {
     if !p
         .extension()
         .map(|e| e.eq_ignore_ascii_case("gguf"))
@@ -467,51 +878,93 @@ fn is_runnable_gguf(p: &Path) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    !name.contains("imatrix") && !name.contains("mmproj")
+    if name.contains("imatrix") {
+        return false;
+    }
+    // Projector files are named `mmproj-*` (sometimes `*-mmproj-*`), or start
+    // with the vision tower family name. Prefix/suffix rules only: `vision` in
+    // the middle of a model name is legitimate.
+    if name.starts_with("mmproj") || name.contains("-mmproj") {
+        return false;
+    }
+    for prefix in ["clip-", "clip_", "vit-", "vit_", "siglip-", "siglip_"] {
+        if name.starts_with(prefix) {
+            return false;
+        }
+    }
+    let stem = name.trim_end_matches(".gguf");
+    let tokens: Vec<&str> = stem.split(['-', '_', '.']).collect();
+    if tokens
+        .iter()
+        .any(|t| matches!(*t, "projector" | "mmproj" | "siglip" | "vit"))
+    {
+        return false;
+    }
+    true
+}
+
+/// Companion projector files that a vision model needs alongside its weights.
+pub fn companion_ggufs(files: &[HfFile]) -> Vec<HfFile> {
+    files
+        .iter()
+        .filter(|f| {
+            let name = f.name.to_ascii_lowercase();
+            name.ends_with(".gguf")
+                && (name.starts_with("mmproj")
+                    || name.contains("-mmproj")
+                    || name.starts_with("clip-")
+                    || name.starts_with("vit-")
+                    || name.starts_with("siglip-"))
+        })
+        .cloned()
+        .collect()
 }
 
 /// List every runnable `*.gguf` under `models_dir`: one level of repo folders
 /// (`{author}--{repo}/file.gguf`, created by the hub downloader) plus any
-/// GGUFs placed directly in the folder.
+/// GGUFs placed directly in the folder. Also recursively scans nested
+/// subdirectories so models placed inside extra folders are discovered.
 pub fn list_downloaded(models_dir: &Path) -> Vec<DownloadedModel> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(models_dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let repo_id = entry.file_name().to_string_lossy().replace("--", "/");
-            if let Ok(files) = std::fs::read_dir(&path) {
-                for f in files.flatten() {
-                    let p = f.path();
-                    if is_runnable_gguf(&p) {
-                        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        out.push(DownloadedModel {
-                            repo_id: repo_id.clone(),
-                            file_name: p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            path: p.to_string_lossy().into_owned(),
-                            size_bytes: size,
-                        });
-                    }
+    fn walk(
+        base: &Path,
+        models_dir: &Path,
+        repo_id: Option<String>,
+        out: &mut Vec<DownloadedModel>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // If we're at the top level and this looks like a repo folder, derive repo_id.
+                if repo_id.is_none() && name.contains("--") {
+                    let derived = name.replace("--", "/");
+                    walk(&path, models_dir, Some(derived), out);
+                } else if repo_id.is_none() {
+                    // Could be a folder containing models directly; treat as "local" unless it looks like repo.
+                    walk(&path, models_dir, Some("local".to_string()), out);
+                } else {
+                    walk(&path, models_dir, repo_id.clone(), out);
                 }
+            } else if is_runnable_gguf(&path) {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(DownloadedModel {
+                    repo_id: repo_id.clone().unwrap_or_else(|| "local".to_string()),
+                    file_name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes: size,
+                });
             }
-        } else if is_runnable_gguf(&path) {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push(DownloadedModel {
-                repo_id: "local".to_string(),
-                file_name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path: path.to_string_lossy().into_owned(),
-                size_bytes: size,
-            });
         }
     }
+
+    let mut out = Vec::new();
+    walk(models_dir, models_dir, None, &mut out);
     out.sort_by(|a, b| {
         a.repo_id
             .cmp(&b.repo_id)
@@ -564,8 +1017,41 @@ mod tests {
     }
 
     #[test]
-    fn list_downloaded_scans_repo_folders_and_top_level() {
-        let dir = std::env::temp_dir().join(format!("ai-hub-list-{}", std::process::id()));
+    fn parse_shard_reads_part_and_total() {
+        assert_eq!(parse_shard("qwen3-4b-q4_k_m-00003-of-00003.gguf"), Some((3, 3)));
+        assert_eq!(parse_shard("a/b/model-00001-of-00004.gguf"), Some((1, 4)));
+        assert_eq!(parse_shard("MODEL-00012-OF-00012.GGUF"), Some((12, 12)));
+        assert_eq!(parse_shard("plain-q4_k_m.gguf"), None);
+        assert_eq!(parse_shard("model-of-00003.gguf"), None);
+        assert_eq!(parse_shard("model-00000-of-00003.gguf"), None);
+        assert_eq!(parse_shard("model-00004-of-00003.gguf"), None);
+        assert_eq!(parse_shard("model-3-of-3.gguf"), None);
+    }
+
+    #[test]
+    fn shard_group_expands_every_part_in_order() {
+        // Any part resolves to the full ordered set — this is what stops the
+        // "only shard 3 downloaded" failure.
+        let all = shard_group("qwen3-4b-q4_k_m-00003-of-00003.gguf");
+        assert_eq!(
+            all,
+            vec![
+                "qwen3-4b-q4_k_m-00001-of-00003.gguf",
+                "qwen3-4b-q4_k_m-00002-of-00003.gguf",
+                "qwen3-4b-q4_k_m-00003-of-00003.gguf",
+            ]
+        );
+        // A single-file model is its own group.
+        assert_eq!(shard_group("model-q4_k_m.gguf"), vec!["model-q4_k_m.gguf"]);
+        // Subdirectories and prefix casing survive; only the part field changes.
+        assert_eq!(
+            shard_group("sub/dir/Big-00002-of-00002.gguf"),
+            vec!["sub/dir/Big-00001-of-00002.gguf", "sub/dir/Big-00002-of-00002.gguf"]
+        );
+    }
+
+    #[test]
+    fn list_downloaded_scans_repo_folders_and_top_level() {        let dir = std::env::temp_dir().join(format!("ai-hub-list-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let repo = dir.join("acme--demo-gguf");
         std::fs::create_dir_all(&repo).unwrap();
@@ -591,5 +1077,76 @@ mod tests {
         assert_eq!(local_hit.size_bytes, 2);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn projector_detection_uses_token_rules_not_substrings() {
+        assert!(!is_runnable_gguf(Path::new("mmproj-model-f16.gguf")));
+        assert!(!is_runnable_gguf(Path::new("model-mmproj-f16.gguf")));
+        assert!(!is_runnable_gguf(Path::new("clip-vit-large.gguf")));
+        assert!(!is_runnable_gguf(Path::new("siglip-so400m.gguf")));
+        assert!(!is_runnable_gguf(Path::new("weights.imatrix.gguf")));
+        // A real LLM with `vision` (or even `vit` inside a word) in its name is
+        // still runnable - substring matching used to hide these.
+        assert!(is_runnable_gguf(Path::new("llava-v1.5-7b-vision-q4_k_m.gguf")));
+        assert!(is_runnable_gguf(Path::new("qwen2.5-vl-7b-instruct-q4.gguf")));
+        assert!(is_runnable_gguf(Path::new("vitamin-coder-7b-q4.gguf")));
+        assert!(is_runnable_gguf(Path::new("qwen3-4b-q4_k_m.gguf")));
+    }
+
+    #[test]
+    fn companion_ggufs_finds_vision_projectors_only() {
+        let files = vec![
+            HfFile {
+                name: "model-q4_k_m.gguf".into(),
+                size: Some(1),
+                sha256: None,
+            },
+            HfFile {
+                name: "mmproj-model-f16.gguf".into(),
+                size: Some(2),
+                sha256: None,
+            },
+            HfFile {
+                name: "README.md".into(),
+                size: None,
+                sha256: None,
+            },
+        ];
+        let companions = companion_ggufs(&files);
+        assert_eq!(companions.len(), 1);
+        assert_eq!(companions[0].name, "mmproj-model-f16.gguf");
+    }
+
+    #[test]
+    fn base_models_reads_card_and_tags() {
+        let info = serde_json::json!({
+            "cardData": { "base_model": ["meta-llama/Llama-3.1-8B-Instruct"] },
+            "tags": ["base_model:Qwen/Qwen2.5-7B-Instruct", "gguf"]
+        });
+        let bases = base_models(&info);
+        assert!(bases.contains(&"meta-llama/Llama-3.1-8B-Instruct".to_string()));
+        assert!(bases.contains(&"Qwen/Qwen2.5-7B-Instruct".to_string()));
+    }
+
+    #[test]
+    fn http_errors_are_actionable() {
+        assert!(http_error(reqwest::StatusCode::UNAUTHORIZED, "Download").contains("gated"));
+        assert!(http_error(reqwest::StatusCode::FORBIDDEN, "HF search").contains("Settings"));
+        assert!(http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "HF search").contains("rate limited"));
+        assert!(http_error(reqwest::StatusCode::NOT_FOUND, "HF tree").contains("revision"));
+        assert!(http_error(reqwest::StatusCode::BAD_GATEWAY, "x").contains("502"));
+    }
+
+    #[tokio::test]
+    async fn file_sha256_matches_known_digest() {
+        let path = std::env::temp_dir().join(format!("ai-hub-sha-{}.bin", std::process::id()));
+        tokio::fs::write(&path, b"abc").await.unwrap();
+        let digest = file_sha256(&path).await.unwrap();
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

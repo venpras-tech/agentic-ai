@@ -130,6 +130,33 @@ pub fn extract_hitl_gate(markdown: &str) -> Option<String> {
     None
 }
 
+/// Remove `<hitl_gate>` markers from assistant text so spurious prose gates
+/// (common on small local models) do not hide the actual reply in the UI.
+pub fn strip_hitl_gate_markers(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let lower = out.to_lowercase();
+        let start = match lower.find("<hitl_gate") {
+            Some(s) => s,
+            None => break,
+        };
+        let rest = &lower[start..];
+        let close = rest.find('>').map(|i| start + i + 1);
+        let end_tag = rest.find("</hitl_gate>").map(|i| start + i + "</hitl_gate>".len());
+        let end = match (close, end_tag) {
+            (_, Some(e)) => e,
+            (Some(c), None) => c,
+            _ => break,
+        };
+        let end = end.min(out.len());
+        if end <= start {
+            break;
+        }
+        out.replace_range(start..end, "");
+    }
+    out.replace("\n\n\n", "\n\n").trim().to_string()
+}
+
 /// JSON schema descriptions for each tool, for orchestrator-side validation.
 ///
 /// Derived entirely from the canonical [`registry`](super::registry) table so

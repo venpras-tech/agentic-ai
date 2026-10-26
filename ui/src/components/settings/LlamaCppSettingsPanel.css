@@ -1,0 +1,43 @@
+.llama-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 920px;
+}
+
+.llama-panel-embedded {
+  gap: 1rem;
+}
+
+.llama-panel-hero h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.35rem;
+}
+
+.llama-panel-hero p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.llama-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.llama-section h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.llama-link-row {
+  display: flex;
+  gap: 12px;
+  font-size: 0.85rem;
+}

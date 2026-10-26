@@ -236,12 +236,14 @@ pub fn check(state: &super::ToolState, call: &ToolCall, workspaces: &[PathBuf]) 
         if p.is_absolute() && is_within(p, &super::scratchpad_root()) {
             continue;
         }
-        let full = if p.is_absolute() {
-            p.to_path_buf()
-        } else if let Some(ws) = workspaces.first() {
-            ws.join(p)
+        let full = if workspaces.is_empty() {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                continue;
+            }
         } else {
-            continue;
+            super::paths::resolve_tool_path(workspaces, &path)
         };
         let inside_any = workspaces.iter().any(|ws| is_within(&full, ws));
         if !inside_any && !grant_covers(state, &full, call_wants_write(call)) {
@@ -592,11 +594,15 @@ fn call_target_paths(call: &ToolCall) -> Vec<String> {
 /// workspace root for relative paths. Returns `None` when no workspace is open
 /// (nothing to anchor a relative path against).
 fn resolve_abs(workspaces: &[PathBuf], path: &str) -> Option<PathBuf> {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        Some(p.to_path_buf())
+    if workspaces.is_empty() {
+        let p = Path::new(path.trim());
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            None
+        }
     } else {
-        workspaces.first().map(|ws| ws.join(p))
+        Some(super::paths::resolve_tool_path(workspaces, path))
     }
 }
 

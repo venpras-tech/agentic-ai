@@ -1,0 +1,180 @@
+# Hugging Face Hub + External AI Tools — Enhancement Todos
+
+Ship target: `ui/` + `src-tauri/`. Legacy root `src/` is reference only.
+Related files: `ui/src/pages/ModelHubPage.tsx`, `ui/src/lib/downloads.ts`,
+`src-tauri/src/hub.rs`, `src-tauri/src/commands/model.rs`, `src-tauri/src/agent/mcp.rs`,
+`src-tauri/src/agent/tools.rs`, `src-tauri/src/agent/registry.rs`, `ui/src/pages/SettingsPage.tsx`.
+
+Baseline already works — do not re-implement:
+- Public GGUF search (`hf_search` → huggingface.co/api/models?filter=gguf)
+- Streamed download with pause/resume/cancel and `.part` Range resume
+- Split-GGUF shard grouping (download all parts together)
+- RAM fit badge (file size + fixed 4k/8k context vs available RAM)
+- MCP catalog in Settings (stdio + HTTP), probe, `call_mcp_tool` wrapper
+- Hugging Face Router as a remote provider (`https://router.huggingface.co/v1`)
+
+---
+
+## P0 — Correctness
+
+- [ ] **P0.1 Hugging Face token on Hub search and download**
+  Reuse (or persist) the `hf_…` token from the Models Hugging Face provider.
+  Send `Authorization: Bearer` on search, tree, and `resolve`.
+  Map HTTP 401/403 to “gated — accept the license on huggingface.co, then add a token in Settings.”
+  Hub footer currently claims public downloads need no token; gated models still need one after license accept.
+
+- [ ] **P0.2 Honor the Sort control**
+  Backend `hub::search` always uses `sort=downloads`. UI “Relevance” is a no-op.
+  After the user’s sort, `sortedResults` re-sorts by RAM compatibility, so Downloads/Likes/Name/Size are not what they claim.
+  Pass sort to the API where HF supports it; apply compatibility as a secondary key or a toggle, not a forced override.
+
+- [ ] **P0.3 Search on page load**
+  Last query is restored from `localStorage` (`hf-last-query`) but `handleSearch` never runs on mount.
+  First visit to `/models/hub` is a blank list. Auto-run the saved (or default) query.
+
+- [ ] **P0.4 Show shard progress in the UI**
+  Backend emits `part` / `parts` on `hf-download-progress` (`commands/model.rs`).
+  Frontend `DownloadProgress` and `progressCell` ignore them.
+  Progress bar resets per shard. Show “shard 2/3 · 41%” and aggregate bytes across the set.
+
+- [ ] **P0.5 Cancel & delete all shard `.part` files**
+  `hf_cancel_download` with `delete_part` only removes `{requestedFile}.part`.
+  Split models leave the other shards’ partials on disk. Delete the whole `shard_group`.
+
+- [ ] **P0.6 “Download all” disk accounting**
+  `handleDownloadAll` compares each file to the same `diskFreeBytes` and never subtracts files already queued.
+  Subtract started sizes so later files that no longer fit are skipped.
+
+- [ ] **P0.7 MCP `isError` handling**
+  `extract_call_result` (`mcp.rs`) on `isError: true` reads JSON-RPC `error` instead of the tool `content` text.
+  Surface the tool’s error body to the model.
+
+---
+
+## P1 — Hub UX (match LM Studio / huggingface.co)
+
+- [ ] **P1.1 Recommended quant for this machine**
+  Use available RAM + GPU VRAM to highlight one row (Q4_K_M if it fits, Q5 if RAM allows, Q3 if not).
+  Reuse / align with `ui/src/lib/modelSuggest.ts` instead of Hub’s crude 12% + 1.5 GB heuristic.
+
+- [ ] **P1.2 Fit badge should use GPU when present**
+  `system_info` reports NVIDIA VRAM; `gpuEnabled` is compile-time CUDA. Fit is RAM-only.
+  Offload-aware estimate: weights on VRAM, KV on RAM (or vice versa).
+  Detect AMD/Intel GPUs, not only `nvidia-smi`.
+
+- [ ] **P1.3 Load / Use after download**
+  `useDownloadManager().loadModel` exists and is unused on the Hub page.
+  After “On disk”, add “Load in llama.cpp” (and optionally jump to chat).
+
+- [ ] **P1.4 Filters and richer cards**
+  Surface `pipeline_tag`, `gated`, `tags`, `lastModified`, `license` from the HF API.
+  Client filters: Instruct vs base, gated badge, license, quant (Q4/Q5/Q8), size range, author.
+
+- [ ] **P1.5 Landing catalog**
+  Empty state with trending GGUF instruct models (Llama, Qwen, Phi, Mistral) sized to this PC,
+  plus “models that already fit.” Do not leave the page blank before first search.
+
+- [ ] **P1.6 Pagination / Load more**
+  Hard cap is 40. Use HF `limit` + offset (or next-page header).
+  Cache tree sizes; skip tree back-fill when `blobs=true` already has sizes.
+
+- [ ] **P1.7 Gated / private UX**
+  Badge + “Open license page” + token field on Hub (not only on Models).
+  Do not start a large download that will 401 at 0%.
+
+- [ ] **P1.8 Post-download row actions**
+  Open folder, delete, verify checksum, warn when the quant is too small for agent work
+  (reuse &lt;3B / bits-per-weight notes from `modelSuggest.ts`).
+
+---
+
+## P2 — Hub backend robustness
+
+- [ ] **P2.1 Pin revision, not always `main`**
+  `resolve/main` can change under the user. Prefer commit SHA from the search payload; show it; resume against that SHA.
+
+- [ ] **P2.2 Verify LFS SHA256 after download**
+  Use tree `lfs.oid` / `lfs.sha256`. Fail or warn on mismatch (Ollama-style integrity).
+
+- [ ] **P2.3 Recursive tree for nested GGUFs**
+  `/tree/main` without `?recursive=true` misses nested files, so sizes stay null and fit is “Unknown.”
+
+- [ ] **P2.4 Companion files for VLMs**
+  `is_runnable_gguf` / `list_downloaded` drop `mmproj`, `clip`, `siglip`, `vit`.
+  Vision models need the projector next to the LLM. Offer “Download mmproj too.”
+
+- [ ] **P2.5 Tokenizer from base model**
+  `download_tokenizer` only looks at the GGUF repo (often 404 on Bartowski-style repos).
+  Read model card `base_model:` and fetch tokenizer from there.
+
+- [ ] **P2.6 Rate limit, retry, cache**
+  No backoff on HF 429. Search results are not cached. User-agent is generic `ai-editor/0.1`.
+
+- [ ] **P2.7 Runnable-file filter false positives**
+  Substring match on `clip` / `vit` / `vision` can exclude a real LLM.
+  Prefer prefix/suffix rules, not substring.
+
+- [ ] **P2.8 Distinct HTTP errors**
+  Surface 404 (wrong revision/file), 429, 503 separately from generic `Download returned HTTP {code}`.
+
+---
+
+## P3 — External tools (MCP)
+
+Cursor / Claude inject each MCP tool as a native function (`mcp__server__tool`) with full JSON schema.
+This app uses one wrapper `call_mcp_tool`; `tools/list` keeps names only.
+
+- [ ] **P3.1 Promote MCP tools to native tool definitions**
+  On session start (or after catalog save): `tools/list` with schemas, inject `mcp__{server}__{tool}` into the registry.
+  Drop the “guess the name” `call_mcp_tool` path for catalogued servers.
+
+- [ ] **P3.2 Keep full `tools/list` payloads**
+  `parse_tools` stores names only. Keep `description` + `inputSchema` so the model can call Playwright/DB/HF MCP correctly.
+
+- [ ] **P3.3 Surface enabled MCP tools in context / status**
+  Skills already have a chip. Show MCP tool count + names so users know the agent can see them.
+
+- [ ] **P3.4 Hugging Face MCP (or Hub agent tools)**
+  Ship the official HF MCP server as a catalog preset, or add agent tools:
+  `hf_search_models`, `hf_model_info`, `hf_download`.
+  Then chat can do “download a 7B Q4 that fits this PC.”
+
+- [ ] **P3.5 MCP protocol gaps**
+  Frozen at protocol `2024-11-05`. Add: `resources/list|read`, `prompts/list`,
+  `notifications/tools/list_changed`, OAuth for remote HTTP MCP, reconnect on dead stdio,
+  concurrent calls (today one mutex per server).
+  `add_mcp_server` from the agent only creates stdio entries — support HTTP too.
+
+- [ ] **P3.6 Settings copy and probe**
+  Hint still says “Each entry spawns a command over stdio” even though HTTP exists.
+  Show last-known tool list on each catalog row without requiring Test first.
+
+- [ ] **P3.7 Align `call_mcp_tool` timeout**
+  Schema says default 30s; implementation uses 120s. Make them match.
+
+---
+
+## P4 — Hugging Face as a cloud model (Models page)
+
+- [ ] **P4.1 Router model list is a raw `/v1/models` dump**
+  No task filter, no “tool-capable,” no context size.
+  Group Hugging Face Router ids by provider (Groq, Together, HF Inference).
+
+- [ ] **P4.2 Persist the HF token**
+  Remote `api_key` is memory-only. Hub gated downloads and Router both need a saved `hf_` token
+  (OS keychain / existing secrets path), used by both Hub and the provider.
+
+- [ ] **P4.3 Unify Hub vs Provider in the UI**
+  Users treat “Hugging Face” as one product.
+  Label them: **Download weights** (Hub / GGUF) vs **Run via Hugging Face Inference** (Router).
+
+---
+
+## Suggested implementation order
+
+1. P0.1–P0.7 — Hub usable for gated models; sort/search/progress/cancel actually work
+2. P1.1–P1.3 — recommended quant, VRAM fit, load-after-download
+3. P1.4–P1.8 — filters, landing catalog, pagination, gated UX
+4. P2 — revision pin, SHA256, recursive tree, VLM companions, tokenizer
+5. P3.1–P3.4 — MCP as native tools + HF from chat
+6. P3.5–P3.7 and P4 — protocol completeness and Router UX

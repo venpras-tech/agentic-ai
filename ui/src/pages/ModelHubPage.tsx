@@ -2,63 +2,45 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/ipc";
 import CancelDownloadDialog from "../components/CancelDownloadDialog";
-import { useDownloadManager, formatBytes, formatSpeed, formatEta, parseQuant, estimateRamGb, fitStatus, dlKey, GB, type DownloadProgress } from "../lib/downloads";
+import {
+  useDownloadManager,
+  formatBytes,
+  formatSpeed,
+  formatEta,
+  parseQuant,
+  estimateRamGb,
+  dlKey,
+  GB,
+  type DownloadProgress,
+} from "../lib/downloads";
+import {
+  type HfResult,
+  type SystemInfo,
+  type SortKey,
+  type StatusLevel,
+  levelFor,
+  ramCapacityLevel,
+  SORT_LABELS,
+  POPULAR_FAMILIES,
+  compactNum,
+  fitForModel,
+  downloadUnits,
+  recommendedUnit,
+  isGatedModel,
+  isInstructModel,
+  fileSizeRange,
+  compatLevel,
+  parseRepoDisplay,
+  normalizeHubSearchQuery,
+} from "../lib/modelHubUtils";
+import "./AgentsPage.css";
+import "./ModelsPage.css";
 import "./ModelHubPage.css";
 
-interface HfResult {
-  repoId: string;
-  author: string | null;
-  likes: number;
-  downloads: number;
-  files: Array<{ name: string; size: number | null }>;
-}
+export { levelFor, ramCapacityLevel };
 
-interface SystemInfo {
-  os: string;
-  cpu: string;
-  cores: number;
-  totalRamGb: number;
-  availableRamGb: number;
-  totalSwapGb: number;
-  diskFreeGb: number;
-  diskTotalGb: number;
-  gpu: { name: string; vramGb: number } | null;
-  gpuEnabled: boolean;
-}
-
-type SortKey = "relevance" | "downloads" | "likes" | "name" | "size";
-
-/** How often the hardware figures are re-read. */
 const SYSTEM_POLL_MS = 3000;
-
-/**
- * Headroom thresholds for a resource, as a fraction of capacity.
- *
- * The bands are deliberately generous: the point is to warn before a download
- * or a model load is starved, not to track load average precisely.
- */
-const STATUS_BANDS = {
-  /** Free fraction: below `red` is critical, below `yellow` is tight. */
-  yellow: 0.15,
-  red: 0.05,
-} as const;
-
-type StatusLevel = "ok" | "warn" | "crit";
-
-export function levelFor(freeGb: number, totalGb: number): StatusLevel {
-  if (!Number.isFinite(freeGb) || !Number.isFinite(totalGb) || totalGb <= 0) return "warn";
-  const free = Math.max(0, Math.min(1, freeGb / totalGb));
-  if (free <= STATUS_BANDS.red) return "crit";
-  if (free <= STATUS_BANDS.yellow) return "warn";
-  return "ok";
-}
-
-/** Total RAM is a capacity fact: only flag it when the machine is tiny. */
-export function ramCapacityLevel(totalGb: number): StatusLevel {
-  if (totalGb < 4) return "crit";
-  if (totalGb < 8) return "warn";
-  return "ok";
-}
+const PAGE_SIZE = 40;
 
 const STATUS_TEXT: Record<StatusLevel, string> = {
   ok: "Healthy",
@@ -66,7 +48,6 @@ const STATUS_TEXT: Record<StatusLevel, string> = {
   crit: "Critical",
 };
 
-/** A single monitor row: coloured dot, label, value, and a status hint. */
 function SysItem({
   level,
   label,
@@ -79,113 +60,80 @@ function SysItem({
   title?: string;
 }) {
   return (
-    <div className="sys-item" title={title}>
-      <span className="sys-item-head">
-        <span className={`sys-dot sys-dot-${level ?? "none"}`} aria-hidden="true" />
-        <span className="sys-label">{label}</span>
+    <div className="hub-sys-item" title={title}>
+      <span className="hub-sys-head">
+        <span className={`hub-sys-dot hub-sys-dot-${level ?? "none"}`} aria-hidden="true" />
+        <span className="hub-sys-label">{label}</span>
       </span>
-      <span className="sys-val">{value}</span>
-      {level && <span className={`sys-state sys-state-${level}`}>{STATUS_TEXT[level]}</span>}
+      <span className="hub-sys-val">{value}</span>
+      {level ? <span className={`hub-sys-state hub-sys-state-${level}`}>{STATUS_TEXT[level]}</span> : null}
     </div>
   );
 }
 
-const SORT_LABELS: Record<SortKey, string> = {
-  relevance: "Relevance",
-  downloads: "Downloads",
-  likes: "Likes",
-  name: "Name",
-  size: "Total size",
-};
-
-function compactNum(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
-
 function fitBadge(status: "fits" | "tight" | "no" | "unknown") {
-  if (status === "fits") return <span className="fit-badge fits">Fits comfortably</span>;
-  if (status === "tight") return <span className="fit-badge tight">Tight fit</span>;
-  if (status === "no") return <span className="fit-badge no">Insufficient RAM</span>;
-  return <span className="fit-badge unknown">Unknown</span>;
-}
-
-/** Only GGUF weight files count for size/fit math and download rows. */
-function modelFiles(files: Array<{ name: string; size: number | null }>) {
-  const weights = files.filter((f) => !/imatrix/i.test(f.name));
-  const quant = weights.filter((f) => parseQuant(f.name) !== "—");
-  return quant.length > 0 ? quant : weights;
-}
-
-function fileSizeRange(files: Array<{ name: string; size: number | null }>): { min: number; max: number } {
-  const sizes = modelFiles(files).map((f) => f.size || 0).filter((s) => s > 0);
-  if (sizes.length === 0) return { min: 0, max: 0 };
-  return { min: Math.min(...sizes), max: Math.max(...sizes) };
-}
-
-/**
- * Compatible = the smallest GGUF quant fits your RAM. Uses the SAME estimate
- * and threshold as the table's "Your Fit" column (recommended 8k context), so
- * the dot and the rows can never disagree.
- */
-function compatLevel(
-  availableGb: number,
-  files: Array<{ name: string; size: number | null }>,
-): "ok" | "bad" | "unknown" {
-  if (!availableGb) return "unknown";
-  const { min } = fileSizeRange(files);
-  if (min <= 0) return "unknown";
-  const ram = estimateRamGb(min, 8192);
-  const fit = fitStatus(availableGb, ram);
-  return fit === "no" ? "bad" : fit === "unknown" ? "unknown" : "ok";
+  if (status === "fits") return <span className="hub-fit fits">Fits</span>;
+  if (status === "tight") return <span className="hub-fit tight">Tight</span>;
+  if (status === "no") return <span className="hub-fit no">Too large</span>;
+  return <span className="hub-fit unknown">—</span>;
 }
 
 function compatDot(level: "ok" | "bad" | "unknown") {
   const title =
     level === "ok"
-      ? "Compatible: the smallest quant fits in your available RAM."
+      ? "At least one quant fits your RAM"
       : level === "bad"
-        ? "Not compatible: even the smallest quant exceeds your available RAM."
-        : "Compatibility unknown (system info unavailable).";
-  return <span className={`hub-dot ${level}`} title={title} aria-label={title} />;
+        ? "No quant fits your available RAM"
+        : "Compatibility unknown";
+  return <span className={`hub-compat-dot ${level}`} title={title} aria-label={title} />;
 }
 
-function progressCell(d: DownloadProgress | undefined, repoId: string, file: string) {
+function progressCell(d: DownloadProgress | undefined) {
   if (!d) return null;
   const pct = d.totalBytes > 0 ? Math.round((d.receivedBytes / d.totalBytes) * 100) : 0;
   const speed = formatSpeed(d.speedBps);
   const eta = formatEta(d.etaSeconds);
+  const shardLabel = d.parts && d.parts > 1 ? `shard ${d.part ?? 1}/${d.parts} · ` : "";
   return (
-    <div className="table-progress">
+    <div className="hub-progress">
       {d.done ? (
-        <span className="dl-status done">Complete</span>
+        <span className="hub-dl-status done" title={d.checksumWarning ? "Checksum mismatch" : undefined}>
+          Complete{d.checksumWarning ? " ⚠" : ""}
+        </span>
       ) : d.cancelled ? (
-        <span className="dl-status">Cancelled</span>
+        <span className="hub-dl-status">Cancelled</span>
       ) : d.paused ? (
-        <span className="dl-status paused">Paused</span>
+        <span className="hub-dl-status paused">Paused</span>
       ) : d.error ? (
-        <span className="dl-status error" title={d.error}>Error</span>
+        <span className="hub-dl-status error" title={d.error}>Error</span>
       ) : (
         <>
-          <span className="dl-pct">{pct}%</span>
-          <div className="table-progress-track">
-            <div className="table-progress-fill" style={{ width: `${pct}%` }} />
+          <span className="hub-dl-pct">{shardLabel}{pct}%</span>
+          <div className="hub-progress-track">
+            <div className="hub-progress-fill" style={{ width: `${pct}%` }} />
           </div>
-          {speed && <span className="dl-rate">{speed}{eta ? ` · ${eta}` : ""}</span>}
+          {speed ? <span className="hub-dl-rate">{speed}{eta ? ` · ${eta}` : ""}</span> : null}
         </>
       )}
     </div>
   );
 }
 
+function HuggingFaceIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2c-1.5 2.2-3.8 3.6-6.2 4.1.4 3.1 1.8 6 4.2 8.2C8.5 17.8 10.1 20 12 22c1.9-2 3.5-4.2 5-7.7 2.4-2.2 3.8-5.1 4.2-8.2C15.8 5.6 13.5 4.2 12 2z" />
+    </svg>
+  );
+}
+
 function ModelHubPage() {
   const navigate = useNavigate();
-  const { downloads, download, pause, resume, cancel } = useDownloadManager();
+  const { downloads, download, pause, resume, cancel, dismiss, loadModel } = useDownloadManager();
   const [query, setQuery] = useState(() => localStorage.getItem("hf-last-query") || "llama gguf");
   const [sortBy, setSortBy] = useState<SortKey>(() => {
     const stored = localStorage.getItem("hf-sort") as SortKey | null;
-    return stored && stored in SORT_LABELS ? stored : "relevance";
+    return stored && stored in SORT_LABELS ? stored : "downloads";
   });
   const [results, setResults] = useState<HfResult[]>([]);
   const [openRepo, setOpenRepo] = useState<string | null>(null);
@@ -195,6 +143,18 @@ function ModelHubPage() {
   const [downloaded, setDownloaded] = useState<Record<string, boolean>>({});
   const [note, setNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<{ repoId: string; file: string } | null>(null);
+  const [tokenStatus, setTokenStatus] = useState<{ present: boolean; source?: string | null } | null>(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [typeFilter, setTypeFilter] = useState<"any" | "instruct" | "base">("any");
+  const [quantFilter, setQuantFilter] = useState<string>("any");
+  const [sizeFilter, setSizeFilter] = useState<string>("any");
+  const [authorFilter, setAuthorFilter] = useState("");
+  const [licenseFilter, setLicenseFilter] = useState("");
+  const [busyRow, setBusyRow] = useState<string | null>(null);
+  const [sidebarFamily, setSidebarFamily] = useState<string | null>(null);
+  const [showTokenPanel, setShowTokenPanel] = useState(false);
 
   const loadDownloaded = useCallback(async () => {
     try {
@@ -202,32 +162,37 @@ function ModelHubPage() {
       const map: Record<string, boolean> = {};
       for (const m of list) map[dlKey(m.repoId, m.fileName)] = true;
       setDownloaded(map);
-    } catch { setDownloaded({}); }
+    } catch {
+      setDownloaded({});
+    }
+  }, []);
+
+  const refreshSystem = useCallback(() => {
+    void api.systemInfo().then(setSys).catch(() => {});
   }, []);
 
   useEffect(() => {
     void loadDownloaded();
+    void api.hfTokenStatus().then(setTokenStatus).catch(() => setTokenStatus({ present: false }));
   }, [loadDownloaded]);
 
-  // Live hardware monitor. RAM and disk move while a download is running, so
-  // the figures are re-polled instead of frozen at mount. The poll is skipped
-  // while the tab is hidden to avoid pointless work in the background.
+  useEffect(() => {
+    void handleSearch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     let timer: number | undefined;
     const tick = () => {
-      if (document.visibilityState === "visible") {
-        void api.systemInfo().then(setSys).catch(() => {});
-      }
+      if (document.visibilityState === "visible") refreshSystem();
     };
     tick();
     timer = window.setInterval(tick, SYSTEM_POLL_MS);
     return () => {
       if (timer !== undefined) window.clearInterval(timer);
     };
-  }, []);
+  }, [refreshSystem]);
 
-  // Whenever any download completes, refresh the set of files already on disk
-  // so the row flips to "On disk".
   useEffect(() => {
     const doneKeys = Object.values(downloads).filter((d) => d.done).map((d) => dlKey(d.repoId, d.file));
     if (doneKeys.length > 0) void loadDownloaded();
@@ -238,70 +203,168 @@ function ModelHubPage() {
     localStorage.setItem("hf-last-query", q);
   };
 
-  const handleSearch = async () => {
-    setSearching(true);
-    setError("");
-    setResults([]);
-    localStorage.setItem("hf-last-query", query.trim() || "llama gguf");
+  const handleSearch = useCallback(
+    async (q?: string) => {
+      const raw = (q ?? query).trim();
+      const searchQuery = normalizeHubSearchQuery(raw) || "llama gguf";
+      setSearching(true);
+      setError("");
+      setResults([]);
+      setHasMore(false);
+      setQuery(raw || searchQuery);
+      localStorage.setItem("hf-last-query", raw || searchQuery);
+      try {
+        const res = (await api.hfSearch(searchQuery, PAGE_SIZE, 0, sortBy)) as HfResult[];
+        setResults(res);
+        setHasMore(res.length >= PAGE_SIZE);
+        setOpenRepo(res.length > 0 ? res[0].repoId : null);
+        if (res.length === 0) setError("No GGUF models found for that query.");
+      } catch (err) {
+        setError(String(err instanceof Error ? err.message : err));
+      }
+      setSearching(false);
+    },
+    [query, sortBy],
+  );
+
+  const loadMore = async () => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
     try {
-      const res = await api.hfSearch(query.trim() || "llama gguf", 20);
-      setResults(res);
-      setOpenRepo(res.length > 0 ? res[0].repoId : null);
-      if (res.length === 0) setError("No GGUF models found for that query.");
+      const res = (await api.hfSearch(query, PAGE_SIZE, results.length, sortBy)) as HfResult[];
+      const seen = new Set(results.map((r) => r.repoId));
+      const merged = [...results, ...res.filter((r) => !seen.has(r.repoId))];
+      setResults(merged);
+      setHasMore(res.length >= PAGE_SIZE && merged.length > results.length);
     } catch (err) {
       setError(String(err instanceof Error ? err.message : err));
     }
-    setSearching(false);
+    setLoadingMore(false);
+  };
+
+  const refreshTokenStatus = async () => {
+    try {
+      const st = await api.hfTokenStatus();
+      setTokenStatus(st);
+      return st;
+    } catch {
+      setTokenStatus({ present: false });
+      return { present: false } as { present: boolean; source?: string | null };
+    }
+  };
+
+  const saveToken = async () => {
+    const t = tokenInput.trim();
+    if (!t) return;
+    try {
+      await api.hfTokenSave(t);
+      setTokenInput("");
+      await refreshTokenStatus();
+      setNote("Hugging Face token saved.");
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  const clearToken = async () => {
+    try {
+      await api.hfTokenClear();
+      await refreshTokenStatus();
+      setNote("Hugging Face token removed.");
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  const deleteModel = async (repoId: string, file: string) => {
+    const key = dlKey(repoId, file);
+    setBusyRow(key);
+    try {
+      const r = await api.deleteDownloadedModel(repoId, file);
+      setNote(`Deleted ${file} (${formatBytes(r.freedBytes)} freed).`);
+      await loadDownloaded();
+      dismiss(repoId, file);
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    }
+    setBusyRow(null);
+  };
+
+  const loadDownloadedModel = async (repoId: string, file: string) => {
+    const key = dlKey(repoId, file);
+    setBusyRow(key);
+    try {
+      await loadModel(repoId, file);
+      setNote(`Loading ${file.split("/").pop()}…`);
+      navigate("/");
+    } catch (err) {
+      setError(`Could not load model: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    setBusyRow(null);
   };
 
   const handleSort = (k: SortKey) => {
     setSortBy(k);
     localStorage.setItem("hf-sort", k);
+    void handleSearch();
   };
 
   const sortedResults = useMemo(() => {
+    if (sortBy !== "relevance") return results;
     const available = sys?.availableRamGb || 0;
     const arr = [...results];
     const compatRank = (files: HfResult["files"]) =>
       compatLevel(available, files) === "ok" ? 0 : compatLevel(available, files) === "bad" ? 1 : 2;
-    const byCompat = (a: HfResult, b: HfResult) => compatRank(a.files) - compatRank(b.files);
-    switch (sortBy) {
-      case "downloads":
-        arr.sort((a, b) => b.downloads - a.downloads);
-        break;
-      case "likes":
-        arr.sort((a, b) => b.likes - a.likes);
-        break;
-      case "name":
-        arr.sort((a, b) => a.repoId.localeCompare(b.repoId));
-        break;
-      case "size":
-        arr.sort((a, b) => {
-          const sa = a.files.reduce((acc, f) => acc + (f.size || 0), 0);
-          const sb = b.files.reduce((acc, f) => acc + (f.size || 0), 0);
-          return sb - sa;
-        });
-        break;
-      default:
-        break;
-    }
-    arr.sort((a, b) => byCompat(a, b) || 0);
+    arr.sort((a, b) => compatRank(a.files) - compatRank(b.files));
     return arr;
-  }, [results, sortBy, sys]);
+  }, [results, sys, sortBy]);
 
+  const filteredResults = useMemo(() => {
+    return sortedResults.filter((m) => {
+      if (typeFilter === "instruct" && !isInstructModel(m)) return false;
+      if (typeFilter === "base" && isInstructModel(m)) return false;
+      if (authorFilter && !(m.author || m.repoId.split("/")[0] || "").toLowerCase().includes(authorFilter.toLowerCase()))
+        return false;
+      if (licenseFilter) {
+        const lic = `${m.license || ""} ${(m.tags || []).join(" ")}`.toLowerCase();
+        if (!lic.includes(licenseFilter.toLowerCase())) return false;
+      }
+      if (sizeFilter !== "any") {
+        const totalGb = m.files.reduce((acc, f) => acc + (f.size || 0), 0) / GB;
+        if (!totalGb) return false;
+        const [op, limit] = sizeFilter.split(":");
+        const n = Number(limit);
+        if (op === "lt" && totalGb > n) return false;
+        if (op === "gt" && totalGb < n) return false;
+      }
+      if (quantFilter !== "any") {
+        if (!m.files.some((f) => parseQuant(f.name).startsWith(quantFilter))) return false;
+      }
+      return true;
+    });
+  }, [sortedResults, typeFilter, authorFilter, licenseFilter, sizeFilter, quantFilter]);
+
+  const gatedVisible = filteredResults.some((m) => isGatedModel(m));
   const diskFreeBytes = (sys?.diskFreeGb || 0) * GB;
 
   const handleDownloadAction = async (repoId: string, file: string) => {
     const key = dlKey(repoId, file);
     const d = downloads[key];
     if (d?.done || downloaded[key]) return;
-    if (d?.paused) { void resume(repoId, file); return; }
-    if (d && !d.cancelled && !d.error) { void pause(repoId, file); return; }
+    if (d?.paused) {
+      void resume(repoId, file);
+      return;
+    }
+    if (d && !d.cancelled && !d.error) {
+      void pause(repoId, file);
+      return;
+    }
     try {
-      await download(repoId, file);
+      const model = results.find((r) => r.repoId === repoId);
+      await download(repoId, file, model?.sha || null);
       setNote(`Downloading ${file.split("/").pop()}…`);
     } catch (err) {
-      setError(`Download failed to start: ${err instanceof Error ? err.message : String(err)}`);
+      setError(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -315,295 +378,446 @@ function ModelHubPage() {
     return "Download";
   };
 
-  const actionClass = (repoId: string, file: string): string => {
-    const key = dlKey(repoId, file);
-    const d = downloads[key];
-    if (downloaded[key] && !d) return "hub-dl-btn on-disk";
-    if (d?.done) return "hub-dl-btn on-disk";
-    if (d?.paused) return "hub-dl-btn resume";
-    if (d && !d.cancelled && !d.error) return "hub-dl-btn active";
-    return "hub-dl-btn";
-  };
-
   const handleDownloadAll = async (model: HfResult) => {
-    const diskFree = diskFreeBytes;
+    let diskFree = diskFreeBytes;
     let started = 0;
-    for (const f of modelFiles(model.files)) {
-      const key = dlKey(model.repoId, f.name);
-      if (!downloaded[key] && !downloads[key] && (f.size ?? 0) <= diskFree) {
+    for (const unit of downloadUnits(model.files)) {
+      const key = dlKey(model.repoId, unit.name);
+      if (!downloaded[key] && !downloads[key] && unit.size <= diskFree) {
         try {
-          await download(model.repoId, f.name);
+          await download(model.repoId, unit.name, model.sha || null);
           started += 1;
-          setNote(`Starting download of all files that fit on your disk.`);
+          diskFree -= unit.size;
         } catch (err) {
-          setError(`Download failed to start: ${err instanceof Error ? err.message : String(err)}`);
+          setError(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }
-    if (started === 0 && !error) setNote(`No files to download — all already on disk (or don't fit).`);
+    if (started > 0) setNote(`Started ${started} download(s).`);
+    else if (!error) setNote("Nothing to download — already on disk or insufficient space.");
   };
 
   const openOnHF = (repoId: string) => {
-    if (note) setNote(`${repoId} – opening model page in your browser…`);
     void api.openUrl(`https://huggingface.co/${repoId}`).catch((err) =>
-      setNote(`Couldn't open browser: ${String(err)}`),
+      setError(`Couldn't open browser: ${String(err)}`),
     );
   };
 
+  const pickFamily = (label: string, familyQuery: string) => {
+    setSidebarFamily(label);
+    persistQuery(familyQuery);
+    void handleSearch(familyQuery);
+  };
+
   return (
-    <div className="hub-view">
-      <div className="hub-header">
-        <h2 className="hub-title">Hugging Face Hub</h2>
-        <p className="hub-desc">
-          Search and download GGUF models. Downloaded models appear in the
-          <button type="button" className="hub-link" onClick={() => navigate("/models")}>Models</button>
-          page for loading. Your system spec is analyzed to suggest whether a model will fit.
-        </p>
-      </div>
-
-      {note && (
-        <div className="hub-note" role="status">
-          {note}
-          <button type="button" className="hub-note-close" onClick={() => setNote(null)}>×</button>
-        </div>
-      )}
-
-      {sys && (
-        <div className="sys-card">
-          <div className="sys-card-title">
-            Your System
-            <span className="sys-live" title="Refreshes every few seconds">
-              <span className="sys-live-dot" aria-hidden="true" />
-              live
-            </span>
-          </div>
-          <div className="sys-grid">
-            <SysItem level={null} label="OS" value={sys.os} />
-            <SysItem level={null} label="CPU" value={sys.cpu} />
-            <SysItem level={null} label="Cores" value={String(sys.cores)} />
-            <SysItem
-              level={ramCapacityLevel(sys.totalRamGb)}
-              label="Total RAM"
-              value={`${sys.totalRamGb.toFixed(1)} GB`}
-              title="Total installed memory. Yellow under 8 GB, red under 4 GB."
-            />
-            <SysItem
-              level={levelFor(sys.availableRamGb, sys.totalRamGb)}
-              label="Available RAM"
-              value={`${sys.availableRamGb.toFixed(1)} GB`}
-              title={`${((sys.availableRamGb / Math.max(sys.totalRamGb, 1)) * 100).toFixed(0)}% of ${sys.totalRamGb.toFixed(1)} GB free`}
-            />
-            <SysItem
-              level={levelFor(sys.diskFreeGb, sys.diskTotalGb)}
-              label="Disk Free"
-              value={`${sys.diskFreeGb.toFixed(1)} GB / ${sys.diskTotalGb.toFixed(1)} GB`}
-              title={`${((sys.diskFreeGb / Math.max(sys.diskTotalGb, 1)) * 100).toFixed(0)}% free on the models volume`}
-            />
-            {sys.gpu ? (
-              <SysItem
-                level={null}
-                label="GPU"
-                value={`${sys.gpu.name} (${sys.gpu.vramGb.toFixed(1)} GB)`}
-                title="GPU and VRAM reported by nvidia-smi"
-              />
-            ) : (
-              <SysItem
-                level={sys.gpuEnabled ? "ok" : "warn"}
-                label="GPU"
-                value={`None detected${sys.gpuEnabled ? "" : " (CPU-only build)"}`}
-                title={
-                  sys.gpuEnabled
-                    ? "No GPU reported. The build has GPU support enabled, so check the driver."
-                    : "This binary was compiled without a llama.cpp GPU backend."
-                }
-              />
-            )}
-          </div>
-        </div>
-      )}
-
-      <div className="hub-search-bar">
-        <div className="hub-search-input-wrap">
-          <svg className="hub-search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="11" cy="11" r="8" />
-            <path d="m21 21-4.3-4.3" />
-          </svg>
-          <input
-            type="text"
-            className="hub-search-input"
-            placeholder="Search GGUF models… e.g. llama, qwen, phi"
-            value={query}
-            onChange={(e) => persistQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") void handleSearch(); }}
-          />
-        </div>
-        <button type="button" className="hub-search-btn" onClick={() => void handleSearch()} disabled={searching}>
-          {searching ? "Searching…" : "Search"}
-        </button>
-      </div>
-
-      {error ? <p className="hub-error">{error}</p> : null}
-      {searching ? <div className="hub-spinner-wrap"><span className="spinner" /></div> : null}
-
-      {!searching && results.length > 0 && (
-        <div className="hub-sort-row">
-          <span className="hub-sort-label">Sort by</span>
-          {Object.entries(SORT_LABELS).map(([k, label]) => (
-            <button
-              key={k}
-              type="button"
-              className={`hub-sort-btn ${sortBy === k ? "active" : ""}`}
-              onClick={() => handleSort(k as SortKey)}
-            >
-              {label}
+    <div className="hub-page agents-page">
+      <header className="agents-hero">
+        <div className="agents-hero-text">
+          <h1 className="agents-title">Download models</h1>
+          <p className="agents-subtitle">
+            Search Hugging Face for GGUF weights used by the local agent backend. Downloads land in your models
+            folder — load them from{" "}
+            <button type="button" className="hub-inline-link" onClick={() => navigate("/agents?focus=local")}>
+              Local GGUF
             </button>
-          ))}
-          <span className="hub-sort-hint">Compatible models are always listed first</span>
+            .
+          </p>
         </div>
-      )}
+      </header>
 
-      <div className="hub-results">
-        {sortedResults.map((model) => {
-          const allSizes = model.files.reduce((acc, f) => acc + (f.size || 0), 0);
-          const { min, max } = fileSizeRange(model.files);
-          const level = compatLevel(sys?.availableRamGb || 0, model.files);
-          const isOpen = openRepo === model.repoId;
-          return (
-            <div key={model.repoId} className="hub-acc-item">
+      <nav className="hub-mode-tabs" aria-label="Model catalog">
+        <button type="button" className="hub-mode-tab active">Text (GGUF)</button>
+        <button type="button" className="hub-mode-tab" onClick={() => navigate("/images")}>
+          Images
+        </button>
+        <button type="button" className="hub-mode-tab" onClick={() => navigate("/video")}>
+          Video
+        </button>
+        <button type="button" className="hub-mode-tab" onClick={() => navigate("/llama-cpp")}>
+          llama.cpp
+        </button>
+      </nav>
+
+      {note ? (
+        <div className="model-connected-banner hub-banner" role="status">
+          <span className="model-dot-connected" />
+          <span>{note}</span>
+          <button type="button" className="hub-banner-dismiss" onClick={() => setNote(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      ) : null}
+
+      <section className="hub-discover" aria-label="Model search">
+        <div className="hub-discover-search">
+          <div className="hub-discover-input-wrap">
+            <svg className="hub-discover-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <circle cx="11" cy="11" r="8" />
+              <path d="m21 21-4.3-4.3" />
+            </svg>
+            <input
+              id="hub-query"
+              type="search"
+              className="hub-discover-input"
+              placeholder="Search models — keyword, user/model, or Hugging Face URL"
+              value={query}
+              onChange={(e) => persistQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleSearch();
+              }}
+            />
+          </div>
+          <button type="button" className="hub-discover-search-btn" onClick={() => void handleSearch()} disabled={searching}>
+            {searching ? "Searching…" : "Search"}
+          </button>
+        </div>
+
+        <div className="hub-discover-toolbar">
+          <div className="hub-discover-filters">
+            <label className="hub-discover-filter">
+              <span>Type</span>
+              <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value as typeof typeFilter)}>
+                <option value="any">Any</option>
+                <option value="instruct">Instruct</option>
+                <option value="base">Base</option>
+              </select>
+            </label>
+            <label className="hub-discover-filter">
+              <span>Quant</span>
+              <select value={quantFilter} onChange={(e) => setQuantFilter(e.target.value)}>
+                <option value="any">Any</option>
+                <option value="Q4">Q4+</option>
+                <option value="Q5">Q5+</option>
+                <option value="Q6">Q6+</option>
+                <option value="Q8">Q8</option>
+                <option value="F16">F16</option>
+              </select>
+            </label>
+            <label className="hub-discover-filter">
+              <span>Size</span>
+              <select value={sizeFilter} onChange={(e) => setSizeFilter(e.target.value)}>
+                <option value="any">Any</option>
+                <option value="lt:8">≤ 8 GB</option>
+                <option value="lt:16">≤ 16 GB</option>
+                <option value="lt:32">≤ 32 GB</option>
+                <option value="gt:32">&gt; 32 GB</option>
+              </select>
+            </label>
+            <label className="hub-discover-filter">
+              <span>Author</span>
+              <input value={authorFilter} onChange={(e) => setAuthorFilter(e.target.value)} placeholder="any" />
+            </label>
+            <label className="hub-discover-filter hub-discover-filter-grow">
+              <span>License</span>
+              <input value={licenseFilter} onChange={(e) => setLicenseFilter(e.target.value)} placeholder="any" />
+            </label>
+          </div>
+          <div className="hub-discover-sort">
+            {(Object.entries(SORT_LABELS) as [SortKey, string][]).map(([k, label]) => (
               <button
+                key={k}
                 type="button"
-                className="hub-acc-head"
-                aria-expanded={isOpen}
-                onClick={() => setOpenRepo(isOpen ? null : model.repoId)}
+                className={`hub-discover-sort-btn ${sortBy === k ? "active" : ""}`}
+                onClick={() => handleSort(k)}
               >
-                <span className="hub-acc-title-wrap">
-                  <span className="hub-result-title" title={model.repoId}>{model.repoId}</span>
-                  {model.author && <span className="hub-author">{model.author}</span>}
-                </span>
-                <span className="hub-acc-meta">
-                  <span className="hub-acc-size" title="Smallest available quant file">Min {formatBytes(min)}</span>
-                  <span className="hub-acc-size" title="Largest available quant file">Max {formatBytes(max)}</span>
-                  {compatDot(level)}
-                  <span className="hub-acc-chevron" aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
-                </span>
+                {label}
               </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className={`hub-discover-token-btn ${tokenStatus?.present ? "ok" : ""}`}
+            onClick={() => setShowTokenPanel((v) => !v)}
+          >
+            {tokenStatus?.present ? "HF token ✓" : "HF token"}
+          </button>
+        </div>
 
-              {isOpen && (
-                <div className="hub-acc-body">
-                  <div className="hub-result-head">
-                    <div className="hub-result-title-wrap">
-                      <div className="hub-result-sub">
-                        <button type="button" className="hub-open-btn" onClick={() => openOnHF(model.repoId)} title="Open on huggingface.co">
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                            <path d="M15 3h6v6" />
-                            <path d="M10 14 21 3" />
-                          </svg>
-                          Open model page
-                        </button>
-                      </div>
-                    </div>
-                    <div className="hub-result-metrics">
-                      <span className="hub-metric" title="Downloads">⬇ {compactNum(model.downloads)}</span>
-                      <span className="hub-metric" title="Likes">★ {compactNum(model.likes)}</span>
-                      {allSizes > 0 && <span className="hub-metric hub-size-total">Σ {formatBytes(allSizes)}</span>}
-                      {model.files.length > 1 && (
-                        <button type="button" className="hub-dl-all-btn" onClick={() => void handleDownloadAll(model)}>
-                          Download all
-                        </button>
-                      )}
-                    </div>
-                  </div>
+        {showTokenPanel ? (
+          <div className="hub-discover-token-panel">
+            <input
+              type="password"
+              className="modal-input"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              placeholder="hf_… read token for gated models"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveToken();
+              }}
+            />
+            <button type="button" className="btn-modal-primary" onClick={() => void saveToken()} disabled={!tokenInput.trim()}>
+              Save
+            </button>
+            {tokenStatus?.present ? (
+              <button type="button" className="btn-modal-secondary" onClick={() => void clearToken()}>
+                Remove
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
 
-                  <div className="hub-table-wrap">
-                    <table className="hub-table">
-                      <thead>
-                        <tr>
-                          <th>File</th>
-                          <th>Size</th>
-                          <th>Quant</th>
-                          <th className="ram-col" title="Estimated RAM for a typical 8k-token context window: model size + ~12 % overhead + ~1.5 GB context. Change n_ctx in Settings to match your usage.">
-                            Recommended RAM
-                          </th>
-                          <th className="ram-col" title="Smallest usable footprint: model file size + ~12 % overhead + ~0.8 GB for a short 4k-token context. Real minimum will still depend on Settings → n_ctx.">
-                            Minimum RAM
-                          </th>
-                          <th>Your Fit</th>
-                          <th>Progress</th>
-                          <th />
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[...modelFiles(model.files)]
-                          .sort((a, b) => (a.size || 0) - (b.size || 0))
-                          .map((f) => {
-                          const size = f.size || 0;
-                          const est = estimateRamGb(size, 8192);
-                          const min = estimateRamGb(size, 4096);
-                          const fit = fitStatus(sys?.availableRamGb || 0, est);
-                          const noDisk = size > diskFreeBytes;
-                          const key = dlKey(model.repoId, f.name);
-                          const dl = downloads[key];
-                          const done = downloaded[key] && !dl;
-                          const label = actionLabel(model.repoId, f.name);
-                          const cls = actionClass(model.repoId, f.name);
-                          const disabled = !done && noDisk && !dl;
-                          return (
-                            <tr key={f.name}>
-                              <td className="hub-table-fname" title={f.name}>{f.name}</td>
-                              <td className="hub-table-num">
-                                {formatBytes(size)}
-                                {noDisk && (
-                                  <div className="hub-warn" title={`This file needs ${formatBytes(size)} but only ${formatBytes(diskFreeBytes)} is free.`}>
-                                    Not enough disk
-                                  </div>
-                                )}
-                              </td>
-                              <td className="hub-table-num">{parseQuant(f.name)}</td>
-                              <td className="hub-table-num">{est > 0 ? `${est.toFixed(1)} GB` : "—"}</td>
-                              <td className="hub-table-num">{min > 0 ? `${min.toFixed(1)} GB` : "—"}</td>
-                              <td>{fitBadge(fit)}</td>
-                              <td>{progressCell(dl, model.repoId, f.name)}</td>
-                              <td className="hub-table-action">
-                                {done ? (
-                                  <span className="hub-dl-btn on-disk">On disk</span>
-                                ) : dl?.error ? (
-                                  <button type="button" className="hub-dl-btn error" onClick={() => void handleDownloadAction(model.repoId, f.name)} title={dl.error}>Retry</button>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className={cls}
-                                    disabled={disabled}
-                                    title={disabled ? `Not enough free disk space (needs ${formatBytes(size)})` : undefined}
-                                    onClick={() => void handleDownloadAction(model.repoId, f.name)}
-                                  >
-                                    {label}
-                                  </button>
-                                )}
-                                {!done && dl && !dl.done && (dl.receivedBytes > 0 || dl.totalBytes > 0) ? (
-                                  <button type="button" className="hub-dl-cancel" onClick={() => setConfirming({ repoId: model.repoId, file: f.name })} title="Cancel">
-                                    <svg width="12" height="12" viewBox="0 0 12 12"><line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" strokeWidth="1.5"/><line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" strokeWidth="1.5"/></svg>
-                                  </button>
-                                ) : null}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+      <div className="model-modal-body hub-layout">
+        <aside className="model-providers-panel hub-aside">
+          <div className="model-providers-panel-title">This machine</div>
+          {sys ? (
+            <div className="hub-sys-grid">
+              <SysItem level={null} label="OS" value={sys.os} />
+              <SysItem level={null} label="CPU" value={`${sys.cores} cores`} title={sys.cpu} />
+              <SysItem
+                level={ramCapacityLevel(sys.totalRamGb)}
+                label="RAM"
+                value={`${sys.availableRamGb.toFixed(1)} / ${sys.totalRamGb.toFixed(1)} GB`}
+              />
+              <SysItem
+                level={levelFor(sys.diskFreeGb, sys.diskTotalGb)}
+                label="Disk"
+                value={`${sys.diskFreeGb.toFixed(1)} GB free`}
+              />
+              {sys.gpu ? (
+                <SysItem level={null} label="GPU" value={`${sys.gpu.vramGb.toFixed(0)} GB VRAM`} title={sys.gpu.name} />
+              ) : (
+                <SysItem
+                  level={sys.gpuEnabled ? "ok" : "warn"}
+                  label="GPU"
+                  value={sys.gpuEnabled ? "None detected" : "CPU-only build"}
+                />
               )}
             </div>
-          );
-        })}
+          ) : (
+            <p className="models-desc hub-aside-muted">Reading system info…</p>
+          )}
+          <button type="button" className="model-refresh-btn hub-refresh-sys" onClick={refreshSystem} title="Refresh hardware">
+            Refresh
+          </button>
+
+          <div className="model-providers-panel-title hub-aside-gap">Staff picks</div>
+          <div className="model-providers-list hub-family-list">
+            {POPULAR_FAMILIES.map((c) => (
+              <button
+                key={c.label}
+                type="button"
+                className={`model-provider-item ${sidebarFamily === c.label ? "active" : ""}`}
+                onClick={() => pickFamily(c.label, c.query)}
+              >
+                <span className="model-provider-icon">
+                  <HuggingFaceIcon />
+                </span>
+                <span className="model-provider-item-text">
+                  <span className="model-provider-item-name">{c.label}</span>
+                  <span className="model-provider-tag">{c.hint}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        <div className="hub-results-pane">
+          {gatedVisible && !tokenStatus?.present ? (
+            <div className="hub-gated-banner" role="status">
+              Gated models need a Hugging Face token — accept the license on the model page first.
+            </div>
+          ) : null}
+
+          {error ? <p className="hub-error">{error}</p> : null}
+          {searching ? <div className="hub-spinner-wrap"><span className="spinner" /></div> : null}
+
+          {!searching && results.length === 0 && !error ? (
+            <div className="hub-discover-empty">
+              <p>Search by name or paste a <span className="hub-code">user/model</span> path.</p>
+              <button type="button" className="btn-modal-secondary" onClick={() => void handleSearch("gguf")}>
+                Browse top GGUF downloads
+              </button>
+            </div>
+          ) : null}
+
+          {!searching && results.length > 0 ? (
+            <div className="hub-results-count">
+              {filteredResults.length} model{filteredResults.length === 1 ? "" : "s"}
+              <span className="hub-results-count-muted"> · {SORT_LABELS[sortBy]}</span>
+            </div>
+          ) : null}
+
+          <div className="hub-lms-list">
+            {filteredResults.map((model) => {
+              const { min, max } = fileSizeRange(model.files);
+              const level = compatLevel(sys?.availableRamGb || 0, model.files);
+              const isOpen = openRepo === model.repoId;
+              const gated = isGatedModel(model);
+              const rec = recommendedUnit(downloadUnits(model.files), sys);
+              const { author, name } = parseRepoDisplay(model.repoId);
+              const desc = (model.description || "").trim();
+              const units = downloadUnits(model.files).sort((a, b) => (a.size || 0) - (b.size || 0));
+              return (
+                <article key={model.repoId} className={`hub-lms-card ${isOpen ? "open" : ""}`}>
+                  <button
+                    type="button"
+                    className="hub-lms-card-head"
+                    aria-expanded={isOpen}
+                    onClick={() => setOpenRepo(isOpen ? null : model.repoId)}
+                  >
+                    <div className="hub-lms-card-main">
+                      <div className="hub-lms-title-row">
+                        <span className="hub-lms-model-name">{name}</span>
+                        {compatDot(level)}
+                        {gated ? <span className="hub-lms-badge gated">Gated</span> : null}
+                        {isInstructModel(model) ? <span className="hub-lms-badge">Instruct</span> : null}
+                      </div>
+                      {author ? <span className="hub-lms-author">{author}</span> : null}
+                      {desc ? <p className="hub-lms-blurb">{desc}</p> : null}
+                      <div className="hub-lms-stats">
+                        <span>{compactNum(model.downloads)} downloads</span>
+                        <span>{compactNum(model.likes)} likes</span>
+                        <span>{formatBytes(min)}{max > min ? ` – ${formatBytes(max)}` : ""}</span>
+                        {model.lastModified ? <span>Updated {model.lastModified.slice(0, 10)}</span> : null}
+                        {rec ? <span className="hub-lms-rec">Pick {parseQuant(rec.name)}</span> : null}
+                      </div>
+                    </div>
+                    <span className="hub-lms-chevron" aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
+                  </button>
+
+                  {isOpen ? (
+                    <div className="hub-lms-quants">
+                      <div className="hub-lms-quants-head">
+                        <span>Choose a quantization</span>
+                        <div className="hub-lms-quants-actions">
+                          <button type="button" className="hub-lms-link" onClick={() => openOnHF(model.repoId)}>
+                            View on Hugging Face
+                          </button>
+                          {units.length > 1 ? (
+                            <button
+                              type="button"
+                              className="hub-lms-link"
+                              disabled={gated && !tokenStatus?.present}
+                              onClick={() => {
+                                if (gated && !tokenStatus?.present) {
+                                  setError("Add a Hugging Face token for gated downloads.");
+                                  return;
+                                }
+                                void handleDownloadAll(model);
+                              }}
+                            >
+                              Download all
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                      {units.map((unit) => {
+                        const size = unit.size || 0;
+                        const est = estimateRamGb(size, 8192);
+                        const fit = fitForModel(size, sys, 8192);
+                        const noDisk = size > diskFreeBytes;
+                        const key = dlKey(model.repoId, unit.name);
+                        const dl = downloads[key];
+                        const done = (downloaded[key] && !dl) || dl?.done;
+                        const label = actionLabel(model.repoId, unit.name);
+                        const disabled =
+                          (!done && noDisk && !dl) || (gated && !tokenStatus?.present && !done && !dl?.done);
+                        const quant = parseQuant(unit.name);
+                        const busy = busyRow === key;
+                        const isRec = rec?.name === unit.name;
+                        return (
+                          <div key={unit.name} className={`hub-lms-quant-row ${isRec ? "recommended" : ""}`}>
+                            <div className="hub-lms-quant-id">
+                              <span className="hub-lms-quant-label">{quant}</span>
+                              {isRec ? <span className="hub-lms-quant-rec">Recommended</span> : null}
+                              {unit.split ? (
+                                <span className="hub-lms-quant-sub">{unit.files.length} shards</span>
+                              ) : (
+                                <span className="hub-lms-quant-sub" title={unit.name}>
+                                  {unit.name.split("/").pop()}
+                                </span>
+                              )}
+                            </div>
+                            <div className="hub-lms-quant-meta">
+                              <span>{formatBytes(size)}</span>
+                              <span>~{est > 0 ? `${est.toFixed(1)} GB RAM` : "—"}</span>
+                              {fitBadge(fit)}
+                            </div>
+                            <div className="hub-lms-quant-dl">
+                              {progressCell(dl)}
+                              {done ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="hub-lms-dl-btn primary"
+                                    disabled={busy}
+                                    onClick={() => void loadDownloadedModel(model.repoId, unit.name)}
+                                  >
+                                    Load
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="hub-lms-dl-btn"
+                                    disabled={busy}
+                                    onClick={() => void deleteModel(model.repoId, unit.name)}
+                                  >
+                                    Delete
+                                  </button>
+                                </>
+                              ) : dl?.error ? (
+                                <button
+                                  type="button"
+                                  className="hub-lms-dl-btn primary error"
+                                  onClick={() => void handleDownloadAction(model.repoId, unit.name)}
+                                  title={dl.error}
+                                >
+                                  Retry
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className={`hub-lms-dl-btn primary${label === "Pause" ? " pause" : ""}${label === "Resume" ? " resume" : ""}`}
+                                  disabled={disabled}
+                                  onClick={() => void handleDownloadAction(model.repoId, unit.name)}
+                                >
+                                  {label}
+                                </button>
+                              )}
+                              {!done && dl && !dl.done && (dl.receivedBytes > 0 || dl.totalBytes > 0) ? (
+                                <button
+                                  type="button"
+                                  className="hub-lms-dl-cancel"
+                                  onClick={() => setConfirming({ repoId: model.repoId, file: unit.name })}
+                                  title="Cancel"
+                                >
+                                  ×
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+
+          {!searching && hasMore ? (
+            <div className="hub-load-more">
+              <button type="button" className="btn-modal-secondary" onClick={() => void loadMore()} disabled={loadingMore}>
+                {loadingMore ? "Loading…" : "Load more"}
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
 
-      {!searching && results.length > 0 && (
-        <div className="hub-footer-hint">
-          Public GGUF repos download directly — no token needed. Gated models require you to accept the license on huggingface.co first. RAM figures are estimates; the fit badge compares your available RAM against the recommended (8k context) figure.
-        </div>
-      )}
+      <footer className="models-footer hub-footer">
+        <button type="button" className="btn-modal-secondary" onClick={() => navigate("/agents?focus=local")}>
+          Back to local backend
+        </button>
+        <div className="models-footer-spacer" />
+        <button
+          type="button"
+          className="model-open-folder-btn"
+          onClick={() => void api.openModelsDir().then((d) => setNote(`Opened ${d}`)).catch((e) => setError(String(e)))}
+        >
+          Open models folder
+        </button>
+      </footer>
 
       <CancelDownloadDialog
         open={confirming !== null}

@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Application Audit — D:\ai</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --ink:#e6e9ef; --muted:#9aa4b2;
+    --line:#2a3040; --accent:#6ea8fe; --good:#3fb950; --warn:#d29922; --bad:#f85149;
+    --code:#11141a;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{display:grid; grid-template-columns:280px minmax(0,1fr); max-width:1500px; margin:0 auto}
+  nav{
+    position:sticky; top:0; align-self:start; height:100vh; overflow:auto;
+    padding:28px 20px; border-right:1px solid var(--line); background:var(--panel);
+  }
+  nav .brand{font-weight:700; font-size:15px; letter-spacing:.02em; margin-bottom:4px}
+  nav .sub{color:var(--muted); font-size:12px; margin-bottom:20px}
+  nav a{display:block; color:var(--muted); text-decoration:none; font-size:13.5px; padding:6px 8px; border-radius:6px}
+  nav a:hover{color:var(--ink); background:var(--panel2)}
+  main{padding:48px 56px 96px; max-width:1080px}
+  header.hero{border-bottom:1px solid var(--line); padding-bottom:28px; margin-bottom:36px}
+  .kicker{color:var(--accent); font-size:12px; letter-spacing:.14em; text-transform:uppercase; font-weight:700}
+  h1{font-size:38px; line-height:1.15; margin:10px 0 8px}
+  h2{font-size:25px; margin:52px 0 14px; padding-top:14px; border-top:1px solid var(--line)}
+  h3{font-size:18px; margin:28px 0 10px}
+  p,li{color:#d3d8e0}
+  .lead{font-size:17px; color:var(--muted)}
+  .meta{color:var(--muted); font-size:13.5px}
+  .badges{display:flex; gap:10px; flex-wrap:wrap; margin:18px 0 4px}
+  .badge{background:var(--panel2); border:1px solid var(--line); border-radius:999px; padding:6px 13px; font-size:12.5px; color:var(--muted)}
+  .badge b{color:var(--ink)}
+  .callout{background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:8px; padding:16px 18px; margin:18px 0}
+  .callout.bad{border-left-color:var(--bad)}
+  .callout.good{border-left-color:var(--good)}
+  .callout.warn{border-left-color:var(--warn)}
+  .callout p:last-child{margin-bottom:0}
+  table{width:100%; border-collapse:collapse; margin:16px 0 24px; font-size:14px}
+  th,td{padding:9px 11px; border:1px solid var(--line); vertical-align:top; text-align:left}
+  th{background:var(--panel2); color:#cfd6e2; font-weight:600; font-size:12.5px; text-transform:uppercase; letter-spacing:.04em}
+  tbody tr:nth-child(even){background:rgba(255,255,255,.018)}
+  td.num{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}
+  .pill{display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:700; letter-spacing:.03em; white-space:nowrap}
+  .pass{background:rgba(63,185,80,.15); color:#56d364; border:1px solid rgba(63,185,80,.35)}
+  .partial{background:rgba(210,153,34,.15); color:#e3b341; border:1px solid rgba(210,153,34,.35)}
+  .fail{background:rgba(248,81,73,.15); color:#ff7b72; border:1px solid rgba(248,81,73,.35)}
+  .nv{background:rgba(154,164,178,.15); color:#b6bfcc; border:1px solid rgba(154,164,178,.35)}
+  .sev{font-weight:700; font-size:12px; letter-spacing:.03em}
+  .p0{color:#ff7b72} .p1{color:#e3b341} .p2{color:#79c0ff} .p3{color:#9aa4b2}
+  code{background:var(--code); border:1px solid var(--line); border-radius:4px; padding:1px 5px; font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; color:#c9d1d9}
+  pre{background:var(--code); border:1px solid var(--line); border-radius:10px; padding:16px 18px; overflow:auto}
+  pre code{background:none; border:none; padding:0; font-size:12.8px; line-height:1.55; color:#c9d1d9}
+  ul,ol{padding-left:24px}
+  li{margin:5px 0}
+  .check{list-style:none; padding-left:0}
+  .check li{position:relative; padding-left:30px; margin:8px 0}
+  .check li::before{content:"☐"; position:absolute; left:4px; top:-1px; color:var(--muted); font-size:17px}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px}
+  .card h3{margin-top:0}
+  .score{font-size:44px; font-weight:800; letter-spacing:-.02em; margin:0}
+  .score small{font-size:16px; color:var(--muted); font-weight:500}
+  footer{margin-top:60px; padding-top:20px; border-top:1px solid var(--line); color:var(--muted); font-size:12.5px}
+  @media (max-width:900px){
+    .wrap{grid-template-columns:1fr}
+    nav{position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line)}
+    nav a{display:inline-block; margin:2px 4px 2px 0}
+    main{padding:28px 20px 64px}
+    .grid2{grid-template-columns:1fr}
+    h1{font-size:29px}
+  }
+  @media print{
+    :root{--bg:#fff; --panel:#fff; --panel2:#f4f5f7; --ink:#111; --muted:#555; --line:#ccc; --code:#f6f6f6}
+    body{background:#fff; color:#111; font-size:11.5pt}
+    .wrap{display:block; max-width:none}
+    nav{display:none}
+    main{padding:0; max-width:none}
+    h2{page-break-after:avoid}
+    table{page-break-inside:auto; font-size:9.5pt}
+    tr{page-break-inside:avoid}
+    p,li{color:#222}
+    code{color:#111}
+    pre code{color:#111}
+    .pill{border:1px solid #999}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <div class="brand">Audit Report</div>
+  <div class="sub">D:\ai · 21 Oct 2026</div>
+  <a href="#a">A. Executive Summary</a>
+  <a href="#b">B. Scoring</a>
+  <a href="#c">C. Capability Matrix</a>
+  <a href="#d">D. Architecture</a>
+  <a href="#e">E. Defect Register</a>
+  <a href="#f">F. Maturity Level</a>
+  <a href="#g">G. Security &amp; Privacy</a>
+  <a href="#h">H. Tests &amp; Verification</a>
+  <a href="#i">I. Documentation &amp; CI</a>
+  <a href="#j">J. Roadmap</a>
+  <a href="#k">K. Checklists</a>
+  <a href="#l">L. Final Verdict</a>
+  <a href="#m">M. Methodology</a>
+</nav>
+
+<main>
+<header class="hero">
+  <div class="kicker">Read-only · Evidence-based</div>
+  <h1>AI Application Audit — <code>D:\ai</code></h1>
+  <p class="lead">Local-first Tauri desktop AI coding agent: llama.cpp GGUF engine, 21 remote providers, real ReAct loop, 61 tools, subagents, MCP, RAG, and a React 19 frontend.</p>
+  <div class="badges">
+    <span class="badge">Overall <b>5.7 / 10</b></span>
+    <span class="badge">Maturity <b>Level 3 / 5</b></span>
+    <span class="badge">Tests <b>432 passing</b></span>
+    <span class="badge">Verdict <b>Pre-production</b></span>
+  </div>
+  <p class="meta">Audit date: 21 October 2026 · Scope: repository, source, docs, build, tests · No source changes, installs, or paid API calls.</p>
+</header>
+
+<!-- A -->
+<h2 id="a">A. Executive Summary</h2>
+
+<p><strong>What the product is.</strong> A local-first Tauri 2 desktop AI coding agent: a Rust host (<code>src-tauri/src</code>, ~900 KB) wrapping a llama.cpp GGUF engine, 21 remote OpenAI/Anthropic-compatible providers, a real ReAct agent loop with 61 tools, subagents, plan/todo tracking, MCP (stdio + HTTP), skills, RAG-style attachments, an LSP bridge, and a React 19 frontend (<code>ui/</code>). It additionally exposes an OpenAI-compatible local HTTP server on <code>127.0.0.1:8080</code>.</p>
+
+<p><strong>Bottom line.</strong> This is a <strong>genuinely functional, unusually ambitious agentic prototype</strong>, not a demo shell. The agent loop is real (tool calls are dispatched, results appended as <code>role:"tool"</code>, generation resumes), the tool surface is broad, and 432 automated tests pass (152 UI + 280 Rust). However it is <strong>not production-ready</strong>: security is the weak axis, abort correctness is broken for approved tool calls, seven frontend event channels are silently dead, the release/CI pipeline builds the wrong frontend, and local inference could not be re-verified at runtime because no release binary and no matching GGUF were available.</p>
+
+<div class="grid2">
+  <div class="card">
+    <p class="score">5.7<small> / 10</small></p>
+    <p class="meta" style="margin:6px 0 0">Overall readiness · Maturity Level 3 of 5</p>
+  </div>
+  <div class="card">
+    <h3>Top strengths</h3>
+    <ol style="margin:0">
+      <li>Real, bounded ReAct orchestration — not a prompt wrapper.</li>
+      <li>Deep llama.cpp integration: pool, KV-cache reuse, streaming, cancellation.</li>
+      <li>Central tool-dispatch chokepoint with backend-enforced policy + HITL.</li>
+      <li>Working security UI: policy, YOLO, grants, audit.</li>
+      <li>Solid baseline test volume; both frontends build.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="callout bad">
+  <p><strong>Top blockers (P0)</strong></p>
+  <ol style="margin-bottom:0">
+    <li>Default-on, <strong>unauthenticated</strong> loopback API that can execute agent tasks and filesystem tools (<code>api_server.rs:81,149</code>; <code>commands/settings.rs:239</code>).</li>
+    <li><strong>API keys stored in plaintext</strong> in <code>active-remote.json</code> (<code>commands/model.rs:345,358</code>).</li>
+    <li><strong>Abort is not honored</strong> for tool calls executed after approval — <code>CancellationToken::new()</code> is passed instead of the run token (<code>agent/tools.rs:299–315</code>).</li>
+    <li><strong>Seven UI event subscriptions never fire</strong> — backend emits none of them (<code>ui/src/lib/ipc.ts:736–752</code>).</li>
+  </ol>
+</div>
+
+<!-- B -->
+<h2 id="b">B. Scoring — 17 dimensions, equal weight</h2>
+
+<table>
+<thead><tr><th>#</th><th>Dimension</th><th class="num">Score</th><th>Basis</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Repository &amp; build health</td><td class="num">6.5</td><td>Both frontends type-check/build; fmt + clippy fail; 5.4 GB unignored artifacts; not a git worktree</td></tr>
+<tr><td>2</td><td>Architecture &amp; modularity</td><td class="num">7.5</td><td>Clean layering (engine / provider / agent / commands / UI), but dual frontends and legacy <code>src/</code></td></tr>
+<tr><td>3</td><td>Local inference</td><td class="num">6.0</td><td>Real llama.cpp pool/KV cache/streaming; runtime unverified; hardcoded sampler</td></tr>
+<tr><td>4</td><td>Remote providers</td><td class="num">7.0</td><td>21 providers, retries, SSE, native tool calls; no live calls; key handling weak</td></tr>
+<tr><td>5</td><td>Agent loop &amp; orchestration</td><td class="num">7.5</td><td>Bounded ReAct, step budgets, stuck detection; no generation retry/backoff; abort gap</td></tr>
+<tr><td>6</td><td>Tool system</td><td class="num">7.0</td><td>61 tools, single chokepoint; cancellation and path-containment defects</td></tr>
+<tr><td>7</td><td>Policy, permissions &amp; HITL</td><td class="num">6.0</td><td>Real backend enforcement + UI; <code>root</code>/<code>cwd</code> path bypass; post-approval token bug</td></tr>
+<tr><td>8</td><td>Editor / IDE UX</td><td class="num">7.0</td><td>Chat streaming, edit review, diff/apply, terminal; abort/step events dead</td></tr>
+<tr><td>9</td><td>Persistence &amp; sessions</td><td class="num">6.0</td><td>Session store + 280 tests; non-atomic writes; checkpoint stages everything</td></tr>
+<tr><td>10</td><td>RAG / attachments / search</td><td class="num">4.0</td><td>Deterministic hashed n-gram + keyword, <strong>not</strong> neural semantic search</td></tr>
+<tr><td>11</td><td>MCP &amp; extensibility</td><td class="num">6.5</td><td>Real stdio + HTTP client; no external-server E2E; fmt failures in client</td></tr>
+<tr><td>12</td><td>Subagents &amp; planning</td><td class="num">6.5</td><td>4 profiles, plan/todo, background tasks; no live-model E2E</td></tr>
+<tr><td>13</td><td>Local API server / integrations</td><td class="num">3.5</td><td>Useful OpenAI-compatible surface, but unauthenticated, default-on, fragile body parsing</td></tr>
+<tr><td>14</td><td>Security &amp; privacy</td><td class="num">4.0</td><td>Plaintext keys, unconfined FS/terminal commands, CSP <code>unsafe-eval</code>, open loopback</td></tr>
+<tr><td>15</td><td>Testing &amp; verification</td><td class="num">5.5</td><td>432 tests pass; helper-only UI tests, 4 ignored GGUF tests, no E2E</td></tr>
+<tr><td>16</td><td>Docs, parity &amp; CI</td><td class="num">4.0</td><td>Significant drift; CI builds deprecated frontend; lint gates red</td></tr>
+<tr><td>17</td><td>Production readiness &amp; ops</td><td class="num">3.0</td><td>No signed release, no updater artifacts, no E2E, machine-specific build config</td></tr>
+<tr><td></td><td><strong>Overall (mean)</strong></td><td class="num"><strong>5.7</strong></td><td>Functional beta-grade agent, pre-production security/ops</td></tr>
+</tbody>
+</table>
+
+<!-- C -->
+<h2 id="c">C. Capability Matrix</h2>
+<p class="meta">PASS = verified working · PARTIAL = implemented with material gaps · FAIL = broken/unsafe · N/I = not implemented · N/V = not runtime-verified.</p>
+
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr><td>Local GGUF chat + streaming</td><td><span class="pill partial">PARTIAL</span></td><td><code>engine.rs</code> pool/KV/streaming real; no release binary; matching 0.5B GGUF absent</td></tr>
+<tr><td>Remote OpenAI/Anthropic chat</td><td><span class="pill partial">PARTIAL</span></td><td><code>remote.rs</code> 21 providers, retries, SSE, native tool calls; not live-called</td></tr>
+<tr><td>ReAct tool loop</td><td><span class="pill pass">PASS</span></td><td><code>agent/orchestrator.rs</code>; results appended as <code>role:"tool"</code>; bounded <code>max_steps</code> ≤ 20</td></tr>
+<tr><td>Stuck/loop protection</td><td><span class="pill pass">PASS</span></td><td>Stops after 3 consecutive failures; step budget</td></tr>
+<tr><td>61-tool dispatch</td><td><span class="pill pass">PASS</span></td><td><code>agent/tools.rs</code>; single policy chokepoint</td></tr>
+<tr><td>Approval / HITL gates</td><td><span class="pill pass">PASS</span></td><td>Backend + <code>ui</code> permission/question gates</td></tr>
+<tr><td>Abort / cancel run</td><td><span class="pill fail">FAIL</span></td><td>Approved calls use <code>CancellationToken::new()</code> (<code>tools.rs:299–315</code>)</td></tr>
+<tr><td>Policy path enforcement</td><td><span class="pill partial">PARTIAL</span></td><td><code>call_target_paths</code> omits <code>root</code>/<code>cwd</code> (<code>policy.rs:575</code>)</td></tr>
+<tr><td>Workspace sandbox</td><td><span class="pill partial">PARTIAL</span></td><td>Tool paths checked; direct editor/terminal IPC commands are not (<code>commands/editor.rs:94,105,184</code>)</td></tr>
+<tr><td>Plan / todo / background tasks</td><td><span class="pill pass">PASS</span></td><td>Emitted events consumed by UI (<code>ipc.ts:741–743</code>)</td></tr>
+<tr><td>Subagents (4 profiles)</td><td><span class="pill partial">PARTIAL</span></td><td>Wired; no live E2E</td></tr>
+<tr><td>MCP stdio + HTTP</td><td><span class="pill partial">PARTIAL</span></td><td><code>agent/mcp.rs</code>; fmt failures at <code>:778</code>, <code>:857</code>; no external server E2E</td></tr>
+<tr><td>Skills</td><td><span class="pill pass">PASS</span></td><td>Loaded and surfaced (<code>agent://skills-changed</code>)</td></tr>
+<tr><td>Edit propose/review/apply</td><td><span class="pill partial">PARTIAL</span></td><td>Works; non-atomic <code>fs::write</code>; verify pass exists</td></tr>
+<tr><td>Auto-checkpoint</td><td><span class="pill fail">FAIL</span></td><td><code>git add -A</code> twice without policy (<code>tools.rs:2076,2121</code>)</td></tr>
+<tr><td>Session persistence</td><td><span class="pill partial">PARTIAL</span></td><td>Store + tests; non-atomic writes</td></tr>
+<tr><td>RAG / semantic search</td><td><span class="pill fail">FAIL</span></td><td>Hashed n-gram/keyword ranking, not embeddings (as advertised)</td></tr>
+<tr><td>LSP bridge</td><td><span class="pill partial">PARTIAL</span></td><td>Present; limited verification</td></tr>
+<tr><td>HF model hub</td><td><span class="pill partial">PARTIAL</span></td><td>Download plumbing; not exercised</td></tr>
+<tr><td>Local API server</td><td><span class="pill fail">FAIL</span></td><td>No auth, default-on, <code>Content-Length</code>-only body handling (<code>api_server.rs:22,131</code>)</td></tr>
+<tr><td>Provider key persistence</td><td><span class="pill fail">FAIL</span></td><td>Plaintext <code>active-remote.json</code>; provider registry in-memory (<code>model.rs:345</code>)</td></tr>
+<tr><td>Settings parity (sampling)</td><td><span class="pill fail">FAIL</span></td><td>UI settings don't reach backend; sampler hardcoded (<code>engine.rs:1757–1768</code>)</td></tr>
+<tr><td>Packaging / updater / signing</td><td><span class="pill fail">FAIL</span></td><td>No release binary; <code>createUpdaterArtifacts:false</code>; CI issues</td></tr>
+<tr><td>Accessibility</td><td><span class="pill partial">PARTIAL</span></td><td>Semantics present in chat UI; not audited with AT</td></tr>
+<tr><td>Offline claim</td><td><span class="pill partial">PARTIAL</span></td><td>Google Fonts links in <code>ui/index.html</code> vs CSP/offline promise</td></tr>
+</tbody>
+</table>
+
+<!-- D -->
+<h2 id="d">D. Architecture</h2>
+
+<pre><code>┌──────────────────────────── Tauri 2 host (Rust) ────────────────────────────┐
+│ commands/  (IPC surface: editor, model, settings, agent, workspace, …)      │
+│   ├── agent/  orchestrator.rs ─ tools.rs (61) ─ policy.rs ─ mcp.rs          │
+│   │            subagents, plan/todo, checkpoints, hooks, skills             │
+│   ├── engine.rs      llama.cpp pool, KV cache, sampler chain, streaming     │
+│   ├── remote.rs      21 providers, retries, SSE, native tool calls          │
+│   ├── api_server.rs  OpenAI-compatible HTTP on 127.0.0.1:8080 (default on)  │
+│   ├── lsp.rs, rag/attachments, hub, session store, logging/audit            │
+│   └── persistence: app_data_dir JSON (settings, policy, sessions, keys)     │
+├──────────────────────────── React 19 frontend (ui/) ────────────────────────┤
+│ pages/ (Chat, Security, Settings, Models…) · context/AppContext.tsx         │
+│ hooks/useAgentStream.ts · lib/ipc.ts (invoke + event subscriptions)         │
+└──────────────────────────────────────────────────────────────────────────────┘
+Legacy: root src/ (documented deprecated) still built by root scripts &amp; CI.</code></pre>
+
+<p><strong>Data flow (chat):</strong> UI invoke → <code>agent_run_task</code> → orchestrator builds prompt (system + skills + context) → engine or remote provider → streamed deltas → tool call → policy evaluation → HITL if required → <code>run_tool</code> → result appended → next step → <code>agent://run-trace</code> / <code>tool-event</code> events → UI.</p>
+
+<h3>Notable design choices</h3>
+<ul>
+  <li>One dispatch chokepoint (<code>run_tool</code>) is the right place for policy — and it mostly works.</li>
+  <li>Cancellation tokens thread through engine and tools, but approval re-entry discards the token.</li>
+  <li>Persistence is plain JSON in the app data dir; no database, no migrations, no atomic replace.</li>
+  <li><code>tauri.conf.json</code> serves <code>ui/</code> (<code>frontendDist ../ui/dist</code>, dev port 5173), so <code>ui/</code> is the shipped app; <code>src/</code> is legacy but still buildable.</li>
+</ul>
+
+<!-- E -->
+<h2 id="e">E. Defect Register</h2>
+<p class="meta">Severity: <span class="sev p0">P0</span> ship-blocker · <span class="sev p1">P1</span> must-fix before beta · <span class="sev p2">P2</span> quality/hygiene · <span class="sev p3">P3</span> polish.</p>
+
+<table>
+<thead><tr><th>ID</th><th>Sev</th><th>Defect</th><th>Location</th><th>Impact</th></tr></thead>
+<tbody>
+<tr><td>S1</td><td class="sev p0">P0</td><td>Loopback API has <strong>no authentication</strong> and exposes <code>POST /v1/agent/tasks</code>, chat, and trace</td><td><code>api_server.rs:81,127–172</code>; <code>settings.rs:239</code></td><td>Any local process/web page can drive the agent and tools as the user</td></tr>
+<tr><td>S2</td><td class="sev p0">P0</td><td>API keys written <strong>plaintext</strong> to <code>active-remote.json</code></td><td><code>commands/model.rs:345,358</code></td><td>Credential theft; contradicts key-handling docs</td></tr>
+<tr><td>S3</td><td class="sev p0">P0</td><td>Abort ignored for post-approval tool calls — new token created per call</td><td><code>agent/tools.rs:299–315</code></td><td>"Stop" does not stop side effects</td></tr>
+<tr><td>S4</td><td class="sev p0">P0</td><td>7 UI event subscriptions have <strong>no backend emitter</strong></td><td><code>ui/src/lib/ipc.ts:736–752</code> (0 matches in <code>src-tauri/src</code>)</td><td>Abort/step/subtask/knowledge/workspace/thinking UI silently stale</td></tr>
+<tr><td>P1</td><td class="sev p1">P1</td><td>Policy path extraction omits <code>root</code>/<code>cwd</code> args</td><td><code>agent/policy.rs:575</code></td><td>Path-based restrictions can be bypassed by tool-call shape</td></tr>
+<tr><td>P2</td><td class="sev p1">P1</td><td>Non-atomic <code>fs::write</code> for edits/settings/policy</td><td><code>commands/editor.rs:105</code>; settings/policy writes</td><td>Truncated/corrupt files on crash</td></tr>
+<tr><td>P3</td><td class="sev p1">P1</td><td>Auto-checkpoint runs <code>git add -A</code> twice without policy</td><td><code>agent/tools.rs:2076,2121</code></td><td>Stages models, secrets, backups; surprising commits</td></tr>
+<tr><td>P4</td><td class="sev p1">P1</td><td>API server parses only <code>Content-Length</code> bodies and closes connections</td><td><code>api_server.rs:22,131</code></td><td>Chunked/absent-length requests misparsed; interoperability failures</td></tr>
+<tr><td>P5</td><td class="sev p1">P1</td><td>Provider registry is in-memory only</td><td><code>commands/model.rs</code></td><td>Keys/config lost or re-entered per session; persistence mismatch</td></tr>
+<tr><td>P6</td><td class="sev p1">P1</td><td>Sampling params hardcoded</td><td><code>engine.rs:1757–1768</code></td><td>UI settings have no effect; parity failure</td></tr>
+<tr><td>P7</td><td class="sev p1">P1</td><td>Editor/terminal IPC commands accept arbitrary absolute paths</td><td><code>commands/editor.rs:94,105,184</code></td><td>Policy bypass; XSS becomes FS/terminal compromise</td></tr>
+<tr><td>P8</td><td class="sev p1">P1</td><td>RAG "semantic" search is hashed n-gram/keyword</td><td>RAG/attachment module</td><td>Misleading capability; poor recall</td></tr>
+<tr><td>P9</td><td class="sev p1">P1</td><td><code>cargo fmt --check</code> fails</td><td><code>agent/mcp.rs:778,857</code></td><td>Format gate red</td></tr>
+<tr><td>P10</td><td class="sev p1">P1</td><td><code>cargo clippy --all-targets -- -D warnings</code> fails</td><td>80 bin / 86 test errors, exit 101</td><td>Lint gate unenforceable; latent issues</td></tr>
+<tr><td>P11</td><td class="sev p1">P1</td><td>CI type-checks/builds deprecated root <code>src/</code>, not <code>ui/</code></td><td><code>.github/workflows/ci.yml</code></td><td>Shipped frontend untested in CI</td></tr>
+<tr><td>P12</td><td class="sev p1">P1</td><td>Boot smoke requires gitignored <code>ui/dist</code></td><td><code>ci.yml</code> + <code>tauri.conf.json</code></td><td>Smoke job unreliable</td></tr>
+<tr><td>P13</td><td class="sev p2">P2</td><td><code>.gitignore</code> omits <code>models/</code> and <code>backups/</code></td><td><code>.gitignore</code> (5.44 GB GGUF)</td><td>Accidental multi-GB commit</td></tr>
+<tr><td>P14</td><td class="sev p2">P2</td><td>CSP includes <code>'unsafe-eval'</code>; remote Google Fonts</td><td><code>tauri.conf.json:29</code>; <code>ui/index.html</code></td><td>Weakens XSS defense; offline conflict</td></tr>
+<tr><td>P15</td><td class="sev p2">P2</td><td>Docs drift: 50 vs 61 tools; 275 vs 280 tests; stale paths; "all done" status</td><td><code>docs/LLM_INTEGRATION.md</code>, <code>PROJECT_STATUS.md</code>, <code>docs/manual-test-script.md</code></td><td>Misleads maintainers/users</td></tr>
+<tr><td>P16</td><td class="sev p2">P2</td><td>Dual frontends, 4.57 MB main chunk</td><td>root <code>src/</code> + <code>ui/</code>; build log</td><td>Maintenance cost, slow load</td></tr>
+<tr><td>P17</td><td class="sev p2">P2</td><td>Machine-specific LLVM/CMake paths, <code>target-cpu=native</code></td><td><code>src-tauri/.cargo/config.toml</code></td><td>Non-reproducible builds</td></tr>
+<tr><td>P18</td><td class="sev p2">P2</td><td>No retry/backoff on generation failure</td><td><code>agent/orchestrator.rs</code></td><td>Transient provider error aborts whole task</td></tr>
+<tr><td>P19</td><td class="sev p2">P2</td><td>Stale logs/PIDs in repo root; not a git worktree</td><td>root</td><td>Hygiene/forensics noise</td></tr>
+<tr><td>P20</td><td class="sev p3">P3</td><td>UI tests cover pure helpers only; 4 ignored GGUF tests</td><td><code>ui/src/**/*.test.*</code>; Rust <code>#[ignore]</code></td><td>No component/IPC/model E2E</td></tr>
+<tr><td>P21</td><td class="sev p3">P3</td><td>Release supplies signing secrets while updater artifacts disabled; no signing/E2E</td><td><code>.github/workflows/release.yml</code>; <code>tauri.conf.json</code></td><td>Release provenance unclear</td></tr>
+</tbody>
+</table>
+
+<!-- F -->
+<h2 id="f">F. Maturity Level</h2>
+<p><strong>Level 3 / 5 — "Defined / Repeatable", with pockets of Level 4.</strong></p>
+
+<table>
+<thead><tr><th>Level</th><th>Description</th><th>Assessment</th></tr></thead>
+<tbody>
+<tr><td>1 Initial</td><td>Ad-hoc</td><td>Passed</td></tr>
+<tr><td>2 Managed</td><td>Basic project practices</td><td>Passed</td></tr>
+<tr><td>3 Defined</td><td>Consistent architecture, documented processes, automated tests</td><td><strong>Current</strong> — clear layering, 432 tests, policy model, docs</td></tr>
+<tr><td>4 Measured</td><td>Metrics, E2E gates, enforced lint/security, reproducible builds</td><td>Pockets only (test runner, build) — lint/CI/E2E absent</td></tr>
+<tr><td>5 Optimizing</td><td>Continuous improvement, production telemetry</td><td>Not present</td></tr>
+</tbody>
+</table>
+
+<p><strong>Why not Level 4:</strong> no E2E or live-model gate, fmt/clippy red, CI tests the wrong frontend, no release artifact/signing, no dependency/security scanning, documented behavior diverges from code.</p>
+
+<!-- G -->
+<h2 id="g">G. Security &amp; Privacy</h2>
+<p><strong>Threat model.</strong> Local attacker process, malicious web content in the WebView, a compromised remote provider response, and accidental data exfiltration via checkpoints/logs.</p>
+
+<table>
+<thead><tr><th>#</th><th>Finding</th><th>Severity</th><th>Notes / Fix direction</th></tr></thead>
+<tbody>
+<tr><td>G1</td><td>Unauthenticated loopback API; agent-task route</td><td class="sev p0">Critical</td><td>Bind with per-launch bearer token; require <code>Authorization</code>; disable by default; reject non-loopback <code>Host</code></td></tr>
+<tr><td>G2</td><td>Plaintext API keys at rest</td><td class="sev p0">High</td><td>OS keychain (DPAPI/Keychain/libsecret); restrict ACLs; migrate + wipe old file</td></tr>
+<tr><td>G3</td><td>Abort not enforced on tools</td><td class="sev p0">High</td><td>Thread the run's <code>CancellationToken</code> through approval resume</td></tr>
+<tr><td>G4</td><td>Direct FS/terminal IPC bypasses policy</td><td class="sev p1">High</td><td>Route all file/terminal commands through policy/workspace containment</td></tr>
+<tr><td>G5</td><td><code>git add -A</code> checkpoint can stage secrets/models</td><td class="sev p1">High</td><td>Explicit pathspec, honor ignore rules, policy check, opt-in</td></tr>
+<tr><td>G6</td><td>CSP <code>'unsafe-eval'</code></td><td class="sev p2">Medium</td><td>Remove if bundler permits; tighten <code>connect-src</code></td></tr>
+<tr><td>G7</td><td>Remote fonts contradict offline/CSP</td><td class="sev p3">Low</td><td>Self-host fonts</td></tr>
+<tr><td>G8</td><td>Audit log exists but coverage/retention unverified</td><td class="sev p2">Medium</td><td>Verify all tool/policy decisions are recorded, tamper-evident</td></tr>
+<tr><td>G9</td><td>No dependency/vuln scanning in CI</td><td class="sev p2">Medium</td><td><code>cargo audit</code>, <code>npm audit</code>, SBOM</td></tr>
+<tr><td>G10</td><td>Logs may contain prompts/paths</td><td class="sev p2">Medium</td><td>Redaction + retention policy</td></tr>
+</tbody>
+</table>
+
+<div class="callout good">
+  <p><strong>Secret handling in this audit:</strong> no API keys, tokens, or <code>.env</code> values are reproduced here. Findings reference storage locations only.</p>
+</div>
+
+<!-- H -->
+<h2 id="h">H. Test &amp; Verification Results</h2>
+<p>All commands were run in place; nothing was installed or modified.</p>
+
+<table>
+<thead><tr><th>Check</th><th>Command</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>UI type-check</td><td><code>ui: npx tsc --noEmit</code></td><td><span class="pill pass">PASS</span> exit 0</td></tr>
+<tr><td>UI unit tests</td><td><code>ui: npm test</code></td><td><span class="pill pass">PASS</span> 152/152, 14 files, 5.37 s</td></tr>
+<tr><td>UI production build</td><td><code>ui: npm run build</code></td><td><span class="pill pass">PASS</span> 656 modules, ~11 s</td></tr>
+<tr><td>Root type-check</td><td><code>npx tsc --noEmit</code></td><td><span class="pill pass">PASS</span></td></tr>
+<tr><td>Root production build</td><td><code>npm run build</code></td><td><span class="pill pass">PASS</span> exit 0, 3 m 4 s; chunk-size warning (4,569 kB)</td></tr>
+<tr><td>Rust tests</td><td><code>cargo test</code></td><td><span class="pill pass">PASS</span> 280 passed, 4 ignored, 57.9 s</td></tr>
+<tr><td>Rust format</td><td><code>cargo fmt --check</code></td><td><span class="pill fail">FAIL</span> <code>agent/mcp.rs:778</code>, <code>:857</code></td></tr>
+<tr><td>Rust lints</td><td><code>cargo clippy --all-targets -- -D warnings</code></td><td><span class="pill fail">FAIL</span> exit 101 — 80 errors (bin), 86 (test)</td></tr>
+<tr><td>Boot/E2E smoke</td><td>release binary</td><td><span class="pill nv">NOT VERIFIED</span> no <code>target/release/ai-editor.exe</code>; historical smoke says <code>AI_EDITOR_SMOKE_OK</code></td></tr>
+<tr><td>Live local inference</td><td>GGUF E2E</td><td><span class="pill nv">NOT VERIFIED</span> ignored tests need absent 0.5B GGUF; only a 7B Q5 model exists</td></tr>
+<tr><td>Live remote providers</td><td>API calls</td><td><span class="pill nv">NOT RUN</span> would incur cost/require keys</td></tr>
+</tbody>
+</table>
+
+<p><strong>Test quality.</strong> 432 passing tests is a credible baseline, but: UI tests cover pure helpers only (no component/IPC integration), the 4 GGUF tests are ignored, and there is no browser/Tauri E2E. Passing tests therefore do not exercise the P0 abort/event/API defects.</p>
+
+<!-- I -->
+<h2 id="i">I. Documentation, Parity &amp; CI</h2>
+
+<h3>Docs drift</h3>
+<table>
+<thead><tr><th>Claim</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td><code>docs/LLM_INTEGRATION.md</code>: 50 tools</td><td>61 tools in dispatch</td></tr>
+<tr><td><code>docs/manual-test-script.md</code>: 275 Rust tests</td><td>280</td></tr>
+<tr><td>Legacy paths in docs</td><td>Shipped app is <code>ui/</code>; root <code>src/</code> deprecated</td></tr>
+<tr><td><code>PROJECT_STATUS.md</code>: all <code>[x]</code></td><td>Several claims false/stale (semantic search, CI, release)</td></tr>
+<tr><td>Manual script admits gaps</td><td>No PTY, keyword-only search, file-granularity edits</td></tr>
+</tbody>
+</table>
+
+<h3>CI/CD</h3>
+<ul>
+  <li>Frontend job builds the <strong>deprecated</strong> root <code>src/</code>; <code>ui/</code> is neither type-checked nor tested.</li>
+  <li>Boot-smoke compiles <code>custom-protocol</code>, requiring gitignored <code>ui/dist</code>.</li>
+  <li><code>cargo fmt --check</code> and clippy (<code>-D warnings</code>) currently fail → gates cannot be trusted.</li>
+  <li><code>createUpdaterArtifacts: false</code> while release workflow supplies signing secrets; no code signing, audit, or E2E.</li>
+  <li><code>.gitignore</code> missing <code>models/</code> and <code>backups/</code>; <code>.cargo/config.toml</code> hardcodes <code>C:\Users\durga</code> LLVM/CMake paths and <code>target-cpu=native</code>.</li>
+</ul>
+
+<!-- J -->
+<h2 id="j">J. Prioritized Roadmap</h2>
+
+<h3>P0 — before any distribution <span class="meta">(est. 3–5 days)</span></h3>
+<ol>
+  <li>Authenticate the loopback API (per-launch bearer token, deny by default, Host check).</li>
+  <li>Move provider keys to OS keychain; migrate and delete <code>active-remote.json</code> secret material.</li>
+  <li>Pass the real run token into post-approval tool execution; add an abort regression test.</li>
+  <li>Fix or remove the 7 dead event subscriptions; add IPC contract test (backend emit ⇄ UI listen).</li>
+</ol>
+<p><strong>Exit criteria:</strong> abort stops a running tool; no unauthenticated route; no plaintext secrets.</p>
+
+<h3>P1 — beta readiness <span class="meta">(est. 2–4 weeks)</span></h3>
+<ol start="5">
+  <li>Close policy path gaps (<code>root</code>/<code>cwd</code>) and confine <code>editor.rs</code> FS/terminal commands.</li>
+  <li>Atomic writes (temp + rename) for settings, policy, edits.</li>
+  <li>Safe checkpoints (explicit paths, policy, opt-in).</li>
+  <li>Harden API body parsing; add request size/time limits.</li>
+  <li>Wire sampling settings to engine; persist provider registry.</li>
+  <li>Make fmt + clippy green; fix CI to build/test <code>ui/</code>; produce a release artifact.</li>
+  <li>Add dependency/security scanning and a real boot E2E.</li>
+</ol>
+<p><strong>Exit criteria:</strong> fmt/clippy/CI green; signed artifact boots; security checklist passes.</p>
+
+<h3>P2 — quality <span class="meta">(est. 4–8 weeks)</span></h3>
+<ol start="12">
+  <li>Replace keyword RAG with embeddings or rename/label honestly.</li>
+  <li>Add component/IPC/streaming tests; run one GGUF E2E with a checked-in small model or downloadable fixture.</li>
+  <li>Consolidate on <code>ui/</code>; retire or clearly quarantine root <code>src/</code>.</li>
+  <li>Self-host fonts, tighten CSP, add retention/redaction for logs.</li>
+  <li>Reproducible build config (no machine paths, no <code>target-cpu=native</code> by default).</li>
+</ol>
+
+<h3>P3 — polish</h3>
+<ol start="17">
+  <li>Sign releases, enable updater artifacts coherently, publish SBOM.</li>
+  <li>Docs regeneration from code (tool count, test count, status truth).</li>
+</ol>
+
+<!-- K -->
+<h2 id="k">K. Checklists</h2>
+
+<h3>Release-readiness (all must be ✅ to ship)</h3>
+<ul class="check">
+  <li>Loopback API authenticated <strong>and</strong> off by default</li>
+  <li>No plaintext secrets at rest</li>
+  <li>Abort reliably stops tools</li>
+  <li>All UI event names match backend emitters</li>
+  <li>Policy covers every path-bearing tool arg</li>
+  <li>Editor/terminal IPC confined to workspace</li>
+  <li>Atomic writes for all config/state</li>
+  <li>Checkpoints never stage secrets/models</li>
+  <li><code>cargo fmt --check</code> clean</li>
+  <li><code>cargo clippy --all-targets -- -D warnings</code> clean</li>
+  <li>CI builds/tests <code>ui/</code></li>
+  <li>Signed artifact boots (E2E)</li>
+  <li>One live GGUF inference E2E</li>
+  <li>Docs match code (tools, tests, status)</li>
+</ul>
+
+<h3>Re-audit verification</h3>
+<ul class="check">
+  <li>Reproduce P0 abort with a slow tool, press Stop</li>
+  <li><code>curl</code> the API without a token → 401</li>
+  <li>Inspect app data dir → no readable keys</li>
+  <li>Emit/listen contract diff → zero dead channels</li>
+  <li>Craft tool call with <code>root</code>/<code>cwd</code> outside workspace → denied</li>
+  <li>Kill process mid-write → config remains valid</li>
+  <li><code>git status</code> after checkpoint → no models/secrets staged</li>
+</ul>
+
+<!-- L -->
+<h2 id="l">L. Final Verdict — 10 Questions</h2>
+<ol>
+  <li><strong>Does it run?</strong> Partially verified. Both frontends build, 432 tests pass; no current release binary, so boot was not re-verified. Historical smoke passed.</li>
+  <li><strong>Is the agent real or simulated?</strong> Real. Tool calls are executed and fed back as <code>role:"tool"</code> in a bounded ReAct loop.</li>
+  <li><strong>Are the tools real?</strong> Yes — 61 tools with a single policy chokepoint, though cancellation and path-containment have defects.</li>
+  <li><strong>Is model integration real?</strong> Yes in code: llama.cpp pool/KV cache/streaming plus 21 remote providers. Live inference was not re-run.</li>
+  <li><strong>Is it secure?</strong> No. Unauthenticated default-on API, plaintext keys, policy bypasses, <code>unsafe-eval</code>.</li>
+  <li><strong>Is it production-ready?</strong> No. Security, abort correctness, CI, release, and E2E gaps are disqualifying.</li>
+  <li><strong>Strongest subsystem?</strong> Agent orchestration + llama.cpp engine integration.</li>
+  <li><strong>Weakest subsystem?</strong> Local API server security, followed by RAG semantics and release engineering.</li>
+  <li><strong>Maturity?</strong> Level 3/5 — defined, tested in parts, not measured or release-hardened.</li>
+  <li><strong>Time to a credible beta?</strong> Estimated <strong>3–6 weeks</strong> for one or two engineers to close P0/P1 (estimate, not a measurement).</li>
+</ol>
+
+<div class="callout warn">
+  <p><strong>Verdict:</strong> <em>A strong local-first agentic coding prototype with a real engine and a broad tool surface — hold distribution until the four P0 security/correctness issues are fixed and CI/release are made trustworthy.</em></p>
+</div>
+
+<!-- M -->
+<h2 id="m">M. Methodology &amp; Limitations</h2>
+<ul>
+  <li><strong>Method:</strong> repository mapping → subsystem deep reads (agent engine, model infra, <code>ui/</code>, persistence/RAG/ops) → static tracing of feature paths end-to-end → execution of existing checks only → cross-checking docs against code.</li>
+  <li><strong>Read-only:</strong> no source edits, installs, upgrades, or destructive commands. No paid API calls. No secrets reproduced.</li>
+  <li><strong>Limitations:</strong> (a) no release binary, so no boot/E2E; (b) required 0.5B GGUF absent, so local inference unverified; (c) remote providers not live-called; (d) the API body-parsing defect is static-only, since socket-level testing requires running the app; (e) UI tests cover helpers, not components/IPC.</li>
+  <li><strong>Confidence:</strong> high on architecture, tool/policy code paths, build/test results, and documented-vs-actual drift; medium on runtime behavior of the API server and streaming UI; low on unexercised MCP/HF/LSP paths.</li>
+  <li><strong>Evidence index:</strong> <code>src-tauri/src/agent/{orchestrator,tools,policy,mcp}.rs</code>; <code>src-tauri/src/{engine,remote,api_server}.rs</code>; <code>src-tauri/src/commands/{model,editor,settings}.rs</code>; <code>src-tauri/tauri.conf.json</code>; <code>ui/src/lib/ipc.ts</code>; <code>ui/src/hooks/useAgentStream.ts</code>; <code>ui/src/context/AppContext.tsx</code>; <code>ui/src/pages/SecurityPage.tsx</code>; <code>.github/workflows/{ci,release}.yml</code>; <code>.gitignore</code>; <code>src-tauri/.cargo/config.toml</code>; <code>docs/*</code>; test/build outputs cited in §H.</li>
+</ul>
+
+<footer>
+  Generated from a read-only audit of <code>D:\ai</code> on 21 October 2026. Findings are point-in-time and should be re-verified after remediation.
+</footer>
+</main>
+</div>
+</body>
+</html>

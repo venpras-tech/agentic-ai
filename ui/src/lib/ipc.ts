@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type EnginePayload = Record<string, unknown>;
 type EngineHandler = (data: EnginePayload) => void;
@@ -53,7 +54,6 @@ function addEngineListener(event: string, handler: EngineHandler): Promise<() =>
     };
   });
 }
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export function isTauriRuntime(): boolean {
   return (
@@ -80,6 +80,59 @@ export interface DownloadedModelInfo {
   fileName: string;
   path: string;
   sizeBytes: number;
+  sha256?: string | null;
+}
+
+export interface HfHubFile {
+  name: string;
+  size: number | null;
+  sha256?: string | null;
+}
+
+export interface HfHubModel {
+  repoId: string;
+  author: string | null;
+  description?: string | null;
+  pipelineTag?: string | null;
+  gated?: boolean | null;
+  tags?: string[] | null;
+  lastModified?: string | null;
+  license?: string | null;
+  sha?: string | null;
+  likes: number;
+  downloads: number;
+  files: HfHubFile[];
+}
+
+export interface HfTokenStatus {
+  present: boolean;
+  source?: string | null;
+  preview?: string | null;
+}
+
+export interface HfModelInfo {
+  repoId: string;
+  author: string | null;
+  pipelineTag: string | null;
+  gated: boolean;
+  tags: string[];
+  lastModified: string | null;
+  license: string | null;
+  sha: string | null;
+  likes: number;
+  downloads: number;
+  files: Array<{
+    name: string;
+    size: number | null;
+    sha256: string | null;
+  }>;
+}
+
+export interface ChecksumResult {
+  verified: boolean;
+  expected: string | null;
+  actual: string;
+  message: string;
 }
 
 export interface StreamInferenceRequest {
@@ -410,6 +463,128 @@ export interface KnowledgeReport {
   skills: Skill[];
 }
 
+/** Compile-time + runtime capabilities of the bundled llama.cpp build. */
+export interface LlamaBuildInfo {
+  /** Pinned `llama-cpp-2` bindings version the binary links. */
+  bindingsVersion: string;
+  /** llama.cpp's own build summary line (may be empty). */
+  systemInfo: string;
+  supportsGpuOffload: boolean;
+  supportsMmap: boolean;
+  supportsMlock: boolean;
+  deviceCount: number;
+  maxDevices: number;
+  computeBufferMib: number;
+  gpuFeatureEnabled: boolean;
+}
+
+/**
+ * Model-load parameters the engine is running with. Mirrors the backend
+ * `ModelInitParams` (all optional; `undefined`/`null` = runtime default).
+ */
+export interface LlamaLoadConfig {
+  nGpuLayers?: number | null;
+  contextSize?: number | null;
+  nThreads?: number | null;
+  nWorkers?: number | null;
+  nBatch?: number | null;
+  nUbatch?: number | null;
+  unifiedKv?: boolean | null;
+  flashAttn?: boolean | null;
+  offloadKqv?: boolean | null;
+  useMmap?: boolean | null;
+  useMlock?: boolean | null;
+  ropeFreqBase?: number | null;
+  ropeFreqScale?: number | null;
+  cacheTypeK?: string | null;
+  cacheTypeV?: string | null;
+  seed?: number | null;
+  maxTokens?: number | null;
+  speculative?: string | null;
+  contextCheckpoints?: number | null;
+  chatTemplate?: string | null;
+  reasoningBudget?: string | null;
+  llamaArgs?: string | null;
+}
+
+/** Snapshot returned by `llama_runtime_info`. */
+export interface LlamaRuntimeInfo {
+  build: LlamaBuildInfo;
+  /** Loaded model metadata (same shape as `model_status`), or null. */
+  model: LlamaModelInfo | null;
+  loadConfig: LlamaLoadConfig | null;
+  workerCount: number | null;
+  loadedPath: string | null;
+  remote: boolean;
+  cacheTypeK: string | null;
+  cacheTypeV: string | null;
+}
+
+/** Structural mirror of `context/types.ts` `ModelInfo` (avoids a layer import). */
+export interface LlamaModelInfo {
+  name: string;
+  architecture: string;
+  nVocab: number;
+  nCtxTrain: number;
+  nEmbd: number;
+  nLayer: number;
+  nParams: number;
+  sizeBytes: number;
+  contextSize: number;
+}
+
+export interface LlamaBindingsUpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  cratesIoUrl: string;
+  upstreamRepoUrl: string;
+  note: string;
+}
+
+export interface MediaEngineSettings {
+  localBinary?: string | null;
+  imageModelPath?: string | null;
+  videoModelPath?: string | null;
+}
+
+export interface MediaEngineStatus {
+  cloudReady: boolean;
+  localBinaryConfigured: boolean;
+  localBinaryExists: boolean;
+  imageModelConfigured: boolean;
+  videoModelConfigured: boolean;
+  message: string;
+}
+
+export interface MediaGenerateImageRequest {
+  prompt: string;
+  width?: number;
+  height?: number;
+  model?: string;
+  mode?: string;
+}
+
+export interface MediaGenerateImageResult {
+  savedPath: string;
+  provider: string;
+  revisedPrompt?: string | null;
+}
+
+export interface MediaGenerateVideoRequest {
+  prompt: string;
+  width?: number;
+  height?: number;
+  durationSecs?: number;
+  model?: string;
+}
+
+export interface MediaGenerateVideoResult {
+  jobId: string;
+  status: string;
+  message: string;
+}
+
 export const api = {
   minimize: () => getCurrentWindow().minimize(),
   toggleMaximize: () => getCurrentWindow().toggleMaximize(),
@@ -428,6 +603,17 @@ export const api = {
     tauriInvoke<Record<string, unknown> | null>("remote_config_load"),
   unloadModel: () => tauriInvoke<void>("unload_model"),
   modelStatus: () => tauriInvoke<Record<string, unknown> | null>("model_status"),
+  llamaRuntimeInfo: () => tauriInvoke<LlamaRuntimeInfo>("llama_runtime_info"),
+  llamaBindingsUpdateCheck: () =>
+    tauriInvoke<LlamaBindingsUpdateInfo>("llama_bindings_update_check"),
+  mediaEngineSettingsLoad: () => tauriInvoke<MediaEngineSettings>("media_engine_settings_load"),
+  mediaEngineSettingsSave: (settings: MediaEngineSettings) =>
+    tauriInvoke<void>("media_engine_settings_save", { settings }),
+  mediaEngineStatus: () => tauriInvoke<MediaEngineStatus>("media_engine_status"),
+  mediaGenerateImage: (request: MediaGenerateImageRequest) =>
+    tauriInvoke<MediaGenerateImageResult>("media_generate_image", { request }),
+  mediaGenerateVideo: (request: MediaGenerateVideoRequest) =>
+    tauriInvoke<MediaGenerateVideoResult>("media_generate_video", { request }),
   loadedModelPath: () => tauriInvoke<string | null>("loaded_model_path"),
   mcpLoadCatalog: () => tauriInvoke<McpServerConfig[]>("mcp_catalog_load"),
   mcpSaveCatalog: (servers: McpServerConfig[]) =>
@@ -620,10 +806,16 @@ export const api = {
       "delete_downloaded_model",
       { repoId, fileName },
     ),
-  hfSearch: (query: string, limit?: number) =>
-    tauriInvoke<Array<{ repoId: string; author: string | null; likes: number; downloads: number; files: Array<{ name: string; size: number | null }> }>>("hf_search", { query, limit }),
-  hfDownloadModel: (repoId: string, fileName: string) =>
-    tauriInvoke<void>("hf_download_model", { repoId, fileName }),
+  hfSearch: (query: string, limit?: number, offset?: number, sort?: string) =>
+    tauriInvoke<HfHubModel[]>("hf_search", { query, limit, offset, sort }),
+  hfModelInfo: (repoId: string) => tauriInvoke<HfModelInfo>("hf_model_info", { repoId }),
+  hfVerifyModel: (repoId: string, fileName: string) =>
+    tauriInvoke<ChecksumResult>("hf_verify_model", { repoId, fileName }),
+  hfTokenStatus: () => tauriInvoke<HfTokenStatus>("hf_token_status"),
+  hfTokenSave: (token: string) => tauriInvoke<void>("hf_token_save", { token }),
+  hfTokenClear: () => tauriInvoke<void>("hf_token_clear"),
+  hfDownloadModel: (repoId: string, fileName: string, revision?: string | null) =>
+    tauriInvoke<void>("hf_download_model", { repoId, fileName, revision: revision ?? null }),
   hfPauseDownload: (repoId: string, fileName: string) =>
     tauriInvoke<void>("hf_pause_download", { repoId, fileName }),
   hfResumeDownload: (repoId: string, fileName: string) =>
@@ -633,7 +825,7 @@ export const api = {
   hfListActive: () =>
     tauriInvoke<Array<{ repoId: string; fileName: string; paused: boolean }>>("hf_list_active"),
   hfDownloadProgress: (handler: (data: Record<string, unknown>) => void) =>
-    listen("hf-download-progress", (e) => handler(e.payload as Record<string, unknown>)),
+    addEngineListener("hf-download-progress", handler),
   systemInfo: () =>
     tauriInvoke<{
       os: string;
@@ -794,7 +986,7 @@ export const api = {
 export function subscribeTerminalOutput(
   handler: (e: TerminalOutputEvent) => void,
 ): Promise<() => void> {
-  return listen("agent://terminal-output", (e) =>
-    handler(e.payload as TerminalOutputEvent),
+  return addEngineListener("agent://terminal-output", (payload) =>
+    handler(payload as unknown as TerminalOutputEvent),
   );
 }

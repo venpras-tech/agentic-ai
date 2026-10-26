@@ -5,20 +5,20 @@ import type { ActiveFileBuffer, ContextState } from "../context/types";
 
 const SMALL_MODEL_PARAM_CEILING = 2_000_000_000;
 
-export const COMPACT_AGENT_SYSTEM_PROMPT = `You are a coding agent in the user's open workspace. Implement what they ask using real tools only.
+export const COMPACT_AGENT_SYSTEM_PROMPT = `You are a coding assistant in the user's workspace. Answer questions in plain text; use tools only when the user asks you to change, run, or inspect something.
 
 Rules:
 - Emit tools as <execute_tool>{"type":"tool_name",...}</execute_tool> (one JSON object per block, camelCase fields).
 - Never invent tool output. Do not write lines like Response: or pretend a command ran.
 - Only act on the user's actual message. Do not delete, push, or overwrite unless they explicitly asked.
-- For unclear or one-word messages, reply briefly and ask what to change — do not run destructive tools.
+- For greetings, questions, or one-word messages, reply briefly in plain text. Ask what they want instead of starting a tool loop.
 
-Flow: list_dir / read_file_range / search_file_contents → write_file or apply_file_diff → run_tests or execute_terminal_command when needed.`;
+Flow when action is needed: list_dir / read_file_range / search_file_contents → write_file or apply_file_diff → run_tests or execute_terminal_command.`;
 
 const ASK_MODE_APPEND = `
 
 ## Active mode: ask
-You are in READ-ONLY mode. Investigate the codebase, answer the user's question, and propose changes — but do NOT modify any files and do NOT run mutating commands. Use read/search tools only.`;
+You are in READ-ONLY mode. Investigate the codebase, answer the user's question, and propose changes — but do NOT modify any files and do NOT run mutating commands. Use read/search tools only when you need workspace evidence; for general questions, answer directly in plain text.`;
 
 export function isAgentCapableLocalModel(nParams?: number): boolean {
   if (nParams == null || nParams === 0) return true;
@@ -48,6 +48,8 @@ export interface PrepareAgentTurnOptions {
   activeFile: ActiveFileBuffer | null;
   nParams?: number;
   pickWorkspace: () => Promise<string | null>;
+  /** Most recently opened folders — used when no workspace is selected yet. */
+  recentProjectPaths?: string[];
 }
 
 export interface PreparedTurn {
@@ -68,6 +70,12 @@ export async function prepareAgentTurn(opts: PrepareAgentTurnOptions): Promise<P
     throw new Error("Agent runs require the desktop app.");
   }
   let workspace = opts.projectPath.trim();
+  if (!workspace) {
+    const recent = (opts.recentProjectPaths ?? [])
+      .map((p) => p.trim())
+      .find((p) => p.length > 0);
+    if (recent) workspace = recent;
+  }
   if (!workspace) {
     workspace = (await opts.pickWorkspace())?.trim() ?? "";
   }

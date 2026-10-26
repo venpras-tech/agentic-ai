@@ -11,6 +11,8 @@ pub mod context;
 pub mod editor;
 pub mod index;
 pub mod lsp;
+pub mod llama_settings;
+pub mod media;
 pub mod misc;
 pub mod model;
 pub mod session;

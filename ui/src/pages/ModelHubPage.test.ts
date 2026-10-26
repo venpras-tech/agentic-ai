@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { levelFor, ramCapacityLevel } from "./ModelHubPage";
+import { levelFor, ramCapacityLevel } from "../lib/modelHubUtils";
 
 describe("levelFor", () => {
   it("is green with plenty of headroom", () => {

@@ -74,6 +74,7 @@ describe("reduceAgentStage", () => {
     expect(reduceAgentStage(done, { type: "tool", tool: "x", status: "running" }, 1)).toBe(done);
     expect(reduceAgentStage(done, { type: "step" }, 1)).toBe(done);
     expect(reduceAgentStage(done, { type: "prompt", tokens: 512 }, 1)).toBe(done);
+    expect(reduceAgentStage(done, { type: "token" }, 1)).toBe(done);
   });
 
   it("records prompt size during thinking without resetting the timer", () => {

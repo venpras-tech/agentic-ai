@@ -45,7 +45,7 @@ function GlobalShortcuts() {
       if (e.key === "n" || e.key === "N") {
         e.preventDefault();
         newChatSession();
-        navigate("/chat");
+        navigate("/");
         return;
       }
 
@@ -62,7 +62,7 @@ function GlobalShortcuts() {
       }
 
       if (e.key >= "1" && e.key <= "5" && !e.altKey && !e.shiftKey) {
-        const routes = ["/", "/chat", "/project", "/models", "/settings"];
+        const routes = ["/", "/chat", "/workspace", "/agents", "/settings"];
         const idx = parseInt(e.key, 10) - 1;
         if (routes[idx]) {
           e.preventDefault();

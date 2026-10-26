@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   activeLocalConfig,
+  applyClearedConfig,
   mergeLocalConfig,
   sanitizeLocalConfig,
   validateLocalModelConfig,
@@ -79,5 +80,63 @@ describe("sanitizeLocalConfig", () => {
       { contextSize: null, nThreads: 4 } as unknown as Partial<Parameters<typeof mergeLocalConfig>[1]>,
     );
     expect(merged).toEqual({ contextSize: 4096, nThreads: 4 });
+  });
+
+  it("preserves booleans without coercing them to numbers", () => {
+    const clean = sanitizeLocalConfig({
+      flashAttn: true,
+      unifiedKv: false,
+      useMmap: true,
+      cacheTypeK: "Q8_0",
+      llamaArgs: "--swa-full",
+    } as unknown as Record<string, unknown>);
+    expect(clean).toEqual({
+      flashAttn: true,
+      unifiedKv: false,
+      useMmap: true,
+      cacheTypeK: "Q8_0",
+      llamaArgs: "--swa-full",
+    });
+  });
+
+  it("ignores a boolean where a number is expected and vice versa", () => {
+    const clean = sanitizeLocalConfig({
+      contextSize: true,
+      flashAttn: 1,
+    } as unknown as Record<string, unknown>);
+    expect(clean).toEqual({});
+  });
+});
+
+describe("applyClearedConfig", () => {
+  it("overlays present keys and removes keys explicitly set to null", () => {
+    const base = { contextSize: 8192, nBatch: 512, cacheTypeK: "Q8_0", llamaArgs: "--swa-full" };
+    const next = applyClearedConfig(base, {
+      contextSize: 16384,
+      nBatch: null,
+      cacheTypeK: "",
+      llamaArgs: "--swa-full",
+    });
+    expect(next).toEqual({ contextSize: 16384, llamaArgs: "--swa-full" });
+  });
+
+  it("leaves keys absent from the patch untouched", () => {
+    const base = { contextSize: 8192, nThreads: 4 };
+    expect(applyClearedConfig(base, { contextSize: 4096 })).toEqual({
+      contextSize: 4096,
+      nThreads: 4,
+    });
+  });
+
+  it("sanitizes patched values (invalid patch values are ignored, not written)", () => {
+    const base = { contextSize: 8192 };
+    // NaN is present in the patch but not a usable number: keep the saved value.
+    expect(applyClearedConfig(base, { contextSize: NaN })).toEqual({ contextSize: 8192 });
+    // A whitespace-only string clears a string field.
+    expect(applyClearedConfig(base, { cacheTypeV: "  " })).toEqual({ contextSize: 8192 });
+  });
+
+  it("starts from an empty base without throwing", () => {
+    expect(applyClearedConfig(undefined, { flashAttn: false })).toEqual({ flashAttn: false });
   });
 });
